@@ -229,7 +229,7 @@ def main():
     else:
         # Assume script is in scripts/ subdirectory
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        root_dir = os.path.join(script_dir, '..', 'logstashagent')
+        root_dir = os.path.join(script_dir, '..', 'src')
     
     root_dir = os.path.abspath(root_dir)
     

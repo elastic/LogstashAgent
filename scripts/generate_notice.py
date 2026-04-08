@@ -24,9 +24,6 @@ from pathlib import Path
 CUSTOM_DEPENDENCIES = {
     # Add custom dependencies here that should always be checked
     # Example: "my-custom-package": "owner/repo" or "https://github.com/owner/repo/blob/main/LICENSE"
-    "d3": "https://github.com/d3/d3/blob/main/LICENSE",
-    "codemirror": "https://github.com/codemirror/dev/blob/main/LICENSE",
-    "js-yaml": "https://github.com/nodeca/js-yaml/blob/master/LICENSE"
 }
 
 # Repository mappings for dependencies (fallback when automatic lookup fails)
@@ -40,6 +37,7 @@ REPOSITORY_MAPPINGS = {
     'pyyaml': 'https://github.com/yaml/pyyaml/blob/main/LICENSE',
     'daisyui': 'https://github.com/saadeghi/daisyui/blob/master/LICENSE',
     'postcss-cli': 'https://github.com/postcss/postcss-cli/blob/master/LICENSE',
+    'fastapi': 'https://github.com/fastapi/fastapi/blob/master/LICENSE'
 }
 
 # License validation patterns
