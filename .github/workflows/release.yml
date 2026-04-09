@@ -26,7 +26,7 @@ jobs:
         run: uv sync --dev
 
       - name: Build executable
-        run: uv run pyinstaller packaging/logstash-agent.spec
+        run: uv run pyinstaller logstash-agent.spec
 
       - name: Archive release bundle
         run: |
