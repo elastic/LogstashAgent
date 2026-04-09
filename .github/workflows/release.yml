@@ -1,0 +1,39 @@
+name: Build and Release LogstashAgent
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Sync deps
+        run: uv sync --dev
+
+      - name: Build executable
+        run: uv run pyinstaller packaging/logstash-agent.spec
+
+      - name: Archive release bundle
+        run: |
+          mkdir -p release
+          tar -czf release/logstash-agent-linux-amd64.tar.gz -C dist logstash-agent
+
+      - name: Create release and upload asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/logstash-agent-linux-amd64.tar.gz
