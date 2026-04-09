@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['src\\logstashagent\\main.py'],
+    ['src/logstashagent/main.py'],
     pathex=[],
     binaries=[],
     datas=[],
