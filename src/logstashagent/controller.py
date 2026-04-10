@@ -921,38 +921,27 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
                         logger.info("Successfully decrypted new keystore password")
 
                         # Delete the keystore file directly — no need to load/decrypt the old one
+                        # Note: /etc/logstash should have group write permissions (set during install)
                         keystore_file = Path(settings_path) / 'logstash.keystore'
-                        try:
-                            keystore_file.unlink(missing_ok=True)
-                            logger.info("Deleted existing keystore file")
-                        except PermissionError as del_e:
-                            # Permission denied - try to fix ownership first
-                            logger.warning(f"Could not delete keystore file (permission denied): {del_e}")
-                            logger.info("Attempting to fix keystore ownership...")
+                        
+                        if keystore_file.exists():
                             try:
-                                # Try to change ownership to logstash user
-                                import pwd
-                                import grp
-                                logstash_uid = pwd.getpwnam('logstash').pw_uid
-                                logstash_gid = grp.getgrnam('logstash').gr_gid
-                                
-                                # This will only work if we have permission (e.g., running as root)
-                                # or if the file is already owned by us
-                                import os
-                                os.chown(str(keystore_file), logstash_uid, logstash_gid)
-                                logger.info("Fixed keystore ownership, retrying delete...")
-                                
-                                # Try deleting again
                                 keystore_file.unlink(missing_ok=True)
-                                logger.info("Deleted existing keystore file after fixing ownership")
-                            except Exception as fix_e:
-                                logger.error(f"Failed to fix keystore ownership: {fix_e}")
-                                logger.error("Cannot proceed with keystore recreation - permission denied")
-                                logger.error("Manual fix required: sudo chown logstash:logstash " + str(keystore_file))
+                                logger.info("Deleted existing keystore file")
+                            except PermissionError as del_e:
+                                logger.error(f"Permission denied deleting keystore: {del_e}")
+                                logger.error(f"Directory permissions issue on {settings_path}")
+                                logger.error("Manual fix required:")
+                                logger.error(f"  sudo chown root:logstash {settings_path}")
+                                logger.error(f"  sudo chmod 775 {settings_path}")
                                 failed_operations.append(f'keystore deletion failed (permission denied): {del_e}')
                                 rollout_aborted = True
-                        except Exception as del_e:
-                            logger.warning(f"Could not delete keystore file: {del_e}")
+                            except Exception as del_e:
+                                logger.error(f"Could not delete keystore file: {del_e}")
+                                failed_operations.append(f'keystore deletion failed: {del_e}')
+                                rollout_aborted = True
+                        else:
+                            logger.info("Keystore file does not exist, will create new one")
 
                         # Only attempt creation if we didn't abort due to permission issues
                         if not rollout_aborted:

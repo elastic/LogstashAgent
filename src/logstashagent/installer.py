@@ -344,19 +344,30 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
             except Exception as e:
                 logger.warning(f"Could not clean up log file: {e}")
         
-        # Step 9: Fix ownership on Logstash keystore if it exists
-        logger.info("\nStep 9: Fixing Logstash keystore ownership...")
-        keystore_file = '/etc/logstash/logstash.keystore'
-        if os.path.exists(keystore_file):
+        # Step 9: Fix /etc/logstash directory permissions
+        logger.info("\nStep 9: Fixing Logstash directory permissions...")
+        logstash_config_dir = '/etc/logstash'
+        if os.path.exists(logstash_config_dir):
             try:
-                os.chown(keystore_file, uid, gid)
-                logger.info(f"✓ Set ownership on {keystore_file}")
+                # Change group to logstash and add group write permission
+                # This allows the logstash user to manage keystore files
+                os.chown(logstash_config_dir, 0, gid)  # root:logstash
+                os.chmod(logstash_config_dir, 0o775)   # rwxrwxr-x
+                logger.info(f"✓ Set permissions on {logstash_config_dir} (root:logstash, 775)")
+                
+                # Also fix keystore file ownership if it exists
+                keystore_file = os.path.join(logstash_config_dir, 'logstash.keystore')
+                if os.path.exists(keystore_file):
+                    os.chown(keystore_file, uid, gid)  # logstash:logstash
+                    logger.info(f"✓ Set ownership on {keystore_file} (logstash:logstash)")
             except Exception as e:
-                logger.warning(f"Could not set ownership on keystore: {e}")
+                logger.warning(f"Could not fix Logstash directory permissions: {e}")
                 logger.warning("Agent may not be able to recreate keystore - manual fix required:")
-                logger.warning(f"  sudo chown logstash:logstash {keystore_file}")
+                logger.warning(f"  sudo chown root:logstash {logstash_config_dir}")
+                logger.warning(f"  sudo chmod 775 {logstash_config_dir}")
         else:
-            logger.info("Keystore file not found at standard location, skipping")
+            logger.warning(f"Logstash config directory not found at {logstash_config_dir}")
+            logger.warning("Agent may not be able to manage keystore")
         
         # Installation complete
         logger.info("\n" + "="*60)
