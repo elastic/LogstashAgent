@@ -156,29 +156,48 @@ def create_directories():
 
 
 def install_binary():
-    """Copy the current executable to /opt/logstash-agent/bin/logstash-agent"""
+    """
+    Copy the current executable to /opt/logstash-agent/bin/logstash-agent
+    For PyInstaller bundles, also copies the _internal directory with dependencies
+    """
     logger.info("Installing binary...")
-    
-    # Get the path to the current executable
-    # For PyInstaller, this will be sys.executable
-    # For development, we need to handle this differently
-    current_exe = sys.executable
     
     # Check if we're running as a PyInstaller bundle
     if getattr(sys, 'frozen', False):
         # Running as PyInstaller bundle
         source_binary = sys.executable
+        source_dir = os.path.dirname(source_binary)
+        
+        # Copy the main executable
+        shutil.copy2(source_binary, INSTALL_PATHS['binary'])
+        os.chmod(INSTALL_PATHS['binary'], 0o755)
+        logger.info(f"✓ Installed binary to {INSTALL_PATHS['binary']}")
+        
+        # Check for _internal directory (PyInstaller dependencies)
+        internal_source = os.path.join(source_dir, '_internal')
+        if os.path.exists(internal_source):
+            internal_dest = os.path.join(INSTALL_PATHS['binary_dir'], '_internal')
+            
+            # Remove existing _internal if it exists
+            if os.path.exists(internal_dest):
+                shutil.rmtree(internal_dest)
+            
+            # Copy the entire _internal directory
+            shutil.copytree(internal_source, internal_dest)
+            logger.info(f"✓ Installed PyInstaller dependencies to {internal_dest}")
+        else:
+            logger.warning("_internal directory not found - this may be a onefile build")
     else:
         # Running as Python script - this shouldn't happen in production
         # but we'll handle it for testing
         logger.warning("Running from Python script, not a compiled binary")
         logger.warning("In production, this should be a PyInstaller executable")
         source_binary = sys.executable
-    
-    # Copy the binary
-    shutil.copy2(source_binary, INSTALL_PATHS['binary'])
-    os.chmod(INSTALL_PATHS['binary'], 0o755)
-    logger.info(f"✓ Installed binary to {INSTALL_PATHS['binary']}")
+        
+        # Copy the binary
+        shutil.copy2(source_binary, INSTALL_PATHS['binary'])
+        os.chmod(INSTALL_PATHS['binary'], 0o755)
+        logger.info(f"✓ Installed binary to {INSTALL_PATHS['binary']}")
 
 
 def create_symlink():
@@ -628,18 +647,47 @@ def perform_upgrade(version: str, auto: bool = False) -> None:
         else:
             logger.info("\nStep 6: Service not running, skipping stop")
         
-        # Step 7: Backup current binary
+        # Step 7: Backup current binary and dependencies
         logger.info("\nStep 7: Backing up current binary...")
         if os.path.exists(backup_path):
             os.remove(backup_path)
         shutil.copy2(INSTALL_PATHS['binary'], backup_path)
-        logger.info(f"✓ Backed up to {backup_path}")
+        logger.info(f"✓ Backed up binary to {backup_path}")
+        
+        # Also backup _internal directory if it exists
+        internal_backup_path = f"{INSTALL_PATHS['binary_dir']}/_internal.backup"
+        internal_current = os.path.join(INSTALL_PATHS['binary_dir'], '_internal')
+        if os.path.exists(internal_current):
+            if os.path.exists(internal_backup_path):
+                shutil.rmtree(internal_backup_path)
+            shutil.copytree(internal_current, internal_backup_path)
+            logger.info(f"✓ Backed up dependencies to {internal_backup_path}")
         
         # Step 8: Replace binary
         logger.info("\nStep 8: Installing new binary...")
+        
+        # Get source directory for PyInstaller bundle
+        new_binary_dir = os.path.dirname(new_binary_path)
+        
+        # Copy the main binary
         shutil.copy2(new_binary_path, INSTALL_PATHS['binary'])
         os.chmod(INSTALL_PATHS['binary'], 0o755)
         logger.info(f"✓ Installed new binary to {INSTALL_PATHS['binary']}")
+        
+        # Check for _internal directory (PyInstaller dependencies)
+        internal_source = os.path.join(new_binary_dir, '_internal')
+        if os.path.exists(internal_source):
+            internal_dest = os.path.join(INSTALL_PATHS['binary_dir'], '_internal')
+            
+            # Remove existing _internal if it exists
+            if os.path.exists(internal_dest):
+                shutil.rmtree(internal_dest)
+            
+            # Copy the entire _internal directory
+            shutil.copytree(internal_source, internal_dest)
+            logger.info(f"✓ Installed PyInstaller dependencies to {internal_dest}")
+        else:
+            logger.warning("_internal directory not found in upgrade package")
         
         # Step 9: Start service if it was running
         if service_was_running:
@@ -668,9 +716,18 @@ def perform_upgrade(version: str, auto: bool = False) -> None:
                 subprocess.run(['systemctl', 'stop', 'logstash-agent'], 
                              check=False, capture_output=True)
                 
-                # Restore backup
+                # Restore backup binary
                 shutil.copy2(backup_path, INSTALL_PATHS['binary'])
                 logger.info("✓ Restored previous binary")
+                
+                # Restore backup _internal if it exists
+                internal_backup_path = f"{INSTALL_PATHS['binary_dir']}/_internal.backup"
+                if os.path.exists(internal_backup_path):
+                    internal_dest = os.path.join(INSTALL_PATHS['binary_dir'], '_internal')
+                    if os.path.exists(internal_dest):
+                        shutil.rmtree(internal_dest)
+                    shutil.copytree(internal_backup_path, internal_dest)
+                    logger.info("✓ Restored previous dependencies")
                 
                 # Start with old binary
                 subprocess.run(['systemctl', 'start', 'logstash-agent'], 
