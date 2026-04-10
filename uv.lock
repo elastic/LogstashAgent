@@ -373,7 +373,7 @@ wheels = [
 
 [[package]]
 name = "logstashagent"
-version = "0.1.9"
+version = "0.1.10"
 source = { editable = "." }
 dependencies = [
     { name = "asn1crypto" },

@@ -43,6 +43,9 @@ def update_logstash_env_file(password: str) -> None:
     Write (or update) LOGSTASH_KEYSTORE_PASS in /etc/default/logstash so that
     the Logstash systemd service can open the password-protected keystore on startup.
 
+    Uses sudo tee as configured in /etc/sudoers.d/logstash-agent since the agent
+    runs as the logstash user and /etc/default/logstash is root-owned.
+    
     The file is written with mode 0o640 so that Logstash (running as the
     logstash user/group) can read it but unprivileged users cannot.
     """
@@ -60,12 +63,31 @@ def update_logstash_env_file(password: str) -> None:
     filtered.append(f'{var_name}={password}')
 
     content = '\n'.join(filtered) + '\n'
+    
+    # Use sudo tee to write the file since we don't have direct write permission
     try:
-        _LOGSTASH_ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _LOGSTASH_ENV_FILE.write_text(content, encoding='utf-8')
-        _LOGSTASH_ENV_FILE.chmod(0o640)
-        logger.info(f"Updated {var_name} in {_LOGSTASH_ENV_FILE}")
-    except OSError as e:
+        result = subprocess.run(
+            ['sudo', 'tee', str(_LOGSTASH_ENV_FILE)],
+            input=content,
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        
+        if result.returncode == 0:
+            # Set permissions using sudo chmod
+            subprocess.run(
+                ['sudo', 'chmod', '640', str(_LOGSTASH_ENV_FILE)],
+                capture_output=True,
+                timeout=5,
+                check=False  # Non-fatal if this fails
+            )
+            logger.info(f"Updated {var_name} in {_LOGSTASH_ENV_FILE}")
+        else:
+            logger.error(f"Failed to write {_LOGSTASH_ENV_FILE}: {result.stderr}")
+    except subprocess.TimeoutExpired:
+        logger.error(f"Timeout writing {_LOGSTASH_ENV_FILE}")
+    except Exception as e:
         logger.error(f"Failed to write {_LOGSTASH_ENV_FILE}: {e}")
 
 logger = logging.getLogger(__name__)
@@ -643,6 +665,7 @@ def update_pipelines(settings_path, pipeline_changes):
 def restart_logstash():
     """
     Restart the Logstash service.
+    Uses sudo as configured in /etc/sudoers.d/logstash-agent
     
     Returns:
         bool: True if successful, False otherwise
@@ -651,9 +674,10 @@ def restart_logstash():
         logger.info("Restarting Logstash service...")
         
         # Try systemctl first (most common on Linux)
+        # Use sudo since agent runs as logstash user
         try:
             result = subprocess.run(
-                ['systemctl', 'restart', 'logstash'],
+                ['sudo', 'systemctl', 'restart', 'logstash'],
                 capture_output=True,
                 text=True,
                 timeout=30
@@ -670,7 +694,7 @@ def restart_logstash():
         # Try service command as fallback
         try:
             result = subprocess.run(
-                ['service', 'logstash', 'restart'],
+                ['sudo', 'service', 'logstash', 'restart'],
                 capture_output=True,
                 text=True,
                 timeout=30
