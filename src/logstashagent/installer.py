@@ -344,6 +344,20 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
             except Exception as e:
                 logger.warning(f"Could not clean up log file: {e}")
         
+        # Step 9: Fix ownership on Logstash keystore if it exists
+        logger.info("\nStep 9: Fixing Logstash keystore ownership...")
+        keystore_file = '/etc/logstash/logstash.keystore'
+        if os.path.exists(keystore_file):
+            try:
+                os.chown(keystore_file, uid, gid)
+                logger.info(f"✓ Set ownership on {keystore_file}")
+            except Exception as e:
+                logger.warning(f"Could not set ownership on keystore: {e}")
+                logger.warning("Agent may not be able to recreate keystore - manual fix required:")
+                logger.warning(f"  sudo chown logstash:logstash {keystore_file}")
+        else:
+            logger.info("Keystore file not found at standard location, skipping")
+        
         # Installation complete
         logger.info("\n" + "="*60)
         logger.info("INSTALLATION COMPLETED SUCCESSFULLY!")

@@ -925,23 +925,51 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
                         try:
                             keystore_file.unlink(missing_ok=True)
                             logger.info("Deleted existing keystore file")
+                        except PermissionError as del_e:
+                            # Permission denied - try to fix ownership first
+                            logger.warning(f"Could not delete keystore file (permission denied): {del_e}")
+                            logger.info("Attempting to fix keystore ownership...")
+                            try:
+                                # Try to change ownership to logstash user
+                                import pwd
+                                import grp
+                                logstash_uid = pwd.getpwnam('logstash').pw_uid
+                                logstash_gid = grp.getgrnam('logstash').gr_gid
+                                
+                                # This will only work if we have permission (e.g., running as root)
+                                # or if the file is already owned by us
+                                import os
+                                os.chown(str(keystore_file), logstash_uid, logstash_gid)
+                                logger.info("Fixed keystore ownership, retrying delete...")
+                                
+                                # Try deleting again
+                                keystore_file.unlink(missing_ok=True)
+                                logger.info("Deleted existing keystore file after fixing ownership")
+                            except Exception as fix_e:
+                                logger.error(f"Failed to fix keystore ownership: {fix_e}")
+                                logger.error("Cannot proceed with keystore recreation - permission denied")
+                                logger.error("Manual fix required: sudo chown logstash:logstash " + str(keystore_file))
+                                failed_operations.append(f'keystore deletion failed (permission denied): {del_e}')
+                                rollout_aborted = True
                         except Exception as del_e:
                             logger.warning(f"Could not delete keystore file: {del_e}")
 
-                        try:
-                            LogstashKeystore.create(path_settings=settings_path, password=actual_password)
-                            logger.info("Created new keystore with updated password")
-                            agent_state.update_state('keystore_password', actual_password)
-                            agent_state.update_state('keystore_password_hash', new_hash)
-                            state = agent_state.get_state()
-                            update_logstash_env_file(actual_password)
-                            files_updated = True
-                            requires_restart = True
-                        except Exception as create_error:
-                            logger.error(f"Failed to create keystore: {create_error}")
-                            logger.exception("Keystore creation exception details:")
-                            failed_operations.append(f'keystore creation failed: {create_error}')
-                            rollout_aborted = True
+                        # Only attempt creation if we didn't abort due to permission issues
+                        if not rollout_aborted:
+                            try:
+                                LogstashKeystore.create(path_settings=settings_path, password=actual_password)
+                                logger.info("Created new keystore with updated password")
+                                agent_state.update_state('keystore_password', actual_password)
+                                agent_state.update_state('keystore_password_hash', new_hash)
+                                state = agent_state.get_state()
+                                update_logstash_env_file(actual_password)
+                                files_updated = True
+                                requires_restart = True
+                            except Exception as create_error:
+                                logger.error(f"Failed to create keystore: {create_error}")
+                                logger.exception("Keystore creation exception details:")
+                                failed_operations.append(f'keystore creation failed: {create_error}')
+                                rollout_aborted = True
 
                     except Exception as decrypt_error:
                         # Decrypt failed — delete the keystore file so we're in a clean
