@@ -921,7 +921,7 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
                         logger.info("Successfully decrypted new keystore password")
 
                         # Delete the keystore file directly — no need to load/decrypt the old one
-                        # Note: /etc/logstash should have group write permissions (set during install)
+                        # Note: /etc/logstash is owned by logstash:logstash (set during install)
                         keystore_file = Path(settings_path) / 'logstash.keystore'
                         
                         if keystore_file.exists():
@@ -930,10 +930,10 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
                                 logger.info("Deleted existing keystore file")
                             except PermissionError as del_e:
                                 logger.error(f"Permission denied deleting keystore: {del_e}")
-                                logger.error(f"Directory permissions issue on {settings_path}")
+                                logger.error(f"Directory ownership issue on {settings_path}")
+                                logger.error("This should have been fixed during installation.")
                                 logger.error("Manual fix required:")
-                                logger.error(f"  sudo chown root:logstash {settings_path}")
-                                logger.error(f"  sudo chmod 775 {settings_path}")
+                                logger.error(f"  sudo chown -R logstash:logstash {settings_path}")
                                 failed_operations.append(f'keystore deletion failed (permission denied): {del_e}')
                                 rollout_aborted = True
                             except Exception as del_e:

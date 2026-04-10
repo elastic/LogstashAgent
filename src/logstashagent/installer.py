@@ -344,30 +344,84 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
             except Exception as e:
                 logger.warning(f"Could not clean up log file: {e}")
         
-        # Step 9: Fix /etc/logstash directory permissions
-        logger.info("\nStep 9: Fixing Logstash directory permissions...")
+        # Step 9: Configure Logstash permissions for agent management
+        logger.info("\nStep 9: Configuring Logstash permissions...")
+        
+        # 9a. Change ownership of /etc/logstash to logstash:logstash
         logstash_config_dir = '/etc/logstash'
         if os.path.exists(logstash_config_dir):
             try:
-                # Change group to logstash and add group write permission
-                # This allows the logstash user to manage keystore files
-                os.chown(logstash_config_dir, 0, gid)  # root:logstash
-                os.chmod(logstash_config_dir, 0o775)   # rwxrwxr-x
-                logger.info(f"✓ Set permissions on {logstash_config_dir} (root:logstash, 775)")
-                
-                # Also fix keystore file ownership if it exists
-                keystore_file = os.path.join(logstash_config_dir, 'logstash.keystore')
-                if os.path.exists(keystore_file):
-                    os.chown(keystore_file, uid, gid)  # logstash:logstash
-                    logger.info(f"✓ Set ownership on {keystore_file} (logstash:logstash)")
+                # Recursively change ownership to logstash:logstash
+                for root, dirs, files in os.walk(logstash_config_dir):
+                    os.chown(root, uid, gid)
+                    for d in dirs:
+                        os.chown(os.path.join(root, d), uid, gid)
+                    for f in files:
+                        os.chown(os.path.join(root, f), uid, gid)
+                logger.info(f"✓ Set ownership on {logstash_config_dir} (logstash:logstash, recursive)")
             except Exception as e:
-                logger.warning(f"Could not fix Logstash directory permissions: {e}")
-                logger.warning("Agent may not be able to recreate keystore - manual fix required:")
-                logger.warning(f"  sudo chown root:logstash {logstash_config_dir}")
-                logger.warning(f"  sudo chmod 775 {logstash_config_dir}")
+                logger.warning(f"Could not set ownership on {logstash_config_dir}: {e}")
+                logger.warning("Agent may not be able to manage Logstash configuration")
         else:
             logger.warning(f"Logstash config directory not found at {logstash_config_dir}")
-            logger.warning("Agent may not be able to manage keystore")
+        
+        # 9b. Change ownership of /var/log/logstash to logstash:logstash
+        logstash_log_dir = '/var/log/logstash'
+        if os.path.exists(logstash_log_dir):
+            try:
+                # Recursively change ownership to logstash:logstash
+                for root, dirs, files in os.walk(logstash_log_dir):
+                    os.chown(root, uid, gid)
+                    for d in dirs:
+                        os.chown(os.path.join(root, d), uid, gid)
+                    for f in files:
+                        os.chown(os.path.join(root, f), uid, gid)
+                logger.info(f"✓ Set ownership on {logstash_log_dir} (logstash:logstash, recursive)")
+            except Exception as e:
+                logger.warning(f"Could not set ownership on {logstash_log_dir}: {e}")
+        else:
+            logger.warning(f"Logstash log directory not found at {logstash_log_dir}")
+        
+        # 9c. Create sudoers drop-in for logstash user
+        logger.info("\nCreating sudoers configuration...")
+        sudoers_file = '/etc/sudoers.d/logstash-agent'
+        sudoers_content = """# LogstashAgent - Allow logstash user to manage Logstash service
+# This file is managed by logstash-agent installation
+Defaults:logstash !requiretty
+
+# Allow service management
+logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart logstash
+logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop logstash
+logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl start logstash
+logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl status logstash
+
+# Allow modification of Logstash environment file (for keystore password)
+logstash ALL=(ALL) NOPASSWD: /usr/bin/tee /etc/default/logstash
+"""
+        try:
+            with open(sudoers_file, 'w') as f:
+                f.write(sudoers_content)
+            os.chmod(sudoers_file, 0o440)  # r--r----- (sudoers requirement)
+            logger.info(f"✓ Created sudoers configuration: {sudoers_file}")
+            
+            # Validate sudoers syntax
+            result = subprocess.run(
+                ['visudo', '-c', '-f', sudoers_file],
+                capture_output=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                logger.info("✓ Sudoers configuration validated successfully")
+            else:
+                logger.warning(f"Sudoers validation warning: {result.stderr.decode()}")
+        except Exception as e:
+            logger.warning(f"Could not create sudoers configuration: {e}")
+            logger.warning("Agent may not be able to restart Logstash service")
+            logger.warning("Manual fix required:")
+            logger.warning(f"  sudo tee {sudoers_file} << 'EOF'")
+            logger.warning(sudoers_content)
+            logger.warning("EOF")
+            logger.warning(f"  sudo chmod 440 {sudoers_file}")
         
         # Installation complete
         logger.info("\n" + "="*60)
@@ -442,6 +496,18 @@ def perform_uninstallation(purge: bool = False) -> None:
                 logger.warning(f"Failed to reload systemd: {e}")
         else:
             logger.info("Service file not found, skipping")
+        
+        # Step 3b: Remove sudoers drop-in
+        logger.info("\nRemoving sudoers configuration...")
+        sudoers_file = '/etc/sudoers.d/logstash-agent'
+        if os.path.exists(sudoers_file):
+            try:
+                os.remove(sudoers_file)
+                logger.info(f"✓ Removed {sudoers_file}")
+            except Exception as e:
+                logger.warning(f"Could not remove sudoers file: {e}")
+        else:
+            logger.info("Sudoers file not found, skipping")
         
         # Step 4: Remove symlink
         logger.info("\nStep 4: Removing symlink...")
