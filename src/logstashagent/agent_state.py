@@ -13,8 +13,12 @@ logger = logging.getLogger(__name__)
 # Keys that should be encrypted when stored
 ENCRYPTED_KEYS = {'api_key', 'keystore_password'}
 
-# Path to state file
-STATE_DIR = Path(__file__).parent / 'data'
+# Path to state file - check for installed location first
+import os
+if os.path.exists('/var/lib/logstash-agent'):
+    STATE_DIR = Path('/var/lib/logstash-agent')
+else:
+    STATE_DIR = Path(__file__).parent / 'data'
 STATE_FILE = STATE_DIR / 'state.json'
 
 

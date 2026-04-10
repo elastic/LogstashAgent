@@ -1586,6 +1586,48 @@ def run_controller():
 
             if result:
                 logger.debug(f"Check-in response: {result}")
+                
+                # Check for upgrade notification
+                if result.get('upgrade_available'):
+                    upgrade_version = result['upgrade_available']
+                    logger.info("=" * 60)
+                    logger.info(f"UPGRADE AVAILABLE: {upgrade_version}")
+                    logger.info("=" * 60)
+                    logger.info(f"Initiating automatic upgrade to version {upgrade_version}...")
+                    
+                    try:
+                        # Spawn upgrade process as separate command
+                        # This will stop the service (killing us), replace binary, and restart
+                        import subprocess
+                        import sys
+                        
+                        # Get path to the installed binary
+                        binary_path = '/opt/logstash-agent/bin/logstash-agent'
+                        if not os.path.exists(binary_path):
+                            # Fallback to current executable if not installed
+                            binary_path = sys.executable
+                        
+                        logger.info(f"Spawning upgrade process: {binary_path} upgrade --version {upgrade_version} --yes")
+                        
+                        # Start upgrade process in background
+                        subprocess.Popen(
+                            [binary_path, 'upgrade', '--version', upgrade_version, '--yes'],
+                            start_new_session=True,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL
+                        )
+                        
+                        logger.info("Upgrade process spawned. Exiting to allow service restart...")
+                        logger.info("The upgrade will complete automatically.")
+                        logger.info("=" * 60)
+                        
+                        # Exit immediately - we're about to be killed by systemctl stop anyway
+                        sys.exit(0)
+                        
+                    except Exception as e:
+                        logger.error(f"Failed to initiate automatic upgrade: {e}")
+                        logger.error("Manual upgrade required:")
+                        logger.error(f"  sudo logstash-agent upgrade --version {upgrade_version}")
             else:
                 logger.warning("Check-in failed, will retry in 60 seconds")
 

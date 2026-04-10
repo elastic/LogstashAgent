@@ -8,9 +8,9 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 import sys
 
-# Check early whether we're in a non-simulation mode (--run or --enroll).
+# Check early whether we're in a non-simulation mode (--run, --enroll, or install).
 # slots starts background threads on import, so we skip it in these modes.
-_SKIP_SIMULATION_IMPORTS = '--run' in sys.argv or '--enroll' in sys.argv
+_SKIP_SIMULATION_IMPORTS = '--run' in sys.argv or '--enroll' in sys.argv or 'install' in sys.argv
 
 from fastapi import FastAPI, HTTPException, Path as FastAPIPath, Query, Request
 from fastapi.responses import JSONResponse
@@ -22,7 +22,7 @@ import json
 import glob
 import logging
 import re
-from logstashagent import agent_state, enrollment, log_analyzer, logstash_supervisor, controller
+from logstashagent import agent_state, enrollment, log_analyzer, logstash_supervisor, controller, installer
 if not _SKIP_SIMULATION_IMPORTS:
     from logstashagent import slots
 from logstashagent.logstash_api import LogstashAPI
@@ -40,9 +40,12 @@ import uvicorn
 from importlib.metadata import version, PackageNotFoundError
 
 # Configure logging with file output
-# Create data/logs directory if it doesn't exist
-LOGS_DIR = Path(__file__).parent / 'data' / 'logs'
-LOGS_DIR.mkdir(parents=True, exist_ok=True)
+# Check for installed location first, then fall back to local data directory
+if os.path.exists('/var/log/logstash-agent'):
+    LOGS_DIR = Path('/var/log/logstash-agent')
+else:
+    LOGS_DIR = Path(__file__).parent / 'data' / 'logs'
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Setup logging configuration
 logging.basicConfig(
@@ -106,7 +109,18 @@ CONFIG_PATH = get_config_path()
 
 def load_agent_config() -> dict:
     """Load logstashagent.yml configuration, with fallback to logstashui.yml or logstashui.example.yml if mounted"""
-    # First, try to load from mounted logstashui.yml (preferred), then logstashui.example.yml
+    # First, check for installed agent config
+    installed_config = "/etc/logstash-agent/logstash-agent.yml"
+    if os.path.exists(installed_config):
+        try:
+            with open(installed_config, 'r') as f:
+                config = yaml.safe_load(f)
+                logger.info(f"Loaded agent config from {installed_config}")
+                return config
+        except Exception as e:
+            logger.warning(f"Failed to load config from {installed_config}: {e}")
+    
+    # Next, try to load from mounted logstashui.yml (preferred), then logstashui.example.yml
     # Check /app first (docker-compose mounts), then /etc (legacy)
     config_paths = [
         "/app/logstashui.yml",
@@ -1565,17 +1579,89 @@ def parse_arguments():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Enroll agent with logstashui
-  python main.py --enroll=eyJlbnJvbGxtZW50X3Rva2VuIjogInN3VGJJODZkYl9tbjBUVE12X2Rfd1hXd0Via3RETU1iUkE2elVaRkF4WXcifQ== --logstash-ui-url=http://localhost:8080
+  # Install and enroll agent with logstashui
+  python main.py install --enroll=TOKEN --logstash-ui-url=http://localhost:8080
   
-  # Enroll with HTTPS URL
-  python main.py --enroll=TOKEN --logstash-ui-url=https://logstashui.example.com
+  # Upgrade agent to a new version
+  python main.py upgrade --version 0.1.4
+  
+  # Uninstall agent (preserves state and logs)
+  python main.py uninstall
+  
+  # Uninstall agent and remove all data
+  python main.py uninstall --purge
+  
+  # Enroll agent with logstashui (legacy)
+  python main.py --enroll=TOKEN --logstash-ui-url=http://localhost:8080
   
   # Run in normal mode (simulation or agent mode based on config)
   python main.py
         """
     )
     
+    # Create subparsers for commands
+    subparsers = parser.add_subparsers(dest='command', help='Available commands')
+    
+    # Install command
+    install_parser = subparsers.add_parser(
+        'install',
+        help='Install and enroll the agent with logstashui'
+    )
+    install_parser.add_argument(
+        '--enroll',
+        type=str,
+        metavar='TOKEN',
+        required=True,
+        help='Enrollment token for registering with logstashui'
+    )
+    install_parser.add_argument(
+        '--logstash-ui-url',
+        type=str,
+        metavar='URL',
+        required=True,
+        help='logstashui URL (e.g., http://localhost:8080 or https://logstashui.example.com)'
+    )
+    install_parser.add_argument(
+        '--yes',
+        action='store_true',
+        help='Skip the enrollment confirmation prompt'
+    )
+    
+    # Uninstall command
+    uninstall_parser = subparsers.add_parser(
+        'uninstall',
+        help='Uninstall the agent from the system'
+    )
+    uninstall_parser.add_argument(
+        '--purge',
+        action='store_true',
+        help='Also remove state and log directories'
+    )
+    uninstall_parser.add_argument(
+        '--yes',
+        action='store_true',
+        help='Skip the uninstallation confirmation prompt'
+    )
+    
+    # Upgrade command
+    upgrade_parser = subparsers.add_parser(
+        'upgrade',
+        help='Upgrade the agent to a new version'
+    )
+    upgrade_parser.add_argument(
+        '--version',
+        type=str,
+        metavar='VERSION',
+        required=True,
+        help='Version to upgrade to (e.g., 0.1.4)'
+    )
+    upgrade_parser.add_argument(
+        '--yes',
+        action='store_true',
+        help='Skip the upgrade confirmation prompt'
+    )
+    
+    # Legacy arguments for backward compatibility
     parser.add_argument(
         '--enroll',
         type=str,
@@ -1610,12 +1696,109 @@ if __name__ == "__main__":
     Main entry point for logstashagent
     
     Supports multiple modes:
+    - Install mode: install command to perform enrollment and setup
     - Enrollment mode: --enroll flag to register with logstashui
     - Agent mode: mode=agent in config, checks in with logstashui
     - Simulation mode: mode=simulation in config, runs as simulation node
     - Host mode: mode=host in config, manages local Logstash instance
     """
     args = parse_arguments()
+    
+    # Check if we're in install mode
+    if args.command == 'install':
+        if not args.yes:
+            print("\nThis will install LogstashAgent as a system service.")
+            print("\nThe agent will be enrolled into LogstashUI managed mode.")
+            print("\nFuture policy applies may overwrite manual changes made directly on the host, including:")
+            print("  - logstash.yml")
+            print("  - jvm.options")
+            print("  - log4j2.properties")
+            print("  - pipelines")
+            print("  - keystore contents")
+            print()
+            answer = input("Continue? [y/N]: ").strip().lower()
+            if answer != 'y':
+                print("Installation cancelled.")
+                sys.exit(0)
+        
+        try:
+            installer.perform_installation(
+                enroll_token=args.enroll,
+                logstash_ui_url=args.logstash_ui_url,
+                agent_id=AGENT_ID,
+                enrollment_func=enrollment.perform_enrollment
+            )
+            sys.exit(0)
+        except installer.InstallError as e:
+            logger.error(f"Installation failed: {e}")
+            sys.exit(1)
+        except Exception as e:
+            logger.error(f"Unexpected installation error: {e}", exc_info=True)
+            sys.exit(1)
+    
+    # Check if we're in uninstall mode
+    if args.command == 'uninstall':
+        if not args.yes:
+            print("\nThis will uninstall LogstashAgent from the system.")
+            print("\nThe following will be removed:")
+            print("  - Binary: /opt/logstash-agent")
+            print("  - Symlink: /usr/local/bin/logstash-agent")
+            print("  - Config: /etc/logstash-agent")
+            print("  - Systemd service: /etc/systemd/system/logstash-agent.service")
+            
+            if args.purge:
+                print("\n--purge flag detected. Also removing:")
+                print("  - State: /var/lib/logstash-agent")
+                print("  - Logs: /var/log/logstash-agent")
+            else:
+                print("\nPreserving:")
+                print("  - State: /var/lib/logstash-agent")
+                print("  - Logs: /var/log/logstash-agent")
+                print("  (Use --purge to remove these)")
+            
+            print()
+            answer = input("Continue? [y/N]: ").strip().lower()
+            if answer != 'y':
+                print("Uninstallation cancelled.")
+                sys.exit(0)
+        
+        try:
+            installer.perform_uninstallation(purge=args.purge)
+            sys.exit(0)
+        except installer.InstallError as e:
+            logger.error(f"Uninstallation failed: {e}")
+            sys.exit(1)
+        except Exception as e:
+            logger.error(f"Unexpected uninstallation error: {e}", exc_info=True)
+            sys.exit(1)
+    
+    # Check if we're in upgrade mode
+    if args.command == 'upgrade':
+        if not args.yes:
+            print(f"\nThis will upgrade LogstashAgent to version {args.version}.")
+            print("\nThe upgrade process will:")
+            print(f"  1. Download version {args.version} from GitHub")
+            print("  2. Stop the logstash-agent service")
+            print("  3. Backup the current binary")
+            print("  4. Replace the binary with the new version")
+            print("  5. Restart the service")
+            print("\nIf the new version fails to start, it will automatically rollback.")
+            print("\nState and configuration will be preserved.")
+            print()
+            answer = input("Continue? [y/N]: ").strip().lower()
+            if answer != 'y':
+                print("Upgrade cancelled.")
+                sys.exit(0)
+        
+        try:
+            installer.perform_upgrade(version=args.version, auto=False)
+            sys.exit(0)
+        except installer.InstallError as e:
+            logger.error(f"Upgrade failed: {e}")
+            sys.exit(1)
+        except Exception as e:
+            logger.error(f"Unexpected upgrade error: {e}", exc_info=True)
+            sys.exit(1)
     
     # Check if we're in enrollment mode
     if args.enroll:

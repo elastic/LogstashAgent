@@ -37,9 +37,12 @@ def get_encryption_key():
                 logger.error(f"Invalid CREDENTIAL_KEY in environment: {e}")
                 raise RuntimeError(f"Invalid CREDENTIAL_KEY format: {e}")
         
-        # Check for key file in package-local data directory
-        base_dir = Path(__file__).resolve().parent
-        key_file = base_dir / 'data' / '.secret_key'
+        # Check for key file - installed location first, then package-local
+        if os.path.exists('/var/lib/logstash-agent'):
+            key_file = Path('/var/lib/logstash-agent') / '.secret_key'
+        else:
+            base_dir = Path(__file__).resolve().parent
+            key_file = base_dir / 'data' / '.secret_key'
         
         if key_file.exists():
             try:
