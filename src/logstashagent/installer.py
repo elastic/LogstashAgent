@@ -382,7 +382,24 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
         else:
             logger.warning(f"Logstash log directory not found at {logstash_log_dir}")
         
-        # 9c. Create sudoers drop-in for logstash user
+        # 9c. Change ownership of /usr/share/logstash/data to logstash:logstash
+        logstash_data_dir = '/usr/share/logstash/data'
+        if os.path.exists(logstash_data_dir):
+            try:
+                # Recursively change ownership to logstash:logstash
+                for root, dirs, files in os.walk(logstash_data_dir):
+                    os.chown(root, uid, gid)
+                    for d in dirs:
+                        os.chown(os.path.join(root, d), uid, gid)
+                    for f in files:
+                        os.chown(os.path.join(root, f), uid, gid)
+                logger.info(f"✓ Set ownership on {logstash_data_dir} (logstash:logstash, recursive)")
+            except Exception as e:
+                logger.warning(f"Could not set ownership on {logstash_data_dir}: {e}")
+        else:
+            logger.warning(f"Logstash data directory not found at {logstash_data_dir}")
+        
+        # 9d. Create sudoers drop-in for logstash user
         logger.info("\nCreating sudoers configuration...")
         sudoers_file = '/etc/sudoers.d/logstash-agent'
         sudoers_content = """# LogstashAgent - Allow logstash user to manage Logstash service
