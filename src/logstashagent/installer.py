@@ -319,7 +319,7 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
         )
         logger.info("✓ Enrollment completed successfully")
         
-        # Step 8: Set ownership on state files
+        # Step 8: Set ownership on state files and clean up log files
         logger.info("\nStep 8: Setting ownership on state files...")
         uid, gid = get_logstash_uid_gid()
         
@@ -331,6 +331,18 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
                 os.chown(os.path.join(root, f), uid, gid)
         
         logger.info(f"✓ Set ownership on {INSTALL_PATHS['state_dir']}")
+        
+        # Clean up any root-owned log files that may have been created during install
+        log_file = os.path.join(INSTALL_PATHS['log_dir'], 'logstashagent.log')
+        if os.path.exists(log_file):
+            try:
+                # Check if owned by root
+                stat_info = os.stat(log_file)
+                if stat_info.st_uid == 0:  # root
+                    os.remove(log_file)
+                    logger.info(f"✓ Removed root-owned log file (will be recreated by service)")
+            except Exception as e:
+                logger.warning(f"Could not clean up log file: {e}")
         
         # Installation complete
         logger.info("\n" + "="*60)

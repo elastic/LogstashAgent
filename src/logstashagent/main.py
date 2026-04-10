@@ -39,28 +39,14 @@ import argparse
 import uvicorn
 from importlib.metadata import version, PackageNotFoundError
 
-# Configure logging with file output
-# Check for installed location first, then fall back to local data directory
-if os.path.exists('/var/log/logstash-agent'):
-    LOGS_DIR = Path('/var/log/logstash-agent')
-else:
-    LOGS_DIR = Path(__file__).parent / 'data' / 'logs'
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
-
-# Setup logging configuration
+# Configure basic console logging first
+# File logging will be added later based on the command mode
 logging.basicConfig(
     level=logging.INFO,
     format='[%(levelname)s] %(asctime)s %(name)s %(funcName)s: %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[
-        # Console handler
-        logging.StreamHandler(),
-        # File handler with rotation
-        RotatingFileHandler(
-            LOGS_DIR / 'logstashagent.log',
-            maxBytes=1024 * 1024 * 10,  # 10 MB
-            backupCount=5,
-        )
+        logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
@@ -68,7 +54,33 @@ logger = logging.getLogger(__name__)
 # Reduce httpx logging noise - only show warnings and errors
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-logger.info(f"logstashagent logging initialized - logs directory: {LOGS_DIR}")
+
+def setup_file_logging():
+    """
+    Setup file logging for normal operation (not install/uninstall/upgrade).
+    This is called after we know we're running as the service.
+    """
+    # Check for installed location first, then fall back to local data directory
+    if os.path.exists('/var/log/logstash-agent'):
+        logs_dir = Path('/var/log/logstash-agent')
+    else:
+        logs_dir = Path(__file__).parent / 'data' / 'logs'
+        logs_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Add file handler to root logger
+    file_handler = RotatingFileHandler(
+        logs_dir / 'logstashagent.log',
+        maxBytes=1024 * 1024 * 10,  # 10 MB
+        backupCount=5,
+    )
+    file_handler.setFormatter(logging.Formatter(
+        '[%(levelname)s] %(asctime)s %(name)s %(funcName)s: %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    ))
+    logging.getLogger().addHandler(file_handler)
+    
+    logger.info(f"File logging initialized - logs directory: {logs_dir}")
+    return logs_dir
 
 # Get agent version from pyproject.toml
 def _get_version():
@@ -1836,6 +1848,10 @@ if __name__ == "__main__":
         except Exception as e:
             logger.error(f"Enrollment failed: {e}")
             sys.exit(1)
+    
+    # Setup file logging for normal operation (not install/uninstall/upgrade)
+    # This creates the log file with the correct user permissions
+    setup_file_logging()
     
     # Check if we're in run mode (controller mode for enrolled agents)
     if args.run:
