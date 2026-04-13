@@ -859,20 +859,32 @@ def perform_upgrade(version: str, auto: bool = False) -> None:
         except Exception as e:
             logger.debug(f"Could not check if binary is in use: {e}")
         
-        # Copy the main binary
-        logger.info(f"Attempting to copy {new_binary_path} to {INSTALL_PATHS['binary']}")
+        # Install the main binary using atomic rename
+        # We can't use shutil.copy2() directly because the upgrade process itself
+        # is running from this binary, causing "Text file busy" error
+        logger.info(f"Installing new binary to {INSTALL_PATHS['binary']}")
         try:
-            shutil.copy2(new_binary_path, INSTALL_PATHS['binary'])
-            os.chmod(INSTALL_PATHS['binary'], 0o755)
+            # First copy to a temporary location
+            temp_binary = f"{INSTALL_PATHS['binary']}.new"
+            shutil.copy2(new_binary_path, temp_binary)
+            os.chmod(temp_binary, 0o755)
+            logger.info(f"✓ Copied new binary to {temp_binary}")
+            
+            # Atomically rename over the old binary
+            # This works even if the old binary is currently executing
+            os.rename(temp_binary, INSTALL_PATHS['binary'])
             logger.info(f"✓ Installed new binary to {INSTALL_PATHS['binary']}")
         except OSError as e:
-            logger.error(f"Failed to copy binary: {e}")
+            logger.error(f"Failed to install binary: {e}")
             logger.error(f"Error code: {e.errno}")
             logger.error(f"Error message: {e.strerror}")
             # Check service status
             service_check = subprocess.run(['systemctl', 'is-active', 'logstash-agent'],
                                          capture_output=True)
             logger.error(f"Service status: {service_check.stdout.decode().strip()}")
+            # Clean up temp file if it exists
+            if os.path.exists(temp_binary):
+                os.remove(temp_binary)
             raise
         
         # Check for _internal directory (PyInstaller dependencies)
