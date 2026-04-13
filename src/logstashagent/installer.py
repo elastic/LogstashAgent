@@ -902,55 +902,51 @@ def perform_upgrade(version: str, auto: bool = False) -> None:
         else:
             logger.warning("_internal directory not found in upgrade package")
         
-        # Step 9: Start service if it was running
-        if service_was_running:
-            logger.info("\nStep 9: Starting service with new binary...")
-            try:
-                subprocess.run(['systemctl', 'start', 'logstash-agent'], 
-                             check=True, capture_output=True, timeout=30)
-                logger.info("✓ Service started")
+        # Step 9: Start service (always start after upgrade)
+        logger.info("\nStep 9: Starting service with new binary...")
+        try:
+            subprocess.run(['systemctl', 'start', 'logstash-agent'], 
+                         check=True, capture_output=True, timeout=30)
+            logger.info("✓ Service started")
+            
+            # Step 10: Verify service is running
+            logger.info("\nStep 10: Verifying service health...")
+            import time
+            time.sleep(2)  # Give it a moment to start
+            
+            if verify_service_running():
+                logger.info("✓ Service is running successfully")
+            else:
+                raise InstallError("Service failed to start with new binary")
                 
-                # Step 10: Verify service is running
-                logger.info("\nStep 10: Verifying service health...")
-                import time
-                time.sleep(2)  # Give it a moment to start
-                
-                if verify_service_running():
-                    logger.info("✓ Service is running successfully")
-                else:
-                    raise InstallError("Service failed to start with new binary")
-                    
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, InstallError) as e:
-                # Rollback!
-                logger.error(f"Service failed to start: {e}")
-                logger.info("\nPerforming rollback...")
-                
-                # Stop the failed service
-                subprocess.run(['systemctl', 'stop', 'logstash-agent'], 
-                             check=False, capture_output=True)
-                
-                # Restore backup binary
-                shutil.copy2(backup_path, INSTALL_PATHS['binary'])
-                logger.info("✓ Restored previous binary")
-                
-                # Restore backup _internal if it exists
-                internal_backup_path = f"{INSTALL_PATHS['binary_dir']}/_internal.backup"
-                if os.path.exists(internal_backup_path):
-                    internal_dest = os.path.join(INSTALL_PATHS['binary_dir'], '_internal')
-                    if os.path.exists(internal_dest):
-                        shutil.rmtree(internal_dest)
-                    shutil.copytree(internal_backup_path, internal_dest)
-                    logger.info("✓ Restored previous dependencies")
-                
-                # Start with old binary
-                subprocess.run(['systemctl', 'start', 'logstash-agent'], 
-                             check=True, capture_output=True, timeout=30)
-                logger.info("✓ Service restarted with previous version")
-                
-                raise InstallError(f"Upgrade failed and was rolled back: {e}")
-        else:
-            logger.info("\nStep 9: Service was not running, skipping start")
-            logger.info("Step 10: Verification skipped (service not running)")
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, InstallError) as e:
+            # Rollback!
+            logger.error(f"Service failed to start: {e}")
+            logger.info("\nPerforming rollback...")
+            
+            # Stop the failed service
+            subprocess.run(['systemctl', 'stop', 'logstash-agent'], 
+                         check=False, capture_output=True)
+            
+            # Restore backup binary
+            shutil.copy2(backup_path, INSTALL_PATHS['binary'])
+            logger.info("✓ Restored previous binary")
+            
+            # Restore backup _internal if it exists
+            internal_backup_path = f"{INSTALL_PATHS['binary_dir']}/_internal.backup"
+            if os.path.exists(internal_backup_path):
+                internal_dest = os.path.join(INSTALL_PATHS['binary_dir'], '_internal')
+                if os.path.exists(internal_dest):
+                    shutil.rmtree(internal_dest)
+                shutil.copytree(internal_backup_path, internal_dest)
+                logger.info("✓ Restored previous dependencies")
+            
+            # Start with old binary
+            subprocess.run(['systemctl', 'start', 'logstash-agent'], 
+                         check=True, capture_output=True, timeout=30)
+            logger.info("✓ Service restarted with previous version")
+            
+            raise InstallError(f"Upgrade failed and was rolled back: {e}")
         
         # Step 11: Cleanup
         logger.info("\nStep 11: Cleaning up...")
