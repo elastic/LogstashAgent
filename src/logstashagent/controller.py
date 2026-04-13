@@ -1610,6 +1610,10 @@ def run_controller():
     # Restart state tracking: detect transitions for controller-level logging.
     # The watcher fires log lines within ~0.5s of a shutdown/startup signal.
     was_restarting: bool = False
+    
+    # Track if upgrade has been initiated in this session
+    # Once we spawn an upgrade, don't attempt another until service restarts
+    upgrade_initiated: bool = False
 
     try:
         while True:
@@ -1630,7 +1634,7 @@ def run_controller():
                 logger.debug(f"Check-in response: {result}")
                 
                 # Check for upgrade notification from desired_agent_version field
-                if result.get('desired_agent_version'):
+                if result.get('desired_agent_version') and not upgrade_initiated:
                     upgrade_version = result['desired_agent_version']
                     
                     # Get current version
@@ -1689,12 +1693,16 @@ def run_controller():
                                     close_fds=True
                                 )
                             
-                            logger.info("Upgrade process spawned. Exiting to allow service restart...")
+                            logger.info("Upgrade process spawned. Waiting for upgrade to stop service...")
                             logger.info("Upgrade logs: tail -f /var/log/logstash-agent/logstashagent.log")
                             logger.info("=" * 60)
                             
-                            # Exit immediately - we're about to be killed by systemctl stop anyway
-                            sys.exit(0)
+                            # Mark upgrade as initiated to prevent spawning another upgrade
+                            upgrade_initiated = True
+                            
+                            # Don't exit - let the upgrade process stop the service
+                            # The upgrade will run 'systemctl stop logstash-agent' which will kill us
+                            # If we exit now, systemd will restart us before the upgrade completes
                             
                         except Exception as e:
                             logger.error(f"Failed to initiate automatic upgrade: {e}")
