@@ -1628,9 +1628,9 @@ def run_controller():
             if result:
                 logger.debug(f"Check-in response: {result}")
                 
-                # Check for upgrade notification
-                if result.get('upgrade_available'):
-                    upgrade_version = result['upgrade_available']
+                # Check for upgrade notification from desired_agent_version field
+                if result.get('desired_agent_version'):
+                    upgrade_version = result['desired_agent_version']
                     logger.info("=" * 60)
                     logger.info(f"UPGRADE AVAILABLE: {upgrade_version}")
                     logger.info("=" * 60)
