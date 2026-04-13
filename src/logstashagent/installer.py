@@ -846,10 +846,34 @@ def perform_upgrade(version: str, auto: bool = False) -> None:
         # Get source directory for PyInstaller bundle
         new_binary_dir = os.path.dirname(new_binary_path)
         
+        # Check if binary is still in use before attempting copy
+        try:
+            # Try to check if any process is using the binary
+            result = subprocess.run(['lsof', INSTALL_PATHS['binary']], 
+                                  capture_output=True, timeout=5)
+            if result.returncode == 0:
+                logger.warning(f"Binary is still in use by processes:")
+                logger.warning(result.stdout.decode())
+            else:
+                logger.info("Binary is not in use by any processes")
+        except Exception as e:
+            logger.debug(f"Could not check if binary is in use: {e}")
+        
         # Copy the main binary
-        shutil.copy2(new_binary_path, INSTALL_PATHS['binary'])
-        os.chmod(INSTALL_PATHS['binary'], 0o755)
-        logger.info(f"✓ Installed new binary to {INSTALL_PATHS['binary']}")
+        logger.info(f"Attempting to copy {new_binary_path} to {INSTALL_PATHS['binary']}")
+        try:
+            shutil.copy2(new_binary_path, INSTALL_PATHS['binary'])
+            os.chmod(INSTALL_PATHS['binary'], 0o755)
+            logger.info(f"✓ Installed new binary to {INSTALL_PATHS['binary']}")
+        except OSError as e:
+            logger.error(f"Failed to copy binary: {e}")
+            logger.error(f"Error code: {e.errno}")
+            logger.error(f"Error message: {e.strerror}")
+            # Check service status
+            service_check = subprocess.run(['systemctl', 'is-active', 'logstash-agent'],
+                                         capture_output=True)
+            logger.error(f"Service status: {service_check.stdout.decode().strip()}")
+            raise
         
         # Check for _internal directory (PyInstaller dependencies)
         internal_source = os.path.join(new_binary_dir, '_internal')
