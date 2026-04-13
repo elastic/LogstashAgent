@@ -11,6 +11,7 @@ import json
 import hashlib
 import base64
 import subprocess
+import os
 from pathlib import Path
 from datetime import datetime, timezone
 from cryptography.fernet import Fernet

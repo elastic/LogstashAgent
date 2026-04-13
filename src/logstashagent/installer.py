@@ -28,6 +28,7 @@ INSTALL_PATHS = {
     'config_dir': '/etc/logstash-agent',
     'state_dir': '/var/lib/logstash-agent',
     'log_dir': '/var/log/logstash-agent',
+    'cache_dir': '/var/cache/logstash-agent',
     'systemd_service': '/etc/systemd/system/logstash-agent.service',
 }
 
@@ -153,6 +154,11 @@ def create_directories():
     os.makedirs(INSTALL_PATHS['log_dir'], mode=0o755, exist_ok=True)
     os.chown(INSTALL_PATHS['log_dir'], uid, gid)
     logger.info(f"✓ Created {INSTALL_PATHS['log_dir']} (owned by logstash)")
+    
+    # Create cache directory (owned by logstash)
+    os.makedirs(INSTALL_PATHS['cache_dir'], mode=0o755, exist_ok=True)
+    os.chown(INSTALL_PATHS['cache_dir'], uid, gid)
+    logger.info(f"✓ Created {INSTALL_PATHS['cache_dir']} (owned by logstash)")
 
 
 def install_binary():
@@ -609,21 +615,47 @@ def perform_uninstallation(purge: bool = False) -> None:
 def download_release(version: str, download_dir: str) -> str:
     """
     Download a specific release from GitHub.
+    Uses a persistent cache directory to avoid re-downloading.
     
     Args:
         version: Version to download (e.g., "0.1.4")
-        download_dir: Directory to download to
+        download_dir: Directory to download to (unused, kept for compatibility)
     
     Returns:
         Path to the downloaded tarball
     """
     import requests
     
+    # Use persistent cache directory
+    cache_dir = INSTALL_PATHS['cache_dir']
+    
+    # Create cache directory if it doesn't exist
+    if not os.path.exists(cache_dir):
+        os.makedirs(cache_dir, mode=0o755)
+        logger.info(f"Created cache directory: {cache_dir}")
+        
+        # Set ownership to logstash:logstash
+        try:
+            logstash_uid = pwd.getpwnam('logstash').pw_uid
+            logstash_gid = grp.getgrnam('logstash').gr_gid
+            os.chown(cache_dir, logstash_uid, logstash_gid)
+            logger.info(f"Set cache directory ownership to logstash:logstash")
+        except (KeyError, OSError) as e:
+            logger.warning(f"Could not set cache directory ownership: {e}")
+    
+    # Check if tarball already exists in cache
+    cached_tarball = os.path.join(cache_dir, f"logstash-agent-{version}.tar.gz")
+    
+    if os.path.exists(cached_tarball):
+        logger.info(f"✓ Found cached download: {cached_tarball}")
+        logger.info("Skipping download (using cached version)")
+        return cached_tarball
+    
     # GitHub release URL
-    url = f"https://github.com/elastic/LogstashAgent/releases/download/{version}/logstash-agent-linux-amd64.tar.gz"
-    tarball_path = os.path.join(download_dir, f"logstash-agent-{version}.tar.gz")
+    url = f"https://github.com/elastic/LogstashAgent/releases/download/v{version}/logstash-agent-linux-amd64.tar.gz"
     
     logger.info(f"Downloading {url}...")
+    logger.info(f"Cache location: {cached_tarball}")
     
     try:
         response = requests.get(url, stream=True, timeout=60)
@@ -633,7 +665,7 @@ def download_release(version: str, download_dir: str) -> str:
         total_size = int(response.headers.get('content-length', 0))
         downloaded = 0
         
-        with open(tarball_path, 'wb') as f:
+        with open(cached_tarball, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192):
                 if chunk:
                     f.write(chunk)
@@ -642,8 +674,17 @@ def download_release(version: str, download_dir: str) -> str:
                         percent = (downloaded / total_size) * 100
                         logger.debug(f"Downloaded {percent:.1f}%")
         
-        logger.info(f"✓ Downloaded {tarball_path}")
-        return tarball_path
+        # Set ownership to logstash:logstash so agent can read it
+        try:
+            logstash_uid = pwd.getpwnam('logstash').pw_uid
+            logstash_gid = grp.getgrnam('logstash').gr_gid
+            os.chown(cached_tarball, logstash_uid, logstash_gid)
+            os.chmod(cached_tarball, 0o644)  # rw-r--r--
+        except (KeyError, OSError) as e:
+            logger.warning(f"Could not set tarball ownership: {e}")
+        
+        logger.info(f"✓ Downloaded to cache: {cached_tarball}")
+        return cached_tarball
         
     except requests.exceptions.RequestException as e:
         raise InstallError(f"Failed to download release {version}: {e}")
@@ -864,6 +905,15 @@ def perform_upgrade(version: str, auto: bool = False) -> None:
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
             logger.info("✓ Removed temporary files")
+        
+        # Remove cached tarball after successful upgrade
+        cached_tarball = os.path.join(INSTALL_PATHS['cache_dir'], f"logstash-agent-{version}.tar.gz")
+        if os.path.exists(cached_tarball):
+            try:
+                os.remove(cached_tarball)
+                logger.info(f"✓ Removed cached tarball: {cached_tarball}")
+            except OSError as e:
+                logger.warning(f"Could not remove cached tarball: {e}")
         
         # Upgrade complete
         logger.info("\n" + "="*60)
