@@ -1681,17 +1681,14 @@ def run_controller():
                             logger.info(f"Spawning upgrade process: sudo {binary_path} upgrade --version {upgrade_version} --yes")
                             
                             # Start upgrade process fully detached from parent
-                            # Redirect all I/O to prevent issues when parent exits
-                            # Upgrade logs will be written to /var/log/logstash-agent/logstashagent.log
-                            with open('/dev/null', 'w') as devnull:
-                                subprocess.Popen(
-                                    ['sudo', binary_path, 'upgrade', '--version', upgrade_version, '--yes'],
-                                    stdout=devnull,
-                                    stderr=devnull,
-                                    stdin=subprocess.DEVNULL,
-                                    start_new_session=True,
-                                    close_fds=True
-                                )
+                            # Let stderr go to systemd journal for error visibility
+                            # stdin redirected to prevent hanging on input
+                            subprocess.Popen(
+                                ['sudo', binary_path, 'upgrade', '--version', upgrade_version, '--yes'],
+                                stdin=subprocess.DEVNULL,
+                                start_new_session=True,
+                                close_fds=True
+                            )
                             
                             logger.info("Upgrade process spawned. Waiting for upgrade to stop service...")
                             logger.info("Upgrade logs: tail -f /var/log/logstash-agent/logstashagent.log")
