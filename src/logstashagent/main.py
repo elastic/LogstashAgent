@@ -8,9 +8,9 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 import sys
 
-# Check early whether we're in a non-simulation mode (--run, --enroll, or install).
+# Check early whether we're in a non-simulation mode (--run, --enroll, install, upgrade, or uninstall).
 # slots starts background threads on import, so we skip it in these modes.
-_SKIP_SIMULATION_IMPORTS = '--run' in sys.argv or '--enroll' in sys.argv or 'install' in sys.argv
+_SKIP_SIMULATION_IMPORTS = '--run' in sys.argv or '--enroll' in sys.argv or 'install' in sys.argv or 'upgrade' in sys.argv or 'uninstall' in sys.argv
 
 from fastapi import FastAPI, HTTPException, Path as FastAPIPath, Query, Request
 from fastapi.responses import JSONResponse
