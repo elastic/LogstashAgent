@@ -412,11 +412,19 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
 # This file is managed by logstash-agent installation
 Defaults:logstash !requiretty
 
-# Allow service management
+# Allow Logstash service management
 logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart logstash
 logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop logstash
 logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl start logstash
 logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl status logstash
+
+# Allow LogstashAgent service management (needed for upgrades)
+logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop logstash-agent
+logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl start logstash-agent
+logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl is-active logstash-agent
+
+# Allow LogstashAgent upgrade command (runs as root to replace binary)
+logstash ALL=(ALL) NOPASSWD: /opt/logstash-agent/bin/logstash-agent upgrade *
 
 # Allow modification of Logstash environment file (for keystore password)
 logstash ALL=(ALL) NOPASSWD: /usr/bin/tee /etc/default/logstash
@@ -796,17 +804,25 @@ def perform_upgrade(version: str, auto: bool = False) -> None:
         else:
             logger.info("Service is not running")
         
-        # Step 6: Stop service if running
-        if service_was_running:
-            logger.info("\nStep 6: Stopping service...")
-            try:
-                subprocess.run(['systemctl', 'stop', 'logstash-agent'], 
-                             check=True, capture_output=True, timeout=30)
+        # Step 6: Stop service (always stop to prevent "Text file busy" error)
+        logger.info("\nStep 6: Stopping service...")
+        try:
+            # Always stop the service, even if verify_service_running() returned False
+            # This handles race conditions where systemd is restarting the service
+            result = subprocess.run(['systemctl', 'stop', 'logstash-agent'], 
+                         capture_output=True, timeout=30)
+            if result.returncode == 0:
                 logger.info("✓ Service stopped")
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-                raise InstallError(f"Failed to stop service: {e}")
-        else:
-            logger.info("\nStep 6: Service not running, skipping stop")
+            else:
+                # Service might not exist or already stopped - that's okay
+                logger.info("Service stop attempted (may not have been running)")
+            
+            # Wait a moment for the process to fully terminate
+            import time
+            time.sleep(2)
+            
+        except subprocess.TimeoutExpired as e:
+            raise InstallError(f"Failed to stop service (timeout): {e}")
         
         # Step 7: Backup current binary and dependencies
         logger.info("\nStep 7: Backing up current binary...")

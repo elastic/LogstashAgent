@@ -24,7 +24,7 @@ from .ls_keystore_utils.exceptions import (
     IncorrectPassword,
     LogstashKeystoreModified
 )
-
+from importlib.metadata import version as get_version, PackageNotFoundError
 
 def _decrypt_from_server(raw_api_key: str, encrypted: str) -> str:
     """
@@ -1632,8 +1632,34 @@ def run_controller():
                 # Check for upgrade notification from desired_agent_version field
                 if result.get('desired_agent_version'):
                     upgrade_version = result['desired_agent_version']
+                    
+                    # Get current version
+
+                    try:
+                        current_version = get_version("LogstashAgent")
+                    except PackageNotFoundError:
+                        # Fallback to reading from pyproject.toml
+                        try:
+                            import tomllib
+                            from pathlib import Path
+                            agent_root = Path(__file__).resolve().parent.parent.parent
+                            pyproject_path = agent_root / "pyproject.toml"
+                            if pyproject_path.exists():
+                                with open(pyproject_path, "rb") as f:
+                                    pyproject_data = tomllib.load(f)
+                                    current_version = pyproject_data.get("project", {}).get("version", "unknown")
+                            else:
+                                current_version = "unknown"
+                        except Exception:
+                            current_version = "unknown"
+                    
+                    # Skip upgrade if already on desired version
+                    if current_version == upgrade_version:
+                        logger.info(f"Already on version {upgrade_version}, skipping upgrade")
+                        continue
+                    
                     logger.info("=" * 60)
-                    logger.info(f"UPGRADE AVAILABLE: {upgrade_version}")
+                    logger.info(f"UPGRADE AVAILABLE: {upgrade_version} (current: {current_version})")
                     logger.info("=" * 60)
                     logger.info(f"Initiating automatic upgrade to version {upgrade_version}...")
                     
@@ -1649,14 +1675,13 @@ def run_controller():
                             # Fallback to current executable if not installed
                             binary_path = sys.executable
                         
-                        logger.info(f"Spawning upgrade process: {binary_path} upgrade --version {upgrade_version} --yes")
+                        logger.info(f"Spawning upgrade process: sudo {binary_path} upgrade --version {upgrade_version} --yes")
                         
-                        # Start upgrade process in background
+                        # Start upgrade process in background with sudo (upgrade requires root)
+                        # Output will go to systemd journal (can view with: journalctl -u logstash-agent)
                         subprocess.Popen(
-                            [binary_path, 'upgrade', '--version', upgrade_version, '--yes'],
-                            start_new_session=True,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL
+                            ['sudo', binary_path, 'upgrade', '--version', upgrade_version, '--yes'],
+                            start_new_session=True
                         )
                         
                         logger.info("Upgrade process spawned. Exiting to allow service restart...")
