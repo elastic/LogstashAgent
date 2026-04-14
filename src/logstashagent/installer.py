@@ -191,6 +191,16 @@ def install_binary():
             # Copy the entire _internal directory
             shutil.copytree(internal_source, internal_dest)
             logger.info(f"✓ Installed PyInstaller dependencies to {internal_dest}")
+            
+            # Set SELinux context for _internal directory on RHEL/CentOS
+            try:
+                result = subprocess.run(['which', 'restorecon'], capture_output=True)
+                if result.returncode == 0:
+                    subprocess.run(['restorecon', '-Rv', internal_dest], 
+                                 check=False, capture_output=True)
+                    logger.debug(f"Set SELinux context for {internal_dest}")
+            except Exception:
+                pass
         else:
             logger.warning("_internal directory not found - this may be a onefile build")
     else:
@@ -204,6 +214,16 @@ def install_binary():
         shutil.copy2(source_binary, INSTALL_PATHS['binary'])
         os.chmod(INSTALL_PATHS['binary'], 0o755)
         logger.info(f"✓ Installed binary to {INSTALL_PATHS['binary']}")
+    
+    # Set SELinux context for RHEL/CentOS systems
+    try:
+        result = subprocess.run(['which', 'restorecon'], capture_output=True)
+        if result.returncode == 0:
+            subprocess.run(['restorecon', '-v', INSTALL_PATHS['binary']], 
+                         check=False, capture_output=True)
+            logger.info(f"✓ Set SELinux context for {INSTALL_PATHS['binary']}")
+    except Exception as e:
+        logger.debug(f"SELinux context setting skipped: {e}")
 
 
 def create_symlink():
@@ -911,8 +931,28 @@ def perform_upgrade(version: str, auto: bool = False) -> None:
             # Copy the entire _internal directory
             shutil.copytree(internal_source, internal_dest)
             logger.info(f"✓ Installed PyInstaller dependencies to {internal_dest}")
+            
+            # Set SELinux context for _internal directory on RHEL/CentOS
+            try:
+                result = subprocess.run(['which', 'restorecon'], capture_output=True)
+                if result.returncode == 0:
+                    subprocess.run(['restorecon', '-Rv', internal_dest], 
+                                 check=False, capture_output=True)
+                    logger.debug(f"Set SELinux context for {internal_dest}")
+            except Exception:
+                pass
         else:
             logger.warning("_internal directory not found in upgrade package")
+        
+        # Set SELinux context for upgraded binary on RHEL/CentOS
+        try:
+            result = subprocess.run(['which', 'restorecon'], capture_output=True)
+            if result.returncode == 0:
+                subprocess.run(['restorecon', '-v', INSTALL_PATHS['binary']], 
+                             check=False, capture_output=True)
+                logger.info(f"✓ Set SELinux context for upgraded binary")
+        except Exception as e:
+            logger.debug(f"SELinux context setting skipped: {e}")
         
         # Step 9: Restart service (always restart after upgrade)
         logger.info("\nStep 9: Restarting service with new binary...")
