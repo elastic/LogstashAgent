@@ -43,22 +43,49 @@ def update_logstash_env_file(password: str) -> None:
     Write (or update) LOGSTASH_KEYSTORE_PASS in /etc/default/logstash so that
     the Logstash systemd service can open the password-protected keystore on startup.
 
-    Uses sudo tee as configured in /etc/sudoers.d/logstash-agent since the agent
+    Uses sudo tee/cat as configured in /etc/sudoers.d/logstash-agent since the agent
     runs as the logstash user and /etc/default/logstash is root-owned.
     
     The file is written with mode 0o640 so that Logstash (running as the
     logstash user/group) can read it but unprivileged users cannot.
+    
+    Raises:
+        FileNotFoundError: If /etc/default/logstash doesn't exist
+        OSError: If unable to read or write the file
     """
     var_name = 'LOGSTASH_KEYSTORE_PASS'
 
-    # Read existing lines, stripping any previous LOGSTASH_KEYSTORE_PASS entry
-    existing_lines = []
-    if _LOGSTASH_ENV_FILE.exists():
-        try:
-            existing_lines = _LOGSTASH_ENV_FILE.read_text(encoding='utf-8').splitlines()
-        except OSError as e:
-            logger.warning(f"Could not read {_LOGSTASH_ENV_FILE}: {e}")
+    # Verify the file exists - it should always exist on a proper Logstash installation
+    if not _LOGSTASH_ENV_FILE.exists():
+        logger.error(f"{_LOGSTASH_ENV_FILE} does not exist - Logstash may not be properly installed")
+        raise FileNotFoundError(
+            f"{_LOGSTASH_ENV_FILE} not found. "
+            "This file should be created by the Logstash package installation. "
+            "Please verify Logstash is properly installed."
+        )
 
+    # Read existing lines using sudo cat since we don't have read permission
+    existing_lines = []
+    try:
+        result = subprocess.run(
+            ['sudo', 'cat', str(_LOGSTASH_ENV_FILE)],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            existing_lines = result.stdout.splitlines()
+        else:
+            logger.error(f"Failed to read {_LOGSTASH_ENV_FILE}: {result.stderr}")
+            raise OSError(f"Cannot read {_LOGSTASH_ENV_FILE}")
+    except subprocess.TimeoutExpired:
+        logger.error(f"Timeout reading {_LOGSTASH_ENV_FILE}")
+        raise
+    except Exception as e:
+        logger.error(f"Failed to read {_LOGSTASH_ENV_FILE}: {e}")
+        raise
+
+    # Filter out any existing LOGSTASH_KEYSTORE_PASS line and add the new one
     filtered = [ln for ln in existing_lines if not ln.startswith(f'{var_name}=')]
     filtered.append(f'{var_name}={password}')
 
@@ -76,19 +103,24 @@ def update_logstash_env_file(password: str) -> None:
         
         if result.returncode == 0:
             # Set permissions using sudo chmod
-            subprocess.run(
+            chmod_result = subprocess.run(
                 ['sudo', 'chmod', '640', str(_LOGSTASH_ENV_FILE)],
                 capture_output=True,
                 timeout=5,
-                check=False  # Non-fatal if this fails
+                check=False
             )
+            if chmod_result.returncode != 0:
+                logger.warning(f"Failed to set permissions on {_LOGSTASH_ENV_FILE}: {chmod_result.stderr}")
             logger.info(f"Updated {var_name} in {_LOGSTASH_ENV_FILE}")
         else:
             logger.error(f"Failed to write {_LOGSTASH_ENV_FILE}: {result.stderr}")
+            raise OSError(f"Cannot write to {_LOGSTASH_ENV_FILE}")
     except subprocess.TimeoutExpired:
         logger.error(f"Timeout writing {_LOGSTASH_ENV_FILE}")
+        raise
     except Exception as e:
         logger.error(f"Failed to write {_LOGSTASH_ENV_FILE}: {e}")
+        raise
 
 logger = logging.getLogger(__name__)
 

@@ -448,7 +448,9 @@ logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl is-active logstash-agent
 logstash ALL=(ALL) NOPASSWD: /opt/logstash-agent/bin/logstash-agent upgrade *
 
 # Allow modification of Logstash environment file (for keystore password)
+logstash ALL=(ALL) NOPASSWD: /usr/bin/cat /etc/default/logstash
 logstash ALL=(ALL) NOPASSWD: /usr/bin/tee /etc/default/logstash
+logstash ALL=(ALL) NOPASSWD: /usr/bin/chmod 640 /etc/default/logstash
 """
         try:
             with open(sudoers_file, 'w') as f:
