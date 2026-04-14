@@ -14,8 +14,16 @@ from logstashagent import agent_state
 
 
 def test_default_state_dir_is_package_local():
-    expected = Path(agent_state.__file__).resolve().parent / "data"
-    assert agent_state.STATE_DIR.resolve() == expected
+    """Test STATE_DIR defaults to package local or installed location."""
+    # STATE_DIR can be either /var/lib/logstash-agent (if installed) or package local
+    import os
+    if os.path.exists('/var/lib/logstash-agent'):
+        # Installed location takes precedence
+        assert agent_state.STATE_DIR == Path('/var/lib/logstash-agent')
+    else:
+        # Falls back to package local
+        expected = Path(agent_state.__file__).resolve().parent / "data"
+        assert agent_state.STATE_DIR.resolve() == expected
 
 
 @pytest.fixture

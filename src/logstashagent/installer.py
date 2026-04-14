@@ -421,6 +421,7 @@ logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl status logstash
 # Allow LogstashAgent service management (needed for upgrades)
 logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop logstash-agent
 logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl start logstash-agent
+logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart logstash-agent
 logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl is-active logstash-agent
 
 # Allow LogstashAgent upgrade command (runs as root to replace binary)
@@ -598,6 +599,19 @@ def perform_uninstallation(purge: bool = False) -> None:
             logger.info(f"Log directory preserved: {INSTALL_PATHS['log_dir']}")
             logger.info("(Use --purge to remove logs)")
         
+        # Step 9: Optionally remove cache directory
+        if purge:
+            logger.info("\nStep 9: Removing cache directory (--purge)...")
+            if os.path.exists(INSTALL_PATHS['cache_dir']):
+                shutil.rmtree(INSTALL_PATHS['cache_dir'])
+                logger.info(f"✓ Removed {INSTALL_PATHS['cache_dir']}")
+            else:
+                logger.info("Cache directory not found, skipping")
+        else:
+            logger.info("\nStep 9: Preserving cache directory...")
+            logger.info(f"Cache directory preserved: {INSTALL_PATHS['cache_dir']}")
+            logger.info("(Use --purge to remove cached downloads)")
+        
         # Uninstallation complete
         logger.info("\n" + "="*60)
         logger.info("UNINSTALLATION COMPLETED SUCCESSFULLY!")
@@ -607,6 +621,7 @@ def perform_uninstallation(purge: bool = False) -> None:
             logger.info("\nPreserved directories:")
             logger.info(f"  - {INSTALL_PATHS['state_dir']}")
             logger.info(f"  - {INSTALL_PATHS['log_dir']}")
+            logger.info(f"  - {INSTALL_PATHS['cache_dir']}")
             logger.info("\nTo remove these, run:")
             logger.info("  sudo logstash-agent uninstall --purge")
         
@@ -804,25 +819,11 @@ def perform_upgrade(version: str, auto: bool = False) -> None:
         else:
             logger.info("Service is not running")
         
-        # Step 6: Stop service (always stop to prevent "Text file busy" error)
-        logger.info("\nStep 6: Stopping service...")
-        try:
-            # Always stop the service, even if verify_service_running() returned False
-            # This handles race conditions where systemd is restarting the service
-            result = subprocess.run(['systemctl', 'stop', 'logstash-agent'], 
-                         capture_output=True, timeout=30)
-            if result.returncode == 0:
-                logger.info("✓ Service stopped")
-            else:
-                # Service might not exist or already stopped - that's okay
-                logger.info("Service stop attempted (may not have been running)")
-            
-            # Wait a moment for the process to fully terminate
-            import time
-            time.sleep(2)
-            
-        except subprocess.TimeoutExpired as e:
-            raise InstallError(f"Failed to stop service (timeout): {e}")
+        # Step 6: Skip stopping service - just overwrite and restart
+        # The atomic rename allows us to replace the binary while it's running
+        # Then systemctl restart will cleanly stop old process and start new one
+        logger.info("\nStep 6: Skipping service stop (will restart after binary replacement)...")
+        logger.info("✓ Service will be restarted with new binary")
         
         # Step 7: Backup current binary and dependencies
         logger.info("\nStep 7: Backing up current binary...")
@@ -902,12 +903,12 @@ def perform_upgrade(version: str, auto: bool = False) -> None:
         else:
             logger.warning("_internal directory not found in upgrade package")
         
-        # Step 9: Start service (always start after upgrade)
-        logger.info("\nStep 9: Starting service with new binary...")
+        # Step 9: Restart service (always restart after upgrade)
+        logger.info("\nStep 9: Restarting service with new binary...")
         try:
-            subprocess.run(['systemctl', 'start', 'logstash-agent'], 
+            subprocess.run(['systemctl', 'restart', 'logstash-agent'], 
                          check=True, capture_output=True, timeout=30)
-            logger.info("✓ Service started")
+            logger.info("✓ Service restarted")
             
             # Step 10: Verify service is running
             logger.info("\nStep 10: Verifying service health...")
@@ -924,27 +925,71 @@ def perform_upgrade(version: str, auto: bool = False) -> None:
             logger.error(f"Service failed to start: {e}")
             logger.info("\nPerforming rollback...")
             
-            # Stop the failed service
-            subprocess.run(['systemctl', 'stop', 'logstash-agent'], 
-                         check=False, capture_output=True)
+            rollback_success = True
+            rollback_errors = []
             
-            # Restore backup binary
-            shutil.copy2(backup_path, INSTALL_PATHS['binary'])
-            logger.info("✓ Restored previous binary")
+            try:
+                # Stop the failed service
+                subprocess.run(['systemctl', 'stop', 'logstash-agent'], 
+                             check=False, capture_output=True)
+                logger.info("✓ Stopped failed service")
+            except Exception as stop_error:
+                logger.warning(f"Could not stop service: {stop_error}")
+                rollback_errors.append(f"Failed to stop service: {stop_error}")
             
-            # Restore backup _internal if it exists
-            internal_backup_path = f"{INSTALL_PATHS['binary_dir']}/_internal.backup"
-            if os.path.exists(internal_backup_path):
-                internal_dest = os.path.join(INSTALL_PATHS['binary_dir'], '_internal')
-                if os.path.exists(internal_dest):
-                    shutil.rmtree(internal_dest)
-                shutil.copytree(internal_backup_path, internal_dest)
-                logger.info("✓ Restored previous dependencies")
+            try:
+                # Restore backup binary
+                if not os.path.exists(backup_path):
+                    raise InstallError(f"Backup binary not found at {backup_path}")
+                shutil.copy2(backup_path, INSTALL_PATHS['binary'])
+                logger.info("✓ Restored previous binary")
+            except Exception as restore_error:
+                logger.error(f"Failed to restore binary: {restore_error}")
+                rollback_errors.append(f"Failed to restore binary: {restore_error}")
+                rollback_success = False
             
-            # Start with old binary
-            subprocess.run(['systemctl', 'start', 'logstash-agent'], 
-                         check=True, capture_output=True, timeout=30)
-            logger.info("✓ Service restarted with previous version")
+            try:
+                # Restore backup _internal if it exists
+                internal_backup_path = f"{INSTALL_PATHS['binary_dir']}/_internal.backup"
+                if os.path.exists(internal_backup_path):
+                    internal_dest = os.path.join(INSTALL_PATHS['binary_dir'], '_internal')
+                    if os.path.exists(internal_dest):
+                        shutil.rmtree(internal_dest)
+                    shutil.copytree(internal_backup_path, internal_dest)
+                    logger.info("✓ Restored previous dependencies")
+            except Exception as deps_error:
+                logger.warning(f"Failed to restore dependencies: {deps_error}")
+                rollback_errors.append(f"Failed to restore dependencies: {deps_error}")
+            
+            if rollback_success:
+                try:
+                    # Start with old binary
+                    subprocess.run(['systemctl', 'start', 'logstash-agent'], 
+                                 check=True, capture_output=True, timeout=30)
+                    logger.info("✓ Service restarted with previous version")
+                    logger.info("\nRollback completed successfully")
+                except Exception as start_error:
+                    logger.error(f"Failed to start service after rollback: {start_error}")
+                    rollback_errors.append(f"Failed to start service: {start_error}")
+                    rollback_success = False
+            
+            if not rollback_success:
+                logger.error("\n" + "="*60)
+                logger.error("ROLLBACK FAILED - MANUAL INTERVENTION REQUIRED")
+                logger.error("="*60)
+                logger.error("\nRollback errors:")
+                for error in rollback_errors:
+                    logger.error(f"  - {error}")
+                logger.error("\nManual recovery steps:")
+                logger.error(f"  1. Check if backup exists: ls -la {backup_path}")
+                logger.error(f"  2. Manually restore: sudo cp {backup_path} {INSTALL_PATHS['binary']}")
+                logger.error(f"  3. Restore permissions: sudo chmod 755 {INSTALL_PATHS['binary']}")
+                logger.error(f"  4. Start service: sudo systemctl start logstash-agent")
+                logger.error(f"  5. Check status: sudo systemctl status logstash-agent")
+                logger.error("="*60)
+                raise InstallError(
+                    f"Upgrade failed and rollback encountered errors. "
+                    f"Manual recovery required. See log for details.")
             
             raise InstallError(f"Upgrade failed and was rolled back: {e}")
         
@@ -954,14 +999,24 @@ def perform_upgrade(version: str, auto: bool = False) -> None:
             shutil.rmtree(temp_dir)
             logger.info("✓ Removed temporary files")
         
-        # Remove cached tarball after successful upgrade
-        cached_tarball = os.path.join(INSTALL_PATHS['cache_dir'], f"logstash-agent-{version}.tar.gz")
-        if os.path.exists(cached_tarball):
+        # Remove backup files after successful upgrade
+        if os.path.exists(backup_path):
             try:
-                os.remove(cached_tarball)
-                logger.info(f"✓ Removed cached tarball: {cached_tarball}")
+                os.remove(backup_path)
+                logger.info(f"✓ Removed backup binary: {backup_path}")
             except OSError as e:
-                logger.warning(f"Could not remove cached tarball: {e}")
+                logger.warning(f"Could not remove backup binary: {e}")
+        
+        internal_backup_path = f"{INSTALL_PATHS['binary_dir']}/_internal.backup"
+        if os.path.exists(internal_backup_path):
+            try:
+                shutil.rmtree(internal_backup_path)
+                logger.info(f"✓ Removed backup dependencies: {internal_backup_path}")
+            except OSError as e:
+                logger.warning(f"Could not remove backup dependencies: {e}")
+        
+        # Keep cached tarball for future upgrades (persistent cache)
+        logger.debug(f"Cached tarball preserved at {INSTALL_PATHS['cache_dir']} for future use")
         
         # Upgrade complete
         logger.info("\n" + "="*60)

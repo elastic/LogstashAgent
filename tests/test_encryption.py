@@ -57,7 +57,8 @@ class TestGetEncryptionKey:
         valid_key = Fernet.generate_key()
         key_file.write_bytes(valid_key)
 
-        with patch("logstashagent.encryption.Path") as mock_path:
+        with patch("logstashagent.encryption.os.path.exists", return_value=False), \
+             patch("logstashagent.encryption.Path") as mock_path:
             mock_path.return_value.resolve.return_value.parent = temp_data_dir.parent
             key = get_encryption_key()
 
@@ -67,7 +68,8 @@ class TestGetEncryptionKey:
         key_file = temp_data_dir / ".secret_key"
         key_file.write_bytes(b"invalid-key-data")
 
-        with patch("logstashagent.encryption.Path") as mock_path:
+        with patch("logstashagent.encryption.os.path.exists", return_value=False), \
+             patch("logstashagent.encryption.Path") as mock_path:
             mock_path.return_value.resolve.return_value.parent = temp_data_dir.parent
             with pytest.raises(RuntimeError, match="Invalid encryption key in file"):
                 get_encryption_key()
@@ -75,7 +77,8 @@ class TestGetEncryptionKey:
     def test_generate_new_key_and_persist(self, no_env_credential_key, temp_data_dir):
         key_file = temp_data_dir / ".secret_key"
 
-        with patch("logstashagent.encryption.Path") as mock_path:
+        with patch("logstashagent.encryption.os.path.exists", return_value=False), \
+             patch("logstashagent.encryption.Path") as mock_path:
             mock_path.return_value.resolve.return_value.parent = temp_data_dir.parent
             key = get_encryption_key()
 
@@ -89,7 +92,8 @@ class TestGetEncryptionKey:
         key_file = temp_data_dir / ".secret_key"
         key_file.write_bytes(Fernet.generate_key())
 
-        with patch("logstashagent.encryption.Path") as mock_path:
+        with patch("logstashagent.encryption.os.path.exists", return_value=False), \
+             patch("logstashagent.encryption.Path") as mock_path:
             mock_path.return_value.resolve.return_value.parent = temp_data_dir.parent
             with patch("builtins.open", side_effect=PermissionError("Access denied")):
                 with pytest.raises(
@@ -105,7 +109,8 @@ class TestEncryptDecryptCredential:
     def test_encrypt_decrypt_round_trip(self, no_env_credential_key, temp_data_dir):
         plaintext = "my-secret-password"
 
-        with patch("logstashagent.encryption.Path") as mock_path:
+        with patch("logstashagent.encryption.os.path.exists", return_value=False), \
+             patch("logstashagent.encryption.Path") as mock_path:
             mock_path.return_value.resolve.return_value.parent = temp_data_dir.parent
 
             encrypted = encrypt_credential(plaintext)
@@ -138,7 +143,8 @@ class TestEncryptDecryptCredential:
             decrypt_credential(["list"])
 
     def test_decrypt_invalid_token(self, no_env_credential_key, temp_data_dir):
-        with patch("logstashagent.encryption.Path") as mock_path:
+        with patch("logstashagent.encryption.os.path.exists", return_value=False), \
+             patch("logstashagent.encryption.Path") as mock_path:
             mock_path.return_value.resolve.return_value.parent = temp_data_dir.parent
 
             with pytest.raises(
@@ -155,7 +161,8 @@ class TestEncryptDecryptCredential:
         key_file = temp_data_dir / ".secret_key"
         key_file.write_bytes(Fernet.generate_key())
 
-        with patch("logstashagent.encryption.Path") as mock_path:
+        with patch("logstashagent.encryption.os.path.exists", return_value=False), \
+             patch("logstashagent.encryption.Path") as mock_path:
             mock_path.return_value.resolve.return_value.parent = temp_data_dir.parent
 
             with pytest.raises(
@@ -167,7 +174,8 @@ class TestEncryptDecryptCredential:
     def test_encrypt_unicode_characters(self, no_env_credential_key, temp_data_dir):
         plaintext = "🔒 Secret with émojis and spëcial çhars 中文"
 
-        with patch("logstashagent.encryption.Path") as mock_path:
+        with patch("logstashagent.encryption.os.path.exists", return_value=False), \
+             patch("logstashagent.encryption.Path") as mock_path:
             mock_path.return_value.resolve.return_value.parent = temp_data_dir.parent
 
             encrypted = encrypt_credential(plaintext)

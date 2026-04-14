@@ -16,7 +16,6 @@ from pathlib import Path
 from datetime import datetime, timezone
 from cryptography.fernet import Fernet
 from . import agent_state
-from . import encryption
 from . import log_analyzer
 from .ls_keystore_utils import LogstashKeystore
 from .ls_keystore_utils.exceptions import (
@@ -1659,7 +1658,7 @@ def run_controller():
                     
                     # Skip upgrade if already on desired version
                     if current_version == upgrade_version:
-                        logger.info(f"Already on version {upgrade_version}, skipping upgrade")
+                        logger.info(f"Already on the desired Agent version {upgrade_version}")
                     else:
                         logger.info("=" * 60)
                         logger.info(f"UPGRADE AVAILABLE: {upgrade_version} (current: {current_version})")
@@ -1680,9 +1679,9 @@ def run_controller():
                             
                             logger.info(f"Spawning upgrade process: sudo {binary_path} upgrade --version {upgrade_version} --yes")
                             
-                            # Start upgrade process fully detached from parent
-                            # Let stderr go to systemd journal for error visibility
-                            # stdin redirected to prevent hanging on input
+                            # Spawn upgrade subprocess with full detachment
+                            # The upgrade will stop the service (killing us), replace binary, and restart
+                            # Let stdout/stderr go to systemd journal for error visibility
                             subprocess.Popen(
                                 ['sudo', binary_path, 'upgrade', '--version', upgrade_version, '--yes'],
                                 stdin=subprocess.DEVNULL,
@@ -1690,16 +1689,15 @@ def run_controller():
                                 close_fds=True
                             )
                             
-                            logger.info("Upgrade process spawned. Waiting for upgrade to stop service...")
-                            logger.info("Upgrade logs: tail -f /var/log/logstash-agent/logstashagent.log")
+                            logger.info("Upgrade process spawned")
+                            logger.info("Waiting for upgrade to stop service and replace binary...")
                             logger.info("=" * 60)
                             
-                            # Mark upgrade as initiated to prevent spawning another upgrade
+                            # Mark upgrade as initiated to prevent spawning another
                             upgrade_initiated = True
                             
-                            # Don't exit - let the upgrade process stop the service
-                            # The upgrade will run 'systemctl stop logstash-agent' which will kill us
-                            # If we exit now, systemd will restart us before the upgrade completes
+                            # Continue running - upgrade will stop the service which kills us
+                            # Then upgrade will restart the service with the new binary
                             
                         except Exception as e:
                             logger.error(f"Failed to initiate automatic upgrade: {e}")

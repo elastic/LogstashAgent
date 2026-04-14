@@ -66,10 +66,11 @@ class TestSupervisorInit:
 
 class TestStartLogstash:
     @patch("logstashagent.logstash_supervisor.os.name", "posix")
+    @patch("logstashagent.logstash_supervisor.os.getpgid", return_value=12345)
     @patch("logstashagent.logstash_supervisor.subprocess.Popen")
     @patch("logstashagent.logstash_supervisor.os.path.exists", return_value=True)
     @patch("logstashagent.logstash_supervisor.os.chmod")
-    def test_start_spawns_process(self, _chmod, _exists, mock_popen,
+    def test_start_spawns_process(self, _chmod, _exists, mock_popen, _getpgid,
                                    supervisor_instance, mock_logstash_process):
         mock_popen.return_value = mock_logstash_process
         supervisor_instance.start_logstash()
@@ -80,10 +81,11 @@ class TestStartLogstash:
         assert supervisor_instance.process is mock_logstash_process
 
     @patch("logstashagent.logstash_supervisor.os.name", "posix")
+    @patch("logstashagent.logstash_supervisor.os.getpgid", return_value=12345)
     @patch("logstashagent.logstash_supervisor.subprocess.Popen")
     @patch("logstashagent.logstash_supervisor.os.path.exists", return_value=True)
     @patch("logstashagent.logstash_supervisor.os.chmod")
-    def test_start_sets_logstash_url_embedded(self, _c, _e, mock_popen,
+    def test_start_sets_logstash_url_embedded(self, _c, _e, mock_popen, _getpgid,
                                                supervisor_instance, mock_logstash_process):
         mock_popen.return_value = mock_logstash_process
         with patch.dict(os.environ, {}, clear=False):
@@ -93,10 +95,11 @@ class TestStartLogstash:
         assert env["LOGSTASH_URL"] == "http://host.docker.internal:8080"
 
     @patch("logstashagent.logstash_supervisor.os.name", "posix")
+    @patch("logstashagent.logstash_supervisor.os.getpgid", return_value=12345)
     @patch("logstashagent.logstash_supervisor.subprocess.Popen")
     @patch("logstashagent.logstash_supervisor.os.path.exists", return_value=True)
     @patch("logstashagent.logstash_supervisor.os.chmod")
-    def test_start_sets_logstash_url_host(self, _c, _e, mock_popen,
+    def test_start_sets_logstash_url_host(self, _c, _e, mock_popen, _getpgid,
                                            supervisor_config_host, mock_logstash_process,
                                            reset_supervisor_global):
         mock_popen.return_value = mock_logstash_process
@@ -115,10 +118,11 @@ class TestStartLogstash:
             supervisor_instance.start_logstash()
 
     @patch("logstashagent.logstash_supervisor.os.name", "posix")
+    @patch("logstashagent.logstash_supervisor.os.getpgid", return_value=12345)
     @patch("logstashagent.logstash_supervisor.subprocess.Popen")
     @patch("logstashagent.logstash_supervisor.os.path.exists", return_value=True)
     @patch("logstashagent.logstash_supervisor.os.chmod")
-    def test_start_cleans_lock_file(self, _c, mock_exists, mock_popen,
+    def test_start_cleans_lock_file(self, _c, mock_exists, mock_popen, _getpgid,
                                      supervisor_instance, mock_logstash_process):
         mock_popen.return_value = mock_logstash_process
         with patch("logstashagent.logstash_supervisor.os.remove") as mock_rm:
@@ -127,10 +131,11 @@ class TestStartLogstash:
             mock_rm.assert_any_call("/usr/share/logstash/data/.lock")
 
     @patch("logstashagent.logstash_supervisor.os.name", "posix")
+    @patch("logstashagent.logstash_supervisor.os.getpgid", return_value=12345)
     @patch("logstashagent.logstash_supervisor.subprocess.Popen")
     @patch("logstashagent.logstash_supervisor.os.path.exists", return_value=True)
     @patch("logstashagent.logstash_supervisor.os.chmod")
-    def test_start_creates_monitor_thread(self, _c, _e, mock_popen,
+    def test_start_creates_monitor_thread(self, _c, _e, mock_popen, _getpgid,
                                            supervisor_instance, mock_logstash_process):
         mock_popen.return_value = mock_logstash_process
         supervisor_instance.start_logstash()
@@ -150,10 +155,11 @@ class TestStartLogstash:
         mock_popen.assert_not_called()
 
     @patch("logstashagent.logstash_supervisor.os.name", "posix")
+    @patch("logstashagent.logstash_supervisor.os.getpgid", return_value=12345)
     @patch("logstashagent.logstash_supervisor.subprocess.Popen")
     @patch("logstashagent.logstash_supervisor.os.path.exists", return_value=True)
     @patch("logstashagent.logstash_supervisor.os.chmod")
-    def test_start_host_mode_calls_setup(self, _c, _e, mock_popen,
+    def test_start_host_mode_calls_setup(self, _c, _e, mock_popen, _getpgid,
                                           supervisor_config_host, mock_logstash_process,
                                           reset_supervisor_global):
         mock_popen.return_value = mock_logstash_process

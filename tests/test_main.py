@@ -7,7 +7,7 @@
 import base64
 import os
 from unittest.mock import mock_open, patch
-
+import shutil
 import pytest
 import yaml
 
@@ -383,7 +383,7 @@ class TestMainEdgeCases:
         assert response.json() == {}
 
     def test_list_pipelines_with_data(self, client, mock_dirs):
-        """Test listing multiple pipelines"""
+        """Test listing multiple pipelines (includes system pipelines)"""
         for i in range(2):
             body = {
                 "pipeline": "input { stdin {} } output { stdout {} }",
@@ -395,6 +395,11 @@ class TestMainEdgeCases:
         assert response.status_code == 200
         data = response.json()
 
-        assert len(data) == 2
+        # Should have our 2 test pipelines plus system pipelines (simulate-start, simulate-end)
+        assert len(data) >= 2, "Should have at least our 2 test pipelines"
         assert "test-pipeline-0" in data
         assert "test-pipeline-1" in data
+        
+        # Verify our test pipelines have correct data
+        assert data["test-pipeline-0"]["description"] == "Pipeline 0"
+        assert data["test-pipeline-1"]["description"] == "Pipeline 1"

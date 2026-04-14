@@ -166,7 +166,7 @@ class TestRestartLogstash:
         assert controller.restart_logstash() is True
 
         mock_run.assert_called_with(
-            ["systemctl", "restart", "logstash"],
+            ["sudo", "systemctl", "restart", "logstash"],
             capture_output=True,
             text=True,
             timeout=30,
@@ -182,6 +182,7 @@ class TestRestartLogstash:
         assert controller.restart_logstash() is True
 
         assert mock_run.call_args_list[1][0][0] == [
+            "sudo",
             "service",
             "logstash",
             "restart",
