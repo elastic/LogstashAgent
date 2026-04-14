@@ -15,7 +15,13 @@ ENCRYPTED_KEYS = {'api_key', 'keystore_password'}
 
 # Path to state file - check for installed location first
 import os
-if os.path.exists('/var/lib/logstash-agent'):
+import sys
+
+# For install/upgrade/uninstall commands, always use production path
+# even if directory doesn't exist yet (it will be created during install)
+if len(sys.argv) > 1 and sys.argv[1] in ('install', 'upgrade', 'uninstall'):
+    STATE_DIR = Path('/var/lib/logstash-agent')
+elif os.path.exists('/var/lib/logstash-agent'):
     STATE_DIR = Path('/var/lib/logstash-agent')
 else:
     STATE_DIR = Path(__file__).parent / 'data'

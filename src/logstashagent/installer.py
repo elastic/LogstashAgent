@@ -455,6 +455,17 @@ logstash ALL=(ALL) NOPASSWD: /usr/bin/tee /etc/default/logstash
             logger.warning("EOF")
             logger.warning(f"  sudo chmod 440 {sudoers_file}")
         
+        # Step 10: Final ownership fix for state files
+        # This ensures state.json has correct ownership even if it was updated
+        # during module initialization (agent_id, agent_version)
+        logger.info("\nStep 10: Final ownership verification...")
+        for root, dirs, files in os.walk(INSTALL_PATHS['state_dir']):
+            for d in dirs:
+                os.chown(os.path.join(root, d), uid, gid)
+            for f in files:
+                os.chown(os.path.join(root, f), uid, gid)
+        logger.info(f"✓ Verified ownership on {INSTALL_PATHS['state_dir']}")
+        
         # Installation complete
         logger.info("\n" + "="*60)
         logger.info("INSTALLATION COMPLETED SUCCESSFULLY!")
