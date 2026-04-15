@@ -227,21 +227,28 @@ def install_binary():
 
 
 def create_symlink():
-    """Create symlink in /usr/local/bin"""
+    """Create symlink in /usr/local/bin or /usr/bin (RHEL)"""
     logger.info("Creating symlink...")
     
+    # On RHEL, /usr/local/bin is not in default PATH, so use /usr/bin instead
+    # Detect RHEL by checking for /etc/redhat-release
+    symlink_path = INSTALL_PATHS['symlink']
+    if os.path.exists('/etc/redhat-release'):
+        symlink_path = '/usr/bin/logstash-agent'
+        logger.info("RHEL detected, using /usr/bin for symlink")
+    
     # Remove existing symlink if it exists
-    if os.path.islink(INSTALL_PATHS['symlink']):
-        os.unlink(INSTALL_PATHS['symlink'])
-    elif os.path.exists(INSTALL_PATHS['symlink']):
+    if os.path.islink(symlink_path):
+        os.unlink(symlink_path)
+    elif os.path.exists(symlink_path):
         raise InstallError(
-            f"{INSTALL_PATHS['symlink']} exists and is not a symlink. "
+            f"{symlink_path} exists and is not a symlink. "
             "Please remove it manually."
         )
     
     # Create the symlink
-    os.symlink(INSTALL_PATHS['binary'], INSTALL_PATHS['symlink'])
-    logger.info(f"✓ Created symlink {INSTALL_PATHS['symlink']} -> {INSTALL_PATHS['binary']}")
+    os.symlink(INSTALL_PATHS['binary'], symlink_path)
+    logger.info(f"✓ Created symlink {symlink_path} -> {INSTALL_PATHS['binary']}")
 
 
 def write_config_file(logstash_ui_url: str):
@@ -288,10 +295,17 @@ def install_systemd_service():
     
     # Reload systemd
     try:
-        subprocess.run(['systemctl', 'daemon-reload'], check=True, capture_output=True)
+        result = subprocess.run(['systemctl', 'daemon-reload'], 
+                              check=True, capture_output=True, text=True)
         logger.info("✓ Reloaded systemd daemon")
     except subprocess.CalledProcessError as e:
         logger.warning(f"Failed to reload systemd: {e}")
+        if e.stderr:
+            logger.warning(f"stderr: {e.stderr}")
+        if e.stdout:
+            logger.warning(f"stdout: {e.stdout}")
+        # Non-fatal - systemctl enable/start will trigger reload anyway
+        logger.info("Continuing (daemon will reload on next systemctl command)")
 
 
 def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str, 
@@ -554,11 +568,17 @@ def perform_uninstallation(purge: bool = False) -> None:
             
             # Reload systemd
             try:
-                subprocess.run(['systemctl', 'daemon-reload'], 
-                             check=True, capture_output=True)
+                result = subprocess.run(['systemctl', 'daemon-reload'], 
+                                      check=True, capture_output=True, text=True)
                 logger.info("✓ Reloaded systemd daemon")
             except subprocess.CalledProcessError as e:
                 logger.warning(f"Failed to reload systemd: {e}")
+                if e.stderr:
+                    logger.warning(f"stderr: {e.stderr}")
+                if e.stdout:
+                    logger.warning(f"stdout: {e.stdout}")
+                # Non-fatal - systemd will eventually pick up the change
+                logger.info("Continuing (daemon will reload eventually)")
         else:
             logger.info("Service file not found, skipping")
         
@@ -574,14 +594,28 @@ def perform_uninstallation(purge: bool = False) -> None:
         else:
             logger.info("Sudoers file not found, skipping")
         
-        # Step 4: Remove symlink
+        # Step 4: Remove symlink (check both /usr/local/bin and /usr/bin for RHEL)
         logger.info("\nStep 4: Removing symlink...")
+        symlink_removed = False
+        
+        # Check /usr/local/bin (default location)
         if os.path.islink(INSTALL_PATHS['symlink']):
             os.unlink(INSTALL_PATHS['symlink'])
             logger.info(f"✓ Removed {INSTALL_PATHS['symlink']}")
+            symlink_removed = True
         elif os.path.exists(INSTALL_PATHS['symlink']):
             logger.warning(f"{INSTALL_PATHS['symlink']} exists but is not a symlink, skipping")
-        else:
+        
+        # Check /usr/bin (RHEL location)
+        rhel_symlink = '/usr/bin/logstash-agent'
+        if os.path.islink(rhel_symlink):
+            os.unlink(rhel_symlink)
+            logger.info(f"✓ Removed {rhel_symlink}")
+            symlink_removed = True
+        elif os.path.exists(rhel_symlink):
+            logger.warning(f"{rhel_symlink} exists but is not a symlink, skipping")
+        
+        if not symlink_removed:
             logger.info("Symlink not found, skipping")
         
         # Step 5: Remove binary directory

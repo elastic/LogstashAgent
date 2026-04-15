@@ -28,7 +28,7 @@ src/logstashagent/data/
 Thumbs.db
 
 # Docker
-Dockerfile
+docker/Dockerfile
 docker-compose*.yml
 .dockerignore
 
