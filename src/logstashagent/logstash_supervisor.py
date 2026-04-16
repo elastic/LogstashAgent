@@ -84,7 +84,8 @@ class LogstashSupervisor:
         logger.info(f"Setting up host mode - copying configs to {self.logstash_settings}")
         
         # Source directory - check local first (native mode), then Docker path
-        local_config_dir = os.path.join(os.path.dirname(__file__), "config")
+        # Navigate up to LogstashAgent root (2 levels up from logstashagent/), then into docker/config
+        local_config_dir = os.path.join(os.path.dirname(__file__), "..", "..", "docker", "config")
         docker_config_dir = "/app/config"
         
         if os.path.exists(local_config_dir):

@@ -445,3 +445,340 @@ class TestRunController:
             with patch.object(controller.time, "sleep") as sleep:
                 controller.run_controller()
         sleep.assert_not_called()
+
+
+class TestDecryptFromServer:
+    def test_decrypts_value_successfully(self):
+        """Test that _decrypt_from_server correctly decrypts a value."""
+        from cryptography.fernet import Fernet
+        import base64
+        import hashlib
+        
+        api_key = "test-api-key-123"
+        plaintext = "secret-value"
+        
+        # Encrypt the value the same way the server would
+        key = base64.urlsafe_b64encode(hashlib.sha256(api_key.encode('utf-8')).digest())
+        fernet = Fernet(key)
+        encrypted = fernet.encrypt(plaintext.encode('utf-8')).decode('utf-8')
+        
+        # Test decryption
+        result = controller._decrypt_from_server(api_key, encrypted)
+        assert result == plaintext
+
+
+class TestUpdateLogstashEnvFile:
+    @patch.object(controller, '_LOGSTASH_ENV_FILE')
+    def test_raises_file_not_found_when_file_missing(self, mock_env_file):
+        """Test that FileNotFoundError is raised when env file doesn't exist."""
+        mock_env_file.exists.return_value = False
+        
+        with patch('pytest.raises', FileNotFoundError):
+            try:
+                controller.update_logstash_env_file("password123")
+                assert False, "Should have raised FileNotFoundError"
+            except FileNotFoundError as e:
+                assert "not found" in str(e)
+    
+    @patch.object(controller, '_LOGSTASH_ENV_FILE')
+    @patch('subprocess.run')
+    def test_updates_password_successfully(self, mock_run, mock_env_file):
+        """Test successful password update."""
+        mock_env_file.exists.return_value = True
+        mock_env_file.__str__.return_value = '/etc/default/logstash'
+        
+        # Mock successful read
+        read_result = MagicMock()
+        read_result.returncode = 0
+        read_result.stdout = "# Existing content\nOTHER_VAR=value\n"
+        
+        # Mock successful write
+        write_result = MagicMock()
+        write_result.returncode = 0
+        
+        # Mock successful chmod
+        chmod_result = MagicMock()
+        chmod_result.returncode = 0
+        
+        mock_run.side_effect = [read_result, write_result, chmod_result]
+        
+        controller.update_logstash_env_file("newpass")
+        
+        # Verify write was called with correct content
+        assert mock_run.call_count == 3
+        write_call = mock_run.call_args_list[1]
+        assert 'tee' in write_call[0][0]
+        assert 'LOGSTASH_KEYSTORE_PASS=newpass' in write_call[1]['input']
+    
+    @patch.object(controller, '_LOGSTASH_ENV_FILE')
+    @patch('subprocess.run')
+    def test_handles_read_failure(self, mock_run, mock_env_file):
+        """Test handling of read failure."""
+        mock_env_file.exists.return_value = True
+        mock_env_file.__str__.return_value = '/etc/default/logstash'
+        
+        read_result = MagicMock()
+        read_result.returncode = 1
+        read_result.stderr = "Permission denied"
+        mock_run.return_value = read_result
+        
+        try:
+            controller.update_logstash_env_file("pass")
+            assert False, "Should have raised OSError"
+        except OSError:
+            pass
+    
+    @patch.object(controller, '_LOGSTASH_ENV_FILE')
+    @patch('subprocess.run')
+    def test_handles_timeout(self, mock_run, mock_env_file):
+        """Test handling of subprocess timeout."""
+        mock_env_file.exists.return_value = True
+        mock_env_file.__str__.return_value = '/etc/default/logstash'
+        
+        mock_run.side_effect = subprocess.TimeoutExpired('sudo', 5)
+        
+        try:
+            controller.update_logstash_env_file("pass")
+            assert False, "Should have raised TimeoutExpired"
+        except subprocess.TimeoutExpired:
+            pass
+
+
+class TestBuildPipelinesState:
+    def test_returns_empty_when_conf_d_missing(self, temp_dir):
+        """Test returns empty dict when conf.d doesn't exist."""
+        settings = temp_dir.replace("\\", "/") + "/"
+        
+        with patch.object(controller.agent_state, "get_state", return_value={}):
+            result = controller.build_pipelines_state(settings)
+        
+        assert result == {}
+    
+    def test_returns_empty_when_no_conf_files(self, temp_dir):
+        """Test returns empty dict when no .conf files exist."""
+        import os
+        settings = temp_dir.replace("\\", "/") + "/"
+        conf_d = Path(temp_dir) / "conf.d"
+        conf_d.mkdir()
+        
+        with patch.object(controller.agent_state, "get_state", return_value={}):
+            result = controller.build_pipelines_state(settings)
+        
+        assert result == {}
+    
+    def test_builds_state_from_conf_files(self, temp_dir):
+        """Test building state from existing .conf files."""
+        import yaml
+        
+        settings = temp_dir.replace("\\", "/") + "/"
+        conf_d = Path(temp_dir) / "conf.d"
+        conf_d.mkdir()
+        
+        # Create a pipeline config file
+        (conf_d / "pipeline1.conf").write_text("input { stdin {} }", encoding="utf-8")
+        
+        # Create pipelines.yml
+        pipelines_yml = Path(temp_dir) / "pipelines.yml"
+        pipelines_data = [
+            {
+                'pipeline.id': 'pipeline1',
+                'pipeline.workers': 2,
+                'pipeline.batch.size': 256
+            }
+        ]
+        pipelines_yml.write_text(yaml.dump(pipelines_data), encoding="utf-8")
+        
+        # Mock agent state with stored hash
+        state = {
+            'pipelines': {
+                'pipeline1': {
+                    'config_hash': 'abc123',
+                    'settings': {'pipeline_workers': 1}
+                }
+            }
+        }
+        
+        with patch.object(controller.agent_state, "get_state", return_value=state):
+            result = controller.build_pipelines_state(settings)
+        
+        assert 'pipeline1' in result
+        assert result['pipeline1']['config_hash'] == 'abc123'
+        assert result['pipeline1']['settings']['pipeline_workers'] == 2
+    
+    def test_includes_no_input_pipelines_from_state(self, temp_dir):
+        """Test that no_input pipelines from state are included even without .conf files."""
+        settings = temp_dir.replace("\\", "/") + "/"
+        conf_d = Path(temp_dir) / "conf.d"
+        conf_d.mkdir()
+        
+        # Create a regular pipeline .conf file
+        (conf_d / "regular_pipeline.conf").write_text("input { stdin {} }", encoding="utf-8")
+        
+        state = {
+            'pipelines': {
+                'regular_pipeline': {
+                    'config_hash': 'abc123',
+                    'settings': {'pipeline_workers': 1}
+                },
+                'no_input_pipeline': {
+                    'config_hash': 'xyz789',
+                    'no_input': True,
+                    'settings': {'pipeline_workers': 1}
+                }
+            }
+        }
+        
+        with patch.object(controller.agent_state, "get_state", return_value=state):
+            result = controller.build_pipelines_state(settings)
+        
+        # Both pipelines should be in the result
+        assert 'regular_pipeline' in result
+        assert 'no_input_pipeline' in result
+        assert result['no_input_pipeline']['no_input'] is True
+        assert result['no_input_pipeline']['config_hash'] == 'xyz789'
+
+
+class TestUpdatePipelines:
+    def test_returns_false_when_no_changes(self, temp_dir):
+        """Test returns False when no changes to apply."""
+        settings = temp_dir.replace("\\", "/") + "/"
+        changes = {'set': {}, 'delete': []}
+        
+        result = controller.update_pipelines(settings, changes)
+        assert result is False
+    
+    def test_creates_conf_d_directory(self, temp_dir):
+        """Test that conf.d directory is created if missing."""
+        import os
+        settings = temp_dir.replace("\\", "/") + "/"
+        conf_d = Path(temp_dir) / "conf.d"
+        
+        changes = {
+            'set': {
+                'test_pipeline': {
+                    'lscl': 'input { stdin {} }',
+                    'pipeline_hash': 'hash123',
+                    'settings': {}
+                }
+            },
+            'delete': []
+        }
+        
+        with patch.object(controller.agent_state, "get_state", return_value={}):
+            with patch.object(controller.agent_state, "update_state"):
+                controller.update_pipelines(settings, changes)
+        
+        assert conf_d.exists()
+    
+    def test_writes_pipeline_config_file(self, temp_dir):
+        """Test writing pipeline .conf file."""
+        settings = temp_dir.replace("\\", "/") + "/"
+        conf_d = Path(temp_dir) / "conf.d"
+        conf_d.mkdir()
+        
+        lscl_content = "input { stdin {} }\nfilter { mutate { add_tag => ['test'] } }"
+        changes = {
+            'set': {
+                'my_pipeline': {
+                    'lscl': lscl_content,
+                    'pipeline_hash': 'hash456',
+                    'settings': {'pipeline_workers': 2}
+                }
+            },
+            'delete': []
+        }
+        
+        with patch.object(controller.agent_state, "get_state", return_value={}):
+            with patch.object(controller.agent_state, "update_state"):
+                result = controller.update_pipelines(settings, changes)
+        
+        assert result is True
+        conf_file = conf_d / "my_pipeline.conf"
+        assert conf_file.exists()
+        assert conf_file.read_text(encoding="utf-8") == lscl_content
+    
+    def test_deletes_pipeline_config_file(self, temp_dir):
+        """Test deleting pipeline .conf file."""
+        settings = temp_dir.replace("\\", "/") + "/"
+        conf_d = Path(temp_dir) / "conf.d"
+        conf_d.mkdir()
+        
+        # Create a file to delete
+        conf_file = conf_d / "old_pipeline.conf"
+        conf_file.write_text("input { stdin {} }", encoding="utf-8")
+        
+        changes = {
+            'set': {},
+            'delete': ['old_pipeline']
+        }
+        
+        with patch.object(controller.agent_state, "get_state", return_value={}):
+            result = controller.update_pipelines(settings, changes)
+        
+        assert result is True
+        assert not conf_file.exists()
+    
+    def test_skips_conf_write_for_no_input_pipeline(self, temp_dir):
+        """Test that no_input pipelines don't get .conf files written."""
+        settings = temp_dir.replace("\\", "/") + "/"
+        conf_d = Path(temp_dir) / "conf.d"
+        conf_d.mkdir()
+        
+        changes = {
+            'set': {
+                'no_input_pipe': {
+                    'lscl': 'should not be written',
+                    'pipeline_hash': 'hash789',
+                    'no_input': True,
+                    'settings': {}
+                }
+            },
+            'delete': []
+        }
+        
+        with patch.object(controller.agent_state, "get_state", return_value={}):
+            with patch.object(controller.agent_state, "update_state"):
+                result = controller.update_pipelines(settings, changes)
+        
+        assert result is True
+        conf_file = conf_d / "no_input_pipe.conf"
+        assert not conf_file.exists()
+    
+    def test_returns_false_on_delete_error(self, temp_dir):
+        """Test returns False when delete operation fails."""
+        settings = temp_dir.replace("\\", "/") + "/"
+        conf_d = Path(temp_dir) / "conf.d"
+        conf_d.mkdir()
+        
+        changes = {
+            'set': {},
+            'delete': ['test_pipeline']
+        }
+        
+        with patch('os.remove', side_effect=PermissionError("Access denied")):
+            with patch('os.path.isfile', return_value=True):
+                result = controller.update_pipelines(settings, changes)
+        
+        assert result is False
+    
+    def test_returns_false_on_write_error(self, temp_dir):
+        """Test returns False when write operation fails."""
+        settings = temp_dir.replace("\\", "/") + "/"
+        conf_d = Path(temp_dir) / "conf.d"
+        conf_d.mkdir()
+        
+        changes = {
+            'set': {
+                'test': {
+                    'lscl': 'content',
+                    'pipeline_hash': 'hash',
+                    'settings': {}
+                }
+            },
+            'delete': []
+        }
+        
+        with patch('builtins.open', side_effect=OSError("Write failed")):
+            result = controller.update_pipelines(settings, changes)
+        
+        assert result is False

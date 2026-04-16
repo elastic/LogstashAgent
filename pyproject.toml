@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "LogstashAgent"
-version = "0.2.5"
+version = "0.2.6"
 description = "An agent that is used to entirely control an instance of Logstash"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -24,11 +24,29 @@ dev = [
     "pre-commit>=4.5.1",
     "pyinstaller>=6.19.0",
     "pytest>=9.0.2,<10",
+    "pytest-cov>=7.1.0",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+addopts = [
+  "--cov",
+  "--cov-report=term-missing",
+  "--cov-report=xml",
+  "--cov-report=html",
+]
+
+[tool.coverage.run]
+source = ["logstashagent"]
+branch = true
+
+[tool.coverage.report]
+skip_empty = true
+show_missing = true
+omit = [
+  "*/tests/*",
+]
 
 [project.scripts]
 logstash-agent = "logstashagent.main:main"

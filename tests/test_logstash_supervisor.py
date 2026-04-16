@@ -572,13 +572,16 @@ class TestHostModeSetup:
 
     def test_creates_directories(self, supervisor_config_host):
         sup = LogstashSupervisor(config=supervisor_config_host)
-        cfg = os.path.join(os.path.dirname(logstash_supervisor.__file__), "config")
-        files = {os.path.join(cfg, f): True for f in [
+        # Mock config directory - use normalized paths
+        cfg = os.path.normpath(os.path.join(os.path.dirname(logstash_supervisor.__file__), "..", "..", "docker", "config"))
+        files = {os.path.normpath(os.path.join(cfg, f)): True for f in [
             "jvm.options", "log4j2.properties", "logstash.yml",
             "pipelines.yml", "simulate_start.conf", "simulate_end.conf"
         ]}
         def chk(p):
-            return p == cfg or p in files or p.startswith(sup.logstash_settings)
+            normalized_p = os.path.normpath(p)
+            normalized_cfg = os.path.normpath(cfg)
+            return normalized_p == normalized_cfg or normalized_p in files or normalized_p.startswith(os.path.normpath(sup.logstash_settings))
         with patch("logstashagent.logstash_supervisor.os.path.exists",
                    side_effect=chk), \
              patch("logstashagent.logstash_supervisor.shutil.copy2"), \

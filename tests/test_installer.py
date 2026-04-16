@@ -186,16 +186,16 @@ def test_download_release_from_cache(mock_exists):
     
     result = installer.download_release('0.1.30', '/tmp/test')
     
-    # Should return cached path
-    assert result == '/var/cache/logstash-agent/logstash-agent-0.1.30.tar.gz'
+    # Should return cached path (normalize for comparison)
+    expected = '/var/cache/logstash-agent/logstash-agent-0.1.30.tar.gz'
+    assert os.path.normpath(result) == os.path.normpath(expected)
 
 
 @patch('builtins.open', new_callable=mock_open)
 @patch('os.chmod')
-@patch('os.chown')
 @patch('os.makedirs')
 @patch('os.path.exists')
-def test_download_release_downloads_when_not_cached(mock_exists, mock_makedirs, mock_chown, mock_chmod, mock_file):
+def test_download_release_downloads_when_not_cached(mock_exists, mock_makedirs, mock_chmod, mock_file):
     """Test download_release downloads from GitHub when not cached"""
     # Mock cache doesn't exist
     mock_exists.return_value = False
@@ -211,6 +211,7 @@ def test_download_release_downloads_when_not_cached(mock_exists, mock_makedirs, 
     
     with patch('logstashagent.installer.pwd') as mock_pwd, \
          patch('logstashagent.installer.grp') as mock_grp, \
+         patch('logstashagent.installer.os.chown', create=True) as mock_chown, \
          patch('requests.get', return_value=mock_response) as mock_get:
         
         mock_pwd.getpwnam.return_value = mock_pw
@@ -222,8 +223,9 @@ def test_download_release_downloads_when_not_cached(mock_exists, mock_makedirs, 
         expected_url = 'https://github.com/elastic/LogstashAgent/releases/download/v0.1.30/logstash-agent-linux-amd64.tar.gz'
         mock_get.assert_called_once_with(expected_url, stream=True, timeout=60)
     
-    # Should return cache path
-    assert result == '/var/cache/logstash-agent/logstash-agent-0.1.30.tar.gz'
+    # Should return cache path (normalize for comparison)
+    expected = '/var/cache/logstash-agent/logstash-agent-0.1.30.tar.gz'
+    assert os.path.normpath(result) == os.path.normpath(expected)
 
 
 @patch('os.makedirs')
@@ -233,7 +235,15 @@ def test_download_release_handles_network_error(mock_exists, mock_makedirs):
     import requests
     mock_exists.return_value = False
     
-    with patch('requests.get', side_effect=requests.exceptions.ConnectionError('Network error')):
+    # Mock pwd/grp and os.chown to avoid AttributeError on Windows
+    with patch('logstashagent.installer.pwd') as mock_pwd, \
+         patch('logstashagent.installer.grp') as mock_grp, \
+         patch('logstashagent.installer.os.chown', create=True), \
+         patch('requests.get', side_effect=requests.exceptions.ConnectionError('Network error')):
+        
+        mock_pwd.getpwnam.return_value = MagicMock(pw_uid=1000)
+        mock_grp.getgrnam.return_value = MagicMock(gr_gid=1000)
+        
         with pytest.raises(installer.InstallError, match="Failed to download release"):
             installer.download_release('0.1.30', '/tmp/test')
 
@@ -248,7 +258,9 @@ def test_extract_binary_success(mock_exists, mock_tarfile):
     
     result = installer.extract_binary('/tmp/test.tar.gz', '/tmp/extract')
     
-    assert result == '/tmp/extract/logstash-agent/logstash-agent'
+    # Normalize paths for comparison
+    expected = os.path.join('/tmp/extract', 'logstash-agent', 'logstash-agent')
+    assert os.path.normpath(result) == os.path.normpath(expected)
     mock_tar.extractall.assert_called_once_with('/tmp/extract')
 
 
@@ -429,6 +441,7 @@ def test_perform_uninstallation_without_purge_preserves_data(mock_rmtree, mock_e
          patch('os.remove'), \
          patch('os.unlink'), \
          patch('os.path.islink', return_value=True), \
+         patch('os.listdir', return_value=[]), \
          patch('os.rmdir'):
         
         installer.perform_uninstallation(purge=False)
