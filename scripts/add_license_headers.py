@@ -40,12 +40,6 @@ EXCLUDED_DIRS = {
 }
 
 EXCLUDED_FILES = {
-    '__init__.py',
-    'asgi.py',
-    'wsgi.py',
-    'manage.py',
-    'settings.py',
-    'apps.py',
     'postcss.config.js',
     'tailwind.config.js',
 }
@@ -84,7 +78,7 @@ def has_license_header(content):
 
 def get_header_for_file(file_ext):
     """Get the appropriate license header for file type."""
-    if file_ext == '.py':
+    if file_ext in ['.py', '.yaml', '.yml', '.sh']:
         return PYTHON_HEADER
     elif file_ext == '.js':
         return JS_HEADER
@@ -131,7 +125,7 @@ def process_file(file_path, dry_run=False, verbose=False):
     """Process a single file to add license header."""
     file_ext = os.path.splitext(file_path)[1]
     
-    if file_ext not in ['.py', '.js', '.html']:
+    if file_ext not in ['.py', '.js', '.html', '.yaml', '.yml', '.sh']:
         return False
     
     if should_exclude_file(file_path):
@@ -160,7 +154,7 @@ def process_file(file_path, dry_run=False, verbose=False):
     if not header:
         return False
     
-    if file_ext == '.py':
+    if file_ext in ['.py', '.yaml', '.yml', '.sh']:
         new_content = add_header_to_python(content, header)
     elif file_ext == '.html':
         new_content = add_header_to_html(content, header)
@@ -218,7 +212,7 @@ def main():
         '--root',
         type=str,
         default=None,
-        help='Root directory to crawl (defaults to logstashui directory)'
+        help='Root directory to crawl (defaults to project root)'
     )
     
     args = parser.parse_args()
@@ -229,9 +223,7 @@ def main():
     else:
         # Assume script is in scripts/ subdirectory
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        root_dir = os.path.join(script_dir, '..', 'src')
-    
-    root_dir = os.path.abspath(root_dir)
+        root_dir = os.path.abspath(os.path.join(script_dir, '..'))
     
     if not os.path.isdir(root_dir):
         print(f"Error: Directory does not exist: {root_dir}")

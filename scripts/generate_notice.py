@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+#Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+#or more contributor license agreements. Licensed under the Elastic License;
+#you may not use this file except in compliance with the Elastic License.
+
 """
 Pre-commit hook to check dependency licenses.
 
@@ -10,7 +14,6 @@ import json
 import os
 import re
 import requests
-import subprocess
 import sys
 import tomllib
 from datetime import datetime
@@ -396,7 +399,7 @@ def validate_license(license_name):
 def get_notice_header():
     """Generate the required NOTICE.txt header."""
     current_year = datetime.now().year
-    return f"""LogstashUI
+    return f"""LogstashAgent
 Copyright 2025-{current_year} Elasticsearch B.V.
 """
 
@@ -410,7 +413,7 @@ def ensure_notice_header():
         content = notice_path.read_text(encoding="utf-8")
 
         # Check if header is already present
-        if not content.startswith("LogstashUI\nCopyright 2025-"):
+        if not content.startswith("LogstashAgent\nCopyright 2025-"):
             # Header missing or outdated, prepend it
             with open(notice_path, "w", encoding="utf-8") as f:
                 f.write(header)
