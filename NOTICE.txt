@@ -1,9 +1,6 @@
 LogstashAgent
 Copyright 2025-2026 Elasticsearch B.V.
 
-LogstashUI
-Copyright 2025-2026 Elasticsearch B.V.
-
 -------------- anyio -------------- 
 The MIT License (MIT)
 
