@@ -8,3 +8,4 @@
 
 - Incremented the application version number.
 - Updated the preferred Logstash Agent version preemptively for the next release.
+- 
