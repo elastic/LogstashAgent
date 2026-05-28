@@ -1122,6 +1122,28 @@ async def allocate_simulation_slot(body: Dict[str, Any]):
             logger.warning(f"Failed to check pipeline existence via API: {e}. Assuming pipelines don't exist.")
             pipelines_exist = False
 
+    # If this is a new (evicted) slot, wait for old pipeline to disappear from Logstash
+    # before creating the new one. _delete_slot_pipelines runs in a background thread
+    # concurrently with this function, so we must wait or the old pipeline may process
+    # the first simulation event before the new one is loaded.
+    if not reused:
+        first_pipeline_name = f"slot{slot_id}-filter1"
+        max_wait = 10.0
+        start_wait = time.time()
+        logger.info(f"Waiting for old pipeline {first_pipeline_name} to be removed before creating new one...")
+        while time.time() - start_wait < max_wait:
+            try:
+                with LogstashAPI(timeout=3.0) as api:
+                    all_pipelines = api.list_pipelines()
+                    if first_pipeline_name not in all_pipelines:
+                        logger.info(f"Old pipeline {first_pipeline_name} is gone, proceeding with new pipeline creation")
+                        break
+            except Exception as e:
+                logger.warning(f"Error checking pipeline removal: {e}")
+            await asyncio.sleep(0.5)
+        else:
+            logger.warning(f"Old pipeline {first_pipeline_name} still present after {max_wait}s, proceeding anyway")
+
     # Create pipelines if they don't exist (new slot or reused slot with deleted pipelines)
     if not reused or not pipelines_exist:
         try:
