@@ -11,6 +11,7 @@ import time
 import yaml
 import os
 from . import log_analyzer
+from . import main
 import logging
 from .logstash_api import LogstashAPI
 
@@ -227,7 +228,6 @@ def evict_all_slots_and_cleanup():
     
     # Also clean up any orphaned pipeline files in conf.d
     try:
-        import main
         conf_d_path = main.PIPELINES_DIR
         if os.path.exists(conf_d_path):
             orphaned_files = []
@@ -625,9 +625,6 @@ def _delete_slot_pipelines(slot_id: int, slot_data: Dict[str, Any]):
         slot_id: Slot ID
         slot_data: Slot data containing pipeline information
     """
-    # Import here to avoid circular dependency
-    import main
-
     try:
         pipelines = slot_data.get('pipelines', [])
 

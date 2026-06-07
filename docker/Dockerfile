@@ -68,10 +68,10 @@ ENV PYTHONPATH=/app/src
 USER logstash
 
 # Expose ports
-# 9600: Logstash API
+# 9650: Logstash API (simulation node)
 # 9449: Logstash HTTP input (for sample events)
 # 9500: FastAPI sidecar API
-EXPOSE 9600 9449 9500
+EXPOSE 9650 9449 9500
 
 # Use custom entrypoint
 ENTRYPOINT ["/entrypoint.sh"]
