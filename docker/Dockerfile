@@ -1,4 +1,4 @@
-FROM docker.elastic.co/logstash/logstash:9.3.1
+FROM docker.elastic.co/logstash/logstash:9.4.3
 
 # Switch to root to install dependencies
 USER root
