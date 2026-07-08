@@ -3,6 +3,7 @@
 #you may not use this file except in compliance with the Elastic License.
 
 import time
+import random
 import threading
 import logging
 import requests
@@ -1755,7 +1756,7 @@ def run_controller():
             # --- End restart state tracking ---
 
             # Wait for next check-in — wakes up early if watcher fires an event
-            _checkin_event.wait(timeout=check_in_interval)
+            _checkin_event.wait(timeout=check_in_interval + random.uniform(-10, 10))
             _checkin_event.clear()
             
     except KeyboardInterrupt:
