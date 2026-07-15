@@ -294,9 +294,17 @@ def write_config_file(logstash_ui_url: str):
 # Generated during installation
 {path_comment}
 mode: agent
+
+# Paths to this Logstash installation
 logstash_binary: /usr/share/logstash/bin/logstash
 logstash_settings: /etc/logstash
 logstash_log_path: /var/log/logstash
+
+# Port that Logstash's monitoring API listens on (default: 9600 for native installs)
+# Simulation/Docker mode uses 9650 — do not change this for a native install
+logstash_api_port: 9600
+
+# Agent API server (not used in controller/agent mode)
 host: 127.0.0.1
 port: 9600
 
@@ -334,6 +342,26 @@ def configure_logstash() -> None:
     """
     logger.info("Configuring Logstash for agent management...")
     uid, gid = get_logstash_uid_gid()
+
+    # Fix ownership on the agent's own directories.  These may have been created
+    # with root:root during installation if the logstash user didn't exist yet.
+    for agent_dir in [
+        INSTALL_PATHS['log_dir'],    # /var/log/logstash-agent
+        INSTALL_PATHS['state_dir'],  # /var/lib/logstash-agent
+        INSTALL_PATHS['config_dir'], # /etc/logstash-agent
+        INSTALL_PATHS['cache_dir'],  # /var/cache/logstash-agent
+    ]:
+        if os.path.exists(agent_dir):
+            try:
+                for root, dirs, files in os.walk(agent_dir):
+                    os.chown(root, uid, gid)
+                    for d in dirs:
+                        os.chown(os.path.join(root, d), uid, gid)
+                    for f in files:
+                        os.chown(os.path.join(root, f), uid, gid)
+                logger.info(f"✓ Fixed ownership on {agent_dir} (logstash:logstash)")
+            except Exception as e:
+                logger.warning(f"Could not fix ownership on {agent_dir}: {e}")
 
     # chown /etc/logstash
     logstash_config_dir = '/etc/logstash'

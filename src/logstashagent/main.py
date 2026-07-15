@@ -1910,7 +1910,15 @@ if __name__ == "__main__":
     
     # Check if we're in run mode (controller mode for enrolled agents)
     if args.run:
-        # Run the agent controller
+        # Persist the Logstash API port from the loaded config into agent state so
+        # the controller's check_in() always queries the correct port.
+        # Native installs use 9600 (Logstash default); simulation/Docker uses 9650.
+        # Writing it here overrides any stale value that may have been stored from
+        # a previous simulation session.
+        logstash_api_port = AGENT_CONFIG.get('logstash_api_port', 9600)
+        agent_state.update_state('api_port', logstash_api_port)
+        logger.info(f"Logstash API port set to {logstash_api_port} (from config)")
+
         controller.run_controller()
         sys.exit(0)
     
