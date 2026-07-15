@@ -436,6 +436,10 @@ def build_pipelines_state(settings_path):
         # Start from persisted state so config_hash values are the server's pipeline_hash
         state = agent_state.get_state()
         persisted_pipelines = state.get('pipelines', {})
+        # SNMP-managed pipelines are reconciled via the check-in loop, not the
+        # regular policy channel. Exclude them here so get_config_changes never
+        # tries to delete or re-push them.
+        snmp_pipeline_names = set(state.get('snmp_pipelines', {}).keys())
 
         if not os.path.isdir(conf_d_path):
             logger.debug(f"conf.d directory not found at {conf_d_path}, returning empty pipelines state")
@@ -472,6 +476,9 @@ def build_pipelines_state(settings_path):
         pipelines_state = {}
         for conf_file in conf_files:
             pipeline_name = conf_file[:-5]  # strip .conf
+            # Skip SNMP-managed pipelines (synced via the check-in loop)
+            if pipeline_name in snmp_pipeline_names:
+                continue
             # Use the stored server pipeline_hash as config_hash for stable comparison
             stored = persisted_pipelines.get(pipeline_name, {})
             config_hash = stored.get('config_hash', '')
@@ -488,6 +495,8 @@ def build_pipelines_state(settings_path):
 
         # Include no_input pipelines from state (they don't have .conf files)
         for pipeline_name, stored in persisted_pipelines.items():
+            if pipeline_name in snmp_pipeline_names:
+                continue
             if stored.get('no_input') and pipeline_name not in pipelines_state:
                 pipelines_state[pipeline_name] = {
                     'config_hash': stored.get('config_hash', ''),
@@ -1337,6 +1346,86 @@ def get_logstash_process_info():
         return {'available': True, 'running': False, 'error': str(e)[:200]}
 
 
+def apply_snmp_changes(settings_path, snmp_changes):
+    """
+    Apply SNMP-managed pipeline and keystore changes received during check-in.
+
+    SNMP changes are delivered independently of the policy revision number and
+    are tracked in dedicated agent-state namespaces ('snmp_pipelines' and
+    'snmp_keystore') so they never interfere with policy revision history. The
+    same update_pipelines()/update_keystore() functions used by the regular
+    policy channel are reused; afterwards the SNMP hash namespaces are updated
+    so subsequent check-ins report the new state.
+
+    Args:
+        settings_path: Path to Logstash settings directory
+        snmp_changes: {'pipelines': {'set': {...}, 'delete': [...]},
+                       'keystore':  {'set': {...}, 'delete': [...]}}
+
+    Returns:
+        bool: True if all applicable changes applied successfully
+    """
+    try:
+        pipeline_changes = snmp_changes.get('pipelines') or {}
+        keystore_changes = snmp_changes.get('keystore') or {}
+
+        keys_to_set = keystore_changes.get('set', {})
+        keys_to_delete = keystore_changes.get('delete', [])
+        pipelines_to_set = pipeline_changes.get('set', {})
+        pipelines_to_delete = pipeline_changes.get('delete', [])
+
+        ok = True
+
+        # --- Keystore first (pipelines may reference these keys) ---
+        if keys_to_set or keys_to_delete:
+            state = agent_state.get_state()
+            # Setting keys requires the keystore password so the agent can
+            # open/create the keystore. If it isn't present yet, skip this cycle
+            # (the regular policy channel provisions it on revision change).
+            if keys_to_set and not state.get('keystore_password'):
+                logger.warning("Skipping SNMP keystore set - no keystore password in agent state yet")
+            elif update_keystore(settings_path, keystore_changes):
+                regular_ks = agent_state.get_state().get('keystore', {})
+                snmp_ks_state = agent_state.get_state().get('snmp_keystore', {})
+                for key_name in keys_to_delete:
+                    snmp_ks_state.pop(key_name, None)
+                for key_name in keys_to_set:
+                    if key_name in regular_ks:
+                        snmp_ks_state[key_name] = regular_ks[key_name]
+                agent_state.update_state('snmp_keystore', snmp_ks_state)
+                logger.info(
+                    f"Applied SNMP keystore changes: {len(keys_to_set)} set, "
+                    f"{len(keys_to_delete)} delete"
+                )
+            else:
+                ok = False
+                logger.error("Failed to apply SNMP keystore changes")
+
+        # --- Pipelines (applied dynamically, no restart required) ---
+        if pipelines_to_set or pipelines_to_delete:
+            if update_pipelines(settings_path, pipeline_changes):
+                snmp_pl_state = agent_state.get_state().get('snmp_pipelines', {})
+                for name in pipelines_to_delete:
+                    snmp_pl_state.pop(name, None)
+                for name, data in pipelines_to_set.items():
+                    snmp_pl_state[name] = data.get('pipeline_hash', '')
+                agent_state.update_state('snmp_pipelines', snmp_pl_state)
+                logger.info(
+                    f"Applied SNMP pipeline changes: {len(pipelines_to_set)} set, "
+                    f"{len(pipelines_to_delete)} delete"
+                )
+            else:
+                ok = False
+                logger.error("Failed to apply SNMP pipeline changes")
+
+        return ok
+
+    except Exception as e:
+        logger.error(f"Unexpected error in apply_snmp_changes: {e}")
+        logger.exception("apply_snmp_changes exception details:")
+        return False
+
+
 def check_in():
     """
     Send check-in to logstashui with current agent state
@@ -1517,11 +1606,14 @@ def check_in():
 
         logger.debug(f"Path validation status: {status_blob}")
         
-        # Prepare check-in data
+        # Prepare check-in data. SNMP-managed pipelines/keystore are synced via
+        # their own hash namespaces, independently of the policy revision number.
         check_in_data = {
             'connection_id': connection_id,
             'revision_number': state.get('revision_number', 0),
-            'status_blob': status_blob
+            'status_blob': status_blob,
+            'snmp_pipelines': state.get('snmp_pipelines', {}),
+            'snmp_keystore': state.get('snmp_keystore', {}),
         }
         
         # Send check-in request
@@ -1574,6 +1666,13 @@ def check_in():
                 server_logs_path = result.get('logs_path')
                 server_binary_path = result.get('binary_path')
                 get_config_changes(server_settings_path, server_logs_path, server_binary_path)
+
+            # Apply SNMP-managed pipeline/keystore changes (revision-independent)
+            snmp_changes = result.get('snmp_changes')
+            if snmp_changes:
+                logger.info("SNMP-managed changes detected during check-in")
+                snmp_settings_path = result.get('settings_path') or state.get('settings_path')
+                apply_snmp_changes(snmp_settings_path, snmp_changes)
 
             if result.get('restart'):
                 logger.warning("Server requested Logstash restart — restarting now")

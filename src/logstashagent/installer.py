@@ -442,10 +442,20 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
         # 9d. Create sudoers drop-in for logstash user
         logger.info("\nCreating sudoers configuration...")
         sudoers_file = '/etc/sudoers.d/logstash-agent'
-        sudoers_content = """# LogstashAgent - Allow logstash user to manage Logstash service
-# This file is managed by logstash-agent installation
-Defaults:logstash !requiretty
 
+        # sudo-rs (Ubuntu 26+) does not support the Defaults directive used by
+        # GNU sudo to suppress the requiretty check.  Detect which is present
+        # and only emit the line for classic GNU sudo.
+        using_sudo_rs = is_sudo_rs()
+        if using_sudo_rs:
+            logger.info("sudo-rs detected — omitting 'Defaults:logstash !requiretty' (not supported)")
+            requiretty_line = ""
+        else:
+            requiretty_line = "Defaults:logstash !requiretty\n"
+
+        sudoers_content = f"""# LogstashAgent - Allow logstash user to manage Logstash service
+# This file is managed by logstash-agent installation
+{requiretty_line}
 # Allow Logstash service management
 logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart logstash
 logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop logstash
@@ -810,6 +820,26 @@ def extract_binary(tarball_path: str, extract_dir: str) -> str:
         
     except (tarfile.TarError, OSError) as e:
         raise InstallError(f"Failed to extract tarball: {e}")
+
+
+def is_sudo_rs() -> bool:
+    """
+    Detect whether the system is using sudo-rs instead of GNU sudo.
+
+    sudo-rs (Ubuntu 26+) does not support the 'Defaults:user !requiretty'
+    directive — using it causes visudo validation to fail.  sudo-rs also does
+    not require a TTY by default, so the directive is unnecessary there.
+    """
+    try:
+        result = subprocess.run(
+            ['sudo', '--version'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        return 'sudo-rs' in result.stdout or 'sudo-rs' in result.stderr
+    except Exception:
+        return False
 
 
 def verify_service_running() -> bool:
