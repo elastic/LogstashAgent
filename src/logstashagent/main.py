@@ -10,7 +10,7 @@ import sys
 
 # Check early whether we're in a non-simulation mode (--run, --enroll, install, upgrade, or uninstall).
 # slots starts background threads on import, so we skip it in these modes.
-_SKIP_SIMULATION_IMPORTS = '--run' in sys.argv or '--enroll' in sys.argv or 'install' in sys.argv or 'upgrade' in sys.argv or 'uninstall' in sys.argv
+_SKIP_SIMULATION_IMPORTS = '--run' in sys.argv or '--enroll' in sys.argv or 'install' in sys.argv or 'upgrade' in sys.argv or 'uninstall' in sys.argv or 'configure' in sys.argv
 
 from fastapi import FastAPI, HTTPException, Path as FastAPIPath, Query, Request
 from fastapi.responses import JSONResponse
@@ -1614,22 +1614,19 @@ def parse_arguments():
         epilog="""
 Examples:
   # Install and enroll agent with logstashui
-  python main.py install --enroll=TOKEN --logstash-ui-url=http://localhost:8080
-  
+  logstash-agent install --enroll TOKEN --logstash-ui-url http://localhost:8080
+
+  # Apply Logstash-specific setup after installing Logstash post-agent-install
+  sudo logstash-agent configure
+
   # Upgrade agent to a new version
-  python main.py upgrade --version 0.1.4
-  
+  logstash-agent upgrade --version 0.1.4
+
   # Uninstall agent (preserves state and logs)
-  python main.py uninstall
-  
+  logstash-agent uninstall
+
   # Uninstall agent and remove all data
-  python main.py uninstall --purge
-  
-  # Enroll agent with logstashui (legacy)
-  python main.py --enroll=TOKEN --logstash-ui-url=http://localhost:8080
-  
-  # Run in normal mode (simulation or agent mode based on config)
-  python main.py
+  logstash-agent uninstall --purge
         """
     )
     
@@ -1677,6 +1674,17 @@ Examples:
         help='Skip the uninstallation confirmation prompt'
     )
     
+    # Configure command
+    configure_parser = subparsers.add_parser(
+        'configure',
+        help='Apply Logstash-specific setup after Logstash is installed'
+    )
+    configure_parser.add_argument(
+        '--yes',
+        action='store_true',
+        help='Skip confirmation prompt'
+    )
+
     # Upgrade command
     upgrade_parser = subparsers.add_parser(
         'upgrade',
@@ -1770,6 +1778,31 @@ if __name__ == "__main__":
             logger.error(f"Unexpected installation error: {e}", exc_info=True)
             sys.exit(1)
     
+    # Check if we're in configure mode
+    if args.command == 'configure':
+        if not args.yes:
+            print("\nThis will configure Logstash for agent management.")
+            print("\nThe following will be applied:")
+            print("  - Ownership of /etc/logstash, /var/log/logstash, /usr/share/logstash/data")
+            print("    will be set to logstash:logstash")
+            print("  - /etc/sudoers.d/logstash-agent will be written (passwordless sudo grants)")
+            print("  - The logstash-agent systemd service will be updated to run as the logstash user")
+            print()
+            answer = input("Continue? [y/N]: ").strip().lower()
+            if answer != 'y':
+                print("Configure cancelled.")
+                sys.exit(0)
+
+        try:
+            installer.perform_configure()
+            sys.exit(0)
+        except installer.InstallError as e:
+            logger.error(f"Configure failed: {e}")
+            sys.exit(1)
+        except Exception as e:
+            logger.error(f"Unexpected configure error: {e}", exc_info=True)
+            sys.exit(1)
+
     # Check if we're in uninstall mode
     if args.command == 'uninstall':
         if not args.yes:

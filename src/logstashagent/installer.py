@@ -317,6 +317,195 @@ logstash_ui_url: {logstash_ui_url}
     logger.info(f"✓ Created configuration file {config_path}")
 
 
+def configure_logstash() -> None:
+    """
+    Apply Logstash-specific setup required for agent management.
+
+    Must run as root. Called automatically by perform_installation() when
+    Logstash is already present, or manually via `logstash-agent configure`
+    when Logstash was installed after the agent.
+
+    Performs:
+    - chown logstash:logstash on /etc/logstash, /var/log/logstash,
+      and /usr/share/logstash/data
+    - Write /etc/sudoers.d/logstash-agent (passwordless sudo grants)
+    - Update systemd service unit to use User=logstash / Group=logstash
+    - Reload systemd daemon
+    """
+    logger.info("Configuring Logstash for agent management...")
+    uid, gid = get_logstash_uid_gid()
+
+    # chown /etc/logstash
+    logstash_config_dir = '/etc/logstash'
+    if os.path.exists(logstash_config_dir):
+        try:
+            for root, dirs, files in os.walk(logstash_config_dir):
+                os.chown(root, uid, gid)
+                for d in dirs:
+                    os.chown(os.path.join(root, d), uid, gid)
+                for f in files:
+                    os.chown(os.path.join(root, f), uid, gid)
+            logger.info(f"✓ Set ownership on {logstash_config_dir} (logstash:logstash, recursive)")
+        except Exception as e:
+            logger.warning(f"Could not set ownership on {logstash_config_dir}: {e}")
+            logger.warning("Agent may not be able to manage Logstash configuration")
+    else:
+        logger.warning(f"Logstash config directory not found at {logstash_config_dir}")
+
+    # chown /var/log/logstash
+    logstash_log_dir = '/var/log/logstash'
+    if os.path.exists(logstash_log_dir):
+        try:
+            for root, dirs, files in os.walk(logstash_log_dir):
+                os.chown(root, uid, gid)
+                for d in dirs:
+                    os.chown(os.path.join(root, d), uid, gid)
+                for f in files:
+                    os.chown(os.path.join(root, f), uid, gid)
+            logger.info(f"✓ Set ownership on {logstash_log_dir} (logstash:logstash, recursive)")
+        except Exception as e:
+            logger.warning(f"Could not set ownership on {logstash_log_dir}: {e}")
+    else:
+        logger.warning(f"Logstash log directory not found at {logstash_log_dir}")
+
+    # chown /usr/share/logstash/data
+    logstash_data_dir = '/usr/share/logstash/data'
+    if os.path.exists(logstash_data_dir):
+        try:
+            for root, dirs, files in os.walk(logstash_data_dir):
+                os.chown(root, uid, gid)
+                for d in dirs:
+                    os.chown(os.path.join(root, d), uid, gid)
+                for f in files:
+                    os.chown(os.path.join(root, f), uid, gid)
+            logger.info(f"✓ Set ownership on {logstash_data_dir} (logstash:logstash, recursive)")
+        except Exception as e:
+            logger.warning(f"Could not set ownership on {logstash_data_dir}: {e}")
+    else:
+        logger.warning(f"Logstash data directory not found at {logstash_data_dir}")
+
+    # Write /etc/sudoers.d/logstash-agent
+    sudoers_file = '/etc/sudoers.d/logstash-agent'
+    using_sudo_rs = is_sudo_rs()
+    if using_sudo_rs:
+        logger.info("sudo-rs detected — omitting 'Defaults:logstash !requiretty' (not supported)")
+        requiretty_line = ""
+    else:
+        requiretty_line = "Defaults:logstash !requiretty\n"
+
+    sudoers_content = f"""# LogstashAgent - Allow logstash user to manage Logstash service
+# This file is managed by logstash-agent installation
+{requiretty_line}
+# Allow Logstash service management
+logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart logstash
+logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop logstash
+logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl start logstash
+logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl status logstash
+
+# Allow LogstashAgent service management (needed for upgrades)
+logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop logstash-agent
+logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl start logstash-agent
+logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart logstash-agent
+logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl is-active logstash-agent
+
+# Allow LogstashAgent upgrade command (runs as root to replace binary)
+logstash ALL=(ALL) NOPASSWD: /opt/logstash-agent/bin/logstash-agent upgrade *
+
+# Allow modification of Logstash environment file (for keystore password)
+logstash ALL=(ALL) NOPASSWD: /usr/bin/cat /etc/default/logstash
+logstash ALL=(ALL) NOPASSWD: /usr/bin/tee /etc/default/logstash
+logstash ALL=(ALL) NOPASSWD: /usr/bin/chmod 640 /etc/default/logstash
+"""
+    try:
+        with open(sudoers_file, 'w') as f:
+            f.write(sudoers_content)
+        os.chmod(sudoers_file, 0o440)
+        logger.info(f"✓ Created sudoers configuration: {sudoers_file}")
+
+        result = subprocess.run(
+            ['visudo', '-c', '-f', sudoers_file],
+            capture_output=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            logger.info("✓ Sudoers configuration validated successfully")
+        else:
+            logger.warning(f"Sudoers validation warning: {result.stderr.decode()}")
+    except Exception as e:
+        logger.warning(f"Could not create sudoers configuration: {e}")
+        logger.warning("Agent may not be able to restart Logstash service")
+        logger.warning("Manual fix required:")
+        logger.warning(f"  sudo tee {sudoers_file} << 'EOF'")
+        logger.warning(sudoers_content)
+        logger.warning("EOF")
+        logger.warning(f"  sudo chmod 440 {sudoers_file}")
+
+    # Update systemd service to use User=logstash / Group=logstash now that
+    # the logstash user exists (it may have been written with root fallback)
+    if os.path.exists(INSTALL_PATHS['systemd_service']):
+        try:
+            with open(INSTALL_PATHS['systemd_service'], 'w') as f:
+                f.write(_build_systemd_service())
+            os.chmod(INSTALL_PATHS['systemd_service'], 0o644)
+            logger.info("✓ Updated systemd service unit (User=logstash)")
+
+            subprocess.run(['systemctl', 'daemon-reload'],
+                           check=True, capture_output=True, text=True)
+            logger.info("✓ Reloaded systemd daemon")
+        except Exception as e:
+            logger.warning(f"Could not update systemd service: {e}")
+
+    logger.info("✓ Logstash configuration complete")
+
+
+def perform_configure() -> None:
+    """
+    Entry point for `logstash-agent configure`.
+
+    Applies the Logstash-specific setup that requires Logstash to already be
+    installed on the host.  Run this after installing Logstash when the agent
+    was originally installed on a host without Logstash.
+    """
+    logger.info("="*60)
+    logger.info("LOGSTASH AGENT - CONFIGURE")
+    logger.info("="*60)
+
+    try:
+        verify_root()
+        verify_platform()
+
+        if not os.path.exists(INSTALL_PATHS['binary']):
+            raise InstallError(
+                "LogstashAgent is not installed. Run 'install' first.\n"
+                "  sudo logstash-agent install --enroll <TOKEN> --logstash-ui-url <URL>"
+            )
+
+        logstash_present = verify_logstash_installed()
+        if not logstash_present:
+            raise InstallError(
+                "Logstash must be installed before running configure.\n\n"
+                "Install Logstash, then rerun:\n"
+                "  sudo logstash-agent configure"
+            )
+
+        configure_logstash()
+
+        logger.info("\n" + "="*60)
+        logger.info("CONFIGURE COMPLETED SUCCESSFULLY!")
+        logger.info("="*60)
+        logger.info("\nNext steps:")
+        logger.info("  Restart the agent service to apply the updated service account:")
+        logger.info("    sudo systemctl restart logstash-agent")
+        logger.info("="*60)
+
+    except InstallError as e:
+        logger.error(f"\nConfigure failed: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"\nUnexpected error during configure: {e}", exc_info=True)
+        raise InstallError(f"Configure failed: {e}")
+
+
 def install_systemd_service():
     """Install the systemd service unit"""
     logger.info("Installing systemd service...")
@@ -428,121 +617,11 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
                 logger.warning(f"Could not clean up log file: {e}")
         
         # Step 9: Configure Logstash permissions for agent management
-        logger.info("\nStep 9: Configuring Logstash permissions...")
-        
-        # 9a. Change ownership of /etc/logstash to logstash:logstash
-        logstash_config_dir = '/etc/logstash'
-        if os.path.exists(logstash_config_dir):
-            try:
-                # Recursively change ownership to logstash:logstash
-                for root, dirs, files in os.walk(logstash_config_dir):
-                    os.chown(root, uid, gid)
-                    for d in dirs:
-                        os.chown(os.path.join(root, d), uid, gid)
-                    for f in files:
-                        os.chown(os.path.join(root, f), uid, gid)
-                logger.info(f"✓ Set ownership on {logstash_config_dir} (logstash:logstash, recursive)")
-            except Exception as e:
-                logger.warning(f"Could not set ownership on {logstash_config_dir}: {e}")
-                logger.warning("Agent may not be able to manage Logstash configuration")
+        if logstash_present:
+            logger.info("\nStep 9: Configuring Logstash permissions...")
+            configure_logstash()
         else:
-            logger.warning(f"Logstash config directory not found at {logstash_config_dir}")
-        
-        # 9b. Change ownership of /var/log/logstash to logstash:logstash
-        logstash_log_dir = '/var/log/logstash'
-        if os.path.exists(logstash_log_dir):
-            try:
-                # Recursively change ownership to logstash:logstash
-                for root, dirs, files in os.walk(logstash_log_dir):
-                    os.chown(root, uid, gid)
-                    for d in dirs:
-                        os.chown(os.path.join(root, d), uid, gid)
-                    for f in files:
-                        os.chown(os.path.join(root, f), uid, gid)
-                logger.info(f"✓ Set ownership on {logstash_log_dir} (logstash:logstash, recursive)")
-            except Exception as e:
-                logger.warning(f"Could not set ownership on {logstash_log_dir}: {e}")
-        else:
-            logger.warning(f"Logstash log directory not found at {logstash_log_dir}")
-        
-        # 9c. Change ownership of /usr/share/logstash/data to logstash:logstash
-        logstash_data_dir = '/usr/share/logstash/data'
-        if os.path.exists(logstash_data_dir):
-            try:
-                # Recursively change ownership to logstash:logstash
-                for root, dirs, files in os.walk(logstash_data_dir):
-                    os.chown(root, uid, gid)
-                    for d in dirs:
-                        os.chown(os.path.join(root, d), uid, gid)
-                    for f in files:
-                        os.chown(os.path.join(root, f), uid, gid)
-                logger.info(f"✓ Set ownership on {logstash_data_dir} (logstash:logstash, recursive)")
-            except Exception as e:
-                logger.warning(f"Could not set ownership on {logstash_data_dir}: {e}")
-        else:
-            logger.warning(f"Logstash data directory not found at {logstash_data_dir}")
-        
-        # 9d. Create sudoers drop-in for logstash user
-        logger.info("\nCreating sudoers configuration...")
-        sudoers_file = '/etc/sudoers.d/logstash-agent'
-
-        # sudo-rs (Ubuntu 26+) does not support the Defaults directive used by
-        # GNU sudo to suppress the requiretty check.  Detect which is present
-        # and only emit the line for classic GNU sudo.
-        using_sudo_rs = is_sudo_rs()
-        if using_sudo_rs:
-            logger.info("sudo-rs detected — omitting 'Defaults:logstash !requiretty' (not supported)")
-            requiretty_line = ""
-        else:
-            requiretty_line = "Defaults:logstash !requiretty\n"
-
-        sudoers_content = f"""# LogstashAgent - Allow logstash user to manage Logstash service
-# This file is managed by logstash-agent installation
-{requiretty_line}
-# Allow Logstash service management
-logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart logstash
-logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop logstash
-logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl start logstash
-logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl status logstash
-
-# Allow LogstashAgent service management (needed for upgrades)
-logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop logstash-agent
-logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl start logstash-agent
-logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart logstash-agent
-logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl is-active logstash-agent
-
-# Allow LogstashAgent upgrade command (runs as root to replace binary)
-logstash ALL=(ALL) NOPASSWD: /opt/logstash-agent/bin/logstash-agent upgrade *
-
-# Allow modification of Logstash environment file (for keystore password)
-logstash ALL=(ALL) NOPASSWD: /usr/bin/cat /etc/default/logstash
-logstash ALL=(ALL) NOPASSWD: /usr/bin/tee /etc/default/logstash
-logstash ALL=(ALL) NOPASSWD: /usr/bin/chmod 640 /etc/default/logstash
-"""
-        try:
-            with open(sudoers_file, 'w') as f:
-                f.write(sudoers_content)
-            os.chmod(sudoers_file, 0o440)  # r--r----- (sudoers requirement)
-            logger.info(f"✓ Created sudoers configuration: {sudoers_file}")
-            
-            # Validate sudoers syntax
-            result = subprocess.run(
-                ['visudo', '-c', '-f', sudoers_file],
-                capture_output=True,
-                timeout=5
-            )
-            if result.returncode == 0:
-                logger.info("✓ Sudoers configuration validated successfully")
-            else:
-                logger.warning(f"Sudoers validation warning: {result.stderr.decode()}")
-        except Exception as e:
-            logger.warning(f"Could not create sudoers configuration: {e}")
-            logger.warning("Agent may not be able to restart Logstash service")
-            logger.warning("Manual fix required:")
-            logger.warning(f"  sudo tee {sudoers_file} << 'EOF'")
-            logger.warning(sudoers_content)
-            logger.warning("EOF")
-            logger.warning(f"  sudo chmod 440 {sudoers_file}")
+            logger.info("\nStep 9: Skipping Logstash configuration (Logstash not installed)")
         
         # Step 10: Final ownership fix for state files
         # This ensures state.json has correct ownership even if it was updated
@@ -559,7 +638,26 @@ logstash ALL=(ALL) NOPASSWD: /usr/bin/chmod 640 /etc/default/logstash
         logger.info("\n" + "="*60)
         logger.info("INSTALLATION COMPLETED SUCCESSFULLY!")
         logger.info("="*60)
+
+        if not logstash_present:
+            logger.warning("\n" + "!"*60)
+            logger.warning("  ACTION REQUIRED: Logstash was NOT installed at install time.")
+            logger.warning("")
+            logger.warning("  You MUST run the following after you install Logstash to")
+            logger.warning("  complete the setup, otherwise you may see issues:")
+            logger.warning("")
+            logger.warning("    sudo logstash-agent configure")
+            logger.warning("")
+            logger.warning("  This applies required permissions and service account")
+            logger.warning("  configuration that could not be set up without Logstash.")
+            logger.warning("!" * 60)
+
         logger.info("\nNext steps:")
+        if not logstash_present:
+            logger.info("  0. Install Logstash, update /etc/logstash-agent/logstash-agent.yml")
+            logger.info("     with the correct paths, then run:")
+            logger.info("       sudo logstash-agent configure")
+            logger.info("")
         logger.info("  1. Enable the service:")
         logger.info("     sudo systemctl enable logstash-agent")
         logger.info("\n  2. Start the service:")
