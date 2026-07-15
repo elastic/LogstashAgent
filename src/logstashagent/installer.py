@@ -32,15 +32,29 @@ INSTALL_PATHS = {
     'systemd_service': '/etc/systemd/system/logstash-agent.service',
 }
 
-SYSTEMD_SERVICE_TEMPLATE = """[Unit]
+def _build_systemd_service() -> str:
+    """
+    Build the systemd service unit content.
+
+    Runs as the logstash user/group when that account exists (i.e. Logstash is
+    installed).  Falls back to root when Logstash is not yet present so the
+    service can still be registered and start once Logstash is installed later.
+    """
+    try:
+        pwd.getpwnam('logstash')
+        grp.getgrnam('logstash')
+        user_lines = "User=logstash\nGroup=logstash\n"
+    except (KeyError, OSError):
+        logger.warning("logstash user not found — service will run as root until Logstash is installed")
+        user_lines = ""
+
+    return f"""[Unit]
 Description=LogstashAgent - Control plane agent for LogstashUI
 After=network.target
 
 [Service]
 Type=simple
-User=logstash
-Group=logstash
-ExecStart=/opt/logstash-agent/bin/logstash-agent --run
+{user_lines}ExecStart=/opt/logstash-agent/bin/logstash-agent --run
 Restart=always
 RestartSec=10
 WorkingDirectory=/var/lib/logstash-agent
@@ -75,59 +89,69 @@ def verify_platform():
         )
 
 
-def verify_logstash_installed():
+def verify_logstash_installed() -> bool:
     """
-    Verify Logstash is installed by checking for:
-    - user: logstash
-    - directory: /etc/logstash
-    - directory: /usr/share/logstash
+    Check whether Logstash appears to be installed on this host.
+
+    Looks for the logstash system user, /etc/logstash, and /usr/share/logstash.
+    Returns True if all checks pass, False if any are missing.  The caller decides
+    whether to abort or continue with a warning.
     """
-    logger.info("Verifying Logstash installation...")
-    
-    errors = []
-    
-    # Check for logstash user
+    logger.info("Checking Logstash installation...")
+
+    missing = []
+
     try:
         pwd.getpwnam('logstash')
         logger.info("✓ User 'logstash' exists")
     except KeyError:
-        errors.append("- user: logstash")
-    
-    # Check for /etc/logstash
+        missing.append("user: logstash")
+
     if not os.path.isdir('/etc/logstash'):
-        errors.append("- directory: /etc/logstash")
+        missing.append("directory: /etc/logstash")
     else:
         logger.info("✓ Directory /etc/logstash exists")
-    
-    # Check for /usr/share/logstash
+
     if not os.path.isdir('/usr/share/logstash'):
-        errors.append("- directory: /usr/share/logstash")
+        missing.append("directory: /usr/share/logstash")
     else:
         logger.info("✓ Directory /usr/share/logstash exists")
-    
-    # Optional: check for /var/log/logstash
+
     if os.path.isdir('/var/log/logstash'):
         logger.info("✓ Directory /var/log/logstash exists")
-    
-    if errors:
-        raise InstallError(
-            "Logstash does not appear to be installed on this host.\n\n"
-            "Expected:\n" + "\n".join(errors) + "\n\n"
-            "Install Logstash first, then rerun:\n"
-            "  sudo logstash-agent install --enroll=... --logstash-ui-url=..."
-        )
-    
+
+    if missing:
+        logger.warning("⚠  Logstash does not appear to be installed on this host.")
+        logger.warning("   Missing:")
+        for item in missing:
+            logger.warning(f"     - {item}")
+        logger.warning("")
+        logger.warning("   Installation will continue, but LogstashAgent will NOT be")
+        logger.warning("   functional until Logstash is installed.")
+        logger.warning("   After installing Logstash, update the paths in")
+        logger.warning("   /etc/logstash-agent/logstash-agent.yml and restart the service.")
+        return False
+
     logger.info("✓ Logstash installation verified")
+    return True
 
 
 def get_logstash_uid_gid():
-    """Get the UID and GID for the logstash user"""
+    """
+    Get the UID and GID for the logstash user.
+
+    Returns (uid, gid) if the logstash user exists, or (0, 0) (root) with a
+    warning if it does not.  Callers that perform chown operations will therefore
+    fall back to root ownership when Logstash is not yet installed, which is safe
+    and can be corrected later once Logstash is present.
+    """
     try:
         pw = pwd.getpwnam('logstash')
         gr = grp.getgrnam('logstash')
         return pw.pw_uid, gr.gr_gid
-    except (KeyError, OSError) as e:
-        raise InstallError(f"Failed to get logstash user/group info: {e}")
+    except (KeyError, OSError):
+        logger.warning("logstash user/group not found — using root ownership as fallback")
+        return 0, 0
 
 
 def create_directories():
@@ -254,10 +278,21 @@ def create_symlink():
 def write_config_file(logstash_ui_url: str):
     """Write the initial agent config file"""
     logger.info("Writing configuration file...")
-    
+
+    logstash_present = os.path.isdir('/usr/share/logstash') and os.path.isdir('/etc/logstash')
+
+    if logstash_present:
+        path_comment = ""
+    else:
+        path_comment = (
+            "\n# ⚠  Logstash was NOT detected at install time.\n"
+            "# Update the three paths below to match your Logstash installation\n"
+            "# before starting the logstash-agent service.\n"
+        )
+
     config_content = f"""# LogstashAgent Configuration
 # Generated during installation
-
+{path_comment}
 mode: agent
 logstash_binary: /usr/share/logstash/bin/logstash
 logstash_settings: /etc/logstash
@@ -285,10 +320,10 @@ logstash_ui_url: {logstash_ui_url}
 def install_systemd_service():
     """Install the systemd service unit"""
     logger.info("Installing systemd service...")
-    
+
     # Write the service file
     with open(INSTALL_PATHS['systemd_service'], 'w') as f:
-        f.write(SYSTEMD_SERVICE_TEMPLATE)
+        f.write(_build_systemd_service())
     
     os.chmod(INSTALL_PATHS['systemd_service'], 0o644)
     logger.info(f"✓ Created systemd service {INSTALL_PATHS['systemd_service']}")
@@ -328,7 +363,15 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
         logger.info("\nStep 1: Verifying prerequisites...")
         verify_root()
         verify_platform()
-        verify_logstash_installed()
+        logstash_present = verify_logstash_installed()
+        if not logstash_present:
+            logger.warning(
+                "\n⚠  Continuing installation without Logstash.\n"
+                "   The agent will be enrolled and the service registered,\n"
+                "   but pipeline management will not work until Logstash is\n"
+                "   installed and /etc/logstash-agent/logstash-agent.yml is\n"
+                "   updated with the correct binary and settings paths.\n"
+            )
         
         # Step 2: Create directories
         logger.info("\nStep 2: Creating directories...")
