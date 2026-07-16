@@ -386,11 +386,17 @@ def update_keystore(settings_path, keystore_changes):
             for key_name in all_keys:
                 key_value = ks.get_key(key_name)
                 if key_value is not None:
-                    # Hash the key_name + key_value for change detection
-                    hash_input = f"{key_name}{key_value}"
+                    # Normalize key_name to lowercase for hashing.  The Logstash
+                    # keystore CLI uppercases all key names internally, but the
+                    # server stores and hashes them as-is (lowercase for SNMP
+                    # entries).  Using lowercase here keeps the formula consistent
+                    # with the server's kv_hash = SHA256(key_name + value) and
+                    # makes snmp_ks_state lookups work without case gymnastics.
+                    normalized = key_name.lower()
+                    hash_input = f"{normalized}{key_value}"
                     key_hash = hashlib.sha256(hash_input.encode('utf-8')).hexdigest()
-                    new_keystore_state[key_name] = key_hash
-                    logger.debug(f"  - Computed hash for key: {key_name}")
+                    new_keystore_state[normalized] = key_hash
+                    logger.debug(f"  - Computed hash for key: {normalized}")
                 else:
                     logger.warning(f"  - Key {key_name} returned None value")
             
@@ -1385,6 +1391,9 @@ def apply_snmp_changes(settings_path, snmp_changes):
             if keys_to_set and not state.get('keystore_password'):
                 logger.warning("Skipping SNMP keystore set - no keystore password in agent state yet")
             elif update_keystore(settings_path, keystore_changes):
+                # regular_ks now uses lowercase key names (normalized in update_keystore),
+                # matching the lowercase names the server sends for SNMP entries.
+                # The lookup is now a direct match with no case conversion needed.
                 regular_ks = agent_state.get_state().get('keystore', {})
                 snmp_ks_state = agent_state.get_state().get('snmp_keystore', {})
                 for key_name in keys_to_delete:
