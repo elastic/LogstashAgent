@@ -1022,6 +1022,20 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
                                 logger.info("Created new keystore with updated password")
                                 agent_state.update_state('keystore_password', actual_password)
                                 agent_state.update_state('keystore_password_hash', new_hash)
+                                # Rebuilding the keystore wipes ALL keys, including the
+                                # SNMP-managed keys that arrive on the separate check-in
+                                # channel (they are intentionally excluded from this
+                                # policy-channel rebuild). Clear our SNMP keystore
+                                # hash-state so the next check-in reports them missing and
+                                # the server re-provisions this agent's SNMP keys.
+                                # Without this, the physical keystore would be permanently
+                                # missing SNMP secrets until an unrelated SNMP change.
+                                if state.get('snmp_keystore'):
+                                    agent_state.update_state('snmp_keystore', {})
+                                    logger.info(
+                                        "Cleared SNMP keystore state after password rebuild; "
+                                        "SNMP keys will be re-provisioned on next check-in"
+                                    )
                                 state = agent_state.get_state()
                                 update_logstash_env_file(actual_password)
                                 files_updated = True
@@ -1057,7 +1071,13 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
                         logger.info("Keystore changes detected")
                         if update_keystore(settings_path, keystore_changes):
                             files_updated = True
-                            requires_restart = True
+                            # Only restart when keys were added or overwritten.
+                            # Logstash reads the keystore at startup, so new/updated
+                            # values require a restart. Delete-only operations don't:
+                            # the pipeline referencing the key is removed dynamically
+                            # and Logstash continues running without it.
+                            if keystore_changes.get('set'):
+                                requires_restart = True
                         else:
                             logger.error("Failed to update keystore - aborting rollout")
                             failed_operations.append('keystore update failed')
@@ -1382,6 +1402,8 @@ def apply_snmp_changes(settings_path, snmp_changes):
 
         ok = True
 
+        keystore_changed = False
+
         # --- Keystore first (pipelines may reference these keys) ---
         if keys_to_set or keys_to_delete:
             state = agent_state.get_state()
@@ -1406,11 +1428,17 @@ def apply_snmp_changes(settings_path, snmp_changes):
                     f"Applied SNMP keystore changes: {len(keys_to_set)} set, "
                     f"{len(keys_to_delete)} delete"
                 )
+                # Only restart when keys were added or overwritten — Logstash reads
+                # the keystore at startup, so new/updated values require a restart.
+                # Deletes don't need one: the pipeline referencing the key is being
+                # removed dynamically anyway, and Logstash continues running fine.
+                if keys_to_set:
+                    keystore_changed = True
             else:
                 ok = False
                 logger.error("Failed to apply SNMP keystore changes")
 
-        # --- Pipelines (applied dynamically, no restart required) ---
+        # --- Pipelines (written first so Logstash picks them up on restart) ---
         if pipelines_to_set or pipelines_to_delete:
             if update_pipelines(settings_path, pipeline_changes):
                 snmp_pl_state = agent_state.get_state().get('snmp_pipelines', {})
@@ -1426,6 +1454,15 @@ def apply_snmp_changes(settings_path, snmp_changes):
             else:
                 ok = False
                 logger.error("Failed to apply SNMP pipeline changes")
+
+        # Keystore values are only read by Logstash at startup, so a restart is
+        # required whenever keystore entries were added or removed.
+        if ok and keystore_changed:
+            logger.info("Keystore updated — restarting Logstash to apply new keystore values...")
+            if restart_logstash():
+                logger.info("Logstash restarted successfully after SNMP keystore update")
+            else:
+                logger.error("Logstash restart failed after SNMP keystore update — manual intervention may be required")
 
         return ok
 
