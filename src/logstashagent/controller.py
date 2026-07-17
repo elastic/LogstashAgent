@@ -26,6 +26,9 @@ from .ls_keystore_utils.exceptions import (
 )
 from importlib.metadata import version as get_version, PackageNotFoundError
 
+logger = logging.getLogger(__name__)
+
+
 def _decrypt_from_server(raw_api_key: str, encrypted: str) -> str:
     """
     Decrypt a value that was encrypted by the server specifically for this agent.
@@ -157,8 +160,6 @@ def update_logstash_env_file(password: str) -> None:
     except Exception as e:
         logger.error(f"Failed to write {_LOGSTASH_ENV_FILE}: {e}")
         raise
-
-logger = logging.getLogger(__name__)
 
 # Module-level watcher — started once by run_controller(), consulted by check_in()
 _log_watcher: Optional[log_analyzer.LogstashLogWatcher] = None
