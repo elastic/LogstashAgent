@@ -3,6 +3,7 @@
 #you may not use this file except in compliance with the Elastic License.
 
 import time
+import random
 import threading
 import logging
 import requests
@@ -25,6 +26,9 @@ from .ls_keystore_utils.exceptions import (
 )
 from importlib.metadata import version as get_version, PackageNotFoundError
 
+logger = logging.getLogger(__name__)
+
+
 def _decrypt_from_server(raw_api_key: str, encrypted: str) -> str:
     """
     Decrypt a value that was encrypted by the server specifically for this agent.
@@ -32,6 +36,41 @@ def _decrypt_from_server(raw_api_key: str, encrypted: str) -> str:
     """
     key = base64.urlsafe_b64encode(hashlib.sha256(raw_api_key.encode('utf-8')).digest())
     return Fernet(key).decrypt(encrypted.encode('utf-8')).decode('utf-8')
+
+
+def _managed_rollup(pipelines, keystore):
+    """
+    Canonical single-hash summary of a managed source's pipeline + keystore hash
+    maps, used for the cheap per-source "dirty?" check at check-in (Phase 2).
+
+    MUST stay byte-for-byte identical to the server's implementation
+    (PipelineManager.agent_api._managed_rollup) so both sides derive the same
+    rollup from the same {name: hash} maps.
+    """
+    parts = []
+    for name in sorted(pipelines or {}):
+        parts.append(f"p:{name}={pipelines[name]}")
+    for name in sorted(keystore or {}):
+        parts.append(f"k:{name}={keystore[name]}")
+    return hashlib.sha256("\n".join(parts).encode('utf-8')).hexdigest()
+
+
+def _record_last_apply(source, success, failed_operations, revision=None):
+    """
+    Record the most recent apply result for a managed source ('user', 'snmp', …)
+    in agent state under `last_apply[source]`, so each channel's status is
+    tracked independently even though they now share one merged apply/restart.
+    """
+    last_apply = agent_state.get_state().get('last_apply', {})
+    entry = {
+        'success': success,
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+        'failed_operations': failed_operations,
+    }
+    if revision is not None:
+        entry['revision'] = revision
+    last_apply[source] = entry
+    agent_state.update_state('last_apply', last_apply)
 
 
 # Default environment file sourced by the Logstash systemd unit.
@@ -121,8 +160,6 @@ def update_logstash_env_file(password: str) -> None:
     except Exception as e:
         logger.error(f"Failed to write {_LOGSTASH_ENV_FILE}: {e}")
         raise
-
-logger = logging.getLogger(__name__)
 
 # Module-level watcher — started once by run_controller(), consulted by check_in()
 _log_watcher: Optional[log_analyzer.LogstashLogWatcher] = None
@@ -385,11 +422,17 @@ def update_keystore(settings_path, keystore_changes):
             for key_name in all_keys:
                 key_value = ks.get_key(key_name)
                 if key_value is not None:
-                    # Hash the key_name + key_value for change detection
-                    hash_input = f"{key_name}{key_value}"
+                    # Normalize key_name to lowercase for hashing.  The Logstash
+                    # keystore CLI uppercases all key names internally, but the
+                    # server stores and hashes them as-is (lowercase for SNMP
+                    # entries).  Using lowercase here keeps the formula consistent
+                    # with the server's kv_hash = SHA256(key_name + value) and
+                    # makes snmp_ks_state lookups work without case gymnastics.
+                    normalized = key_name.lower()
+                    hash_input = f"{normalized}{key_value}"
                     key_hash = hashlib.sha256(hash_input.encode('utf-8')).hexdigest()
-                    new_keystore_state[key_name] = key_hash
-                    logger.debug(f"  - Computed hash for key: {key_name}")
+                    new_keystore_state[normalized] = key_hash
+                    logger.debug(f"  - Computed hash for key: {normalized}")
                 else:
                     logger.warning(f"  - Key {key_name} returned None value")
             
@@ -435,6 +478,10 @@ def build_pipelines_state(settings_path):
         # Start from persisted state so config_hash values are the server's pipeline_hash
         state = agent_state.get_state()
         persisted_pipelines = state.get('pipelines', {})
+        # SNMP-managed pipelines are reconciled via the check-in loop, not the
+        # regular policy channel. Exclude them here so get_config_changes never
+        # tries to delete or re-push them.
+        snmp_pipeline_names = set(state.get('snmp_pipelines', {}).keys())
 
         if not os.path.isdir(conf_d_path):
             logger.debug(f"conf.d directory not found at {conf_d_path}, returning empty pipelines state")
@@ -471,6 +518,9 @@ def build_pipelines_state(settings_path):
         pipelines_state = {}
         for conf_file in conf_files:
             pipeline_name = conf_file[:-5]  # strip .conf
+            # Skip SNMP-managed pipelines (synced via the check-in loop)
+            if pipeline_name in snmp_pipeline_names:
+                continue
             # Use the stored server pipeline_hash as config_hash for stable comparison
             stored = persisted_pipelines.get(pipeline_name, {})
             config_hash = stored.get('config_hash', '')
@@ -487,6 +537,8 @@ def build_pipelines_state(settings_path):
 
         # Include no_input pipelines from state (they don't have .conf files)
         for pipeline_name, stored in persisted_pipelines.items():
+            if pipeline_name in snmp_pipeline_names:
+                continue
             if stored.get('no_input') and pipeline_name not in pipelines_state:
                 pipelines_state[pipeline_name] = {
                     'config_hash': stored.get('config_hash', ''),
@@ -751,7 +803,185 @@ def restart_logstash():
         return False
 
 
-def get_config_changes(server_settings_path=None, server_logs_path=None, server_binary_path=None):
+def _merge_keystore_into(plan_keystore, incoming):
+    """
+    Merge an incoming {'set': {...}, 'delete': [...]} keystore delta into the
+    shared apply plan. Later sources override earlier ones on key-name conflict
+    (collisions across sources are not expected today — see handoff).
+    """
+    if not incoming or incoming is False:
+        return
+    for name, value in (incoming.get('set') or {}).items():
+        plan_keystore['set'][name] = value
+    for name in (incoming.get('delete') or []):
+        if name not in plan_keystore['delete']:
+            plan_keystore['delete'].append(name)
+
+
+def _merge_pipelines_into(plan_pipelines, incoming):
+    """
+    Merge an incoming {'set': {...}, 'delete': [...]} pipeline delta into the
+    shared apply plan.
+    """
+    if not incoming or incoming is False:
+        return
+    for name, data in (incoming.get('set') or {}).items():
+        plan_pipelines['set'][name] = data
+    for name in (incoming.get('delete') or []):
+        if name not in plan_pipelines['delete']:
+            plan_pipelines['delete'].append(name)
+
+
+def _apply_merged_plan(settings_path, plan, policy_res, snmp_res):
+    """
+    Apply a merged policy + SNMP change plan in a SINGLE pass:
+    one `logstash-keystore` batch, one pipelines.yml rewrite, and at most one
+    Logstash restart — instead of each channel applying and restarting on its own.
+
+    Config files and the keystore-password rebuild are applied earlier, inline in
+    `get_config_changes` (they are policy-only and order-sensitive). This function
+    only applies the merged keystore-key + pipeline deltas, restarts once if
+    needed, then updates the SNMP hash namespaces and finalizes the policy
+    revision / last_policy_apply bookkeeping.
+
+    Args:
+        settings_path: Logstash settings directory
+        plan: {'keystore': {'set': {}, 'delete': []},
+               'pipelines': {'set': {}, 'delete': []}}
+        policy_res: dict returned by get_config_changes(plan=...) or None if the
+                    policy channel did not run this cycle
+        snmp_res: dict returned by apply_snmp_changes(plan=...) or None
+    """
+    ks = plan['keystore']
+    pl = plan['pipelines']
+
+    # A key/pipeline being set supersedes a delete of the same name.
+    ks['delete'] = [n for n in ks['delete'] if n not in ks['set']]
+    pl['delete'] = [n for n in pl['delete'] if n not in pl['set']]
+
+    ks_has = bool(ks['set'] or ks['delete'])
+    pl_has = bool(pl['set'] or pl['delete'])
+
+    ks_ok = True
+    pl_ok = True
+
+    # Keystore first — pipelines may reference these keys. Single batched
+    # `logstash-keystore add` covers both policy and SNMP keys.
+    if ks_has:
+        logger.info(f"Merged keystore apply: {len(ks['set'])} set, {len(ks['delete'])} delete")
+        ks_ok = update_keystore(settings_path, ks)
+        if not ks_ok:
+            logger.error("Merged keystore apply failed")
+
+    # Pipelines — single pipelines.yml rewrite covering policy + SNMP.
+    if pl_has:
+        logger.info(f"Merged pipeline apply: {len(pl['set'])} set, {len(pl['delete'])} delete")
+        pl_ok = update_pipelines(settings_path, pl)
+        if not pl_ok:
+            logger.error("Merged pipeline apply failed")
+
+    # Restart is required for config-file / keystore-password changes (policy
+    # channel) or whenever keystore VALUES were added/updated. Pipeline changes
+    # and pure keystore deletes reload dynamically — no restart.
+    requires_restart = bool(ks['set'])
+    if policy_res:
+        requires_restart = requires_restart or policy_res.get('requires_restart', False)
+
+    keystore_apply_ok = (not ks_has) or ks_ok
+    restart_failed = False
+    if requires_restart and keystore_apply_ok:
+        logger.info("Applying merged changes — restarting Logstash once...")
+        if restart_logstash():
+            logger.info("Logstash restart completed successfully")
+        else:
+            logger.error("Logstash restart failed - manual intervention may be required")
+            restart_failed = True
+    elif pl_has and pl_ok and not ks['set']:
+        logger.info("Pipeline-only changes applied - Logstash restart not required")
+
+    # --- Update SNMP hash namespaces (only for parts that applied cleanly) ---
+    if snmp_res and snmp_res.get('ran'):
+        if (snmp_res.get('pipeline_set') or snmp_res.get('pipeline_delete_names')) and pl_ok:
+            snmp_pl_state = agent_state.get_state().get('snmp_pipelines', {})
+            for name in snmp_res.get('pipeline_delete_names', []):
+                snmp_pl_state.pop(name, None)
+            for name, phash in (snmp_res.get('pipeline_set') or {}).items():
+                snmp_pl_state[name] = phash
+            agent_state.update_state('snmp_pipelines', snmp_pl_state)
+            logger.info(
+                f"Applied SNMP pipeline changes: {len(snmp_res.get('pipeline_set') or {})} set, "
+                f"{len(snmp_res.get('pipeline_delete_names') or [])} delete"
+            )
+        if (snmp_res.get('keystore_set_names') or snmp_res.get('keystore_delete_names')) \
+                and ks_ok and not snmp_res.get('keystore_skipped'):
+            regular_ks = agent_state.get_state().get('keystore', {})
+            snmp_ks_state = agent_state.get_state().get('snmp_keystore', {})
+            for name in snmp_res.get('keystore_delete_names', []):
+                snmp_ks_state.pop(name, None)
+            for name in snmp_res.get('keystore_set_names', []):
+                if name in regular_ks:
+                    snmp_ks_state[name] = regular_ks[name]
+            agent_state.update_state('snmp_keystore', snmp_ks_state)
+            logger.info(
+                f"Applied SNMP keystore changes: {len(snmp_res.get('keystore_set_names') or [])} set, "
+                f"{len(snmp_res.get('keystore_delete_names') or [])} delete"
+            )
+
+        # Record this source's independent apply status (Phase 2). Note:
+        # `keystore_skipped` is checked directly because in that case
+        # apply_snmp_changes leaves keystore_set/delete names empty.
+        snmp_failed = []
+        if snmp_res.get('keystore_skipped'):
+            snmp_failed.append('keystore skipped - no keystore password set')
+        elif (snmp_res.get('keystore_set_names') or snmp_res.get('keystore_delete_names')) \
+                and ks_has and not ks_ok:
+            snmp_failed.append('keystore update failed')
+        if (snmp_res.get('pipeline_set') or snmp_res.get('pipeline_delete_names')) and pl_has and not pl_ok:
+            snmp_failed.append('pipelines update failed')
+        # Only attribute the shared restart failure to SNMP if SNMP actually
+        # needed one (it added/updated keystore values); pipeline-only SNMP
+        # changes reload dynamically and don't depend on the restart.
+        if restart_failed and snmp_res.get('keystore_set_names'):
+            snmp_failed.append('logstash restart failed')
+        _record_last_apply('snmp', len(snmp_failed) == 0, snmp_failed)
+
+    # --- Finalize policy revision + last_policy_apply (only if policy ran) ---
+    if policy_res and policy_res.get('ran'):
+        policy_failed = list(policy_res.get('failed_operations', []))
+        if ks_has and not ks_ok:
+            policy_failed.append('keystore update failed')
+        if pl_has and not pl_ok:
+            policy_failed.append('pipelines update failed')
+        if restart_failed:
+            policy_failed.append('logstash restart failed')
+
+        aborted = policy_res.get('aborted', False)
+        policy_files_updated = policy_res.get('files_updated', False)
+
+        # Bump revision unless the rollout aborted or a policy change failed to
+        # apply (mirrors the legacy standalone get_config_changes semantics).
+        if (not aborted) and not (policy_files_updated and policy_failed):
+            server_revision = policy_res.get('current_revision')
+            if server_revision is not None:
+                agent_state.update_state('revision_number', server_revision)
+                logger.info(f"Updated agent revision number to {server_revision}")
+
+        apply_success = len(policy_failed) == 0
+        agent_state.update_state('last_policy_apply', {
+            'success': apply_success,
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'revision': policy_res.get('current_revision'),
+            'failed_operations': policy_failed,
+        })
+        # Mirror into the per-source structure (Phase 2). last_policy_apply is
+        # retained for the existing UI; last_apply['user'] is the generic form.
+        _record_last_apply(
+            'user', apply_success, policy_failed, revision=policy_res.get('current_revision')
+        )
+        logger.info(f"Saved last_policy_apply: success={apply_success}, failed={policy_failed}")
+
+
+def get_config_changes(server_settings_path=None, server_logs_path=None, server_binary_path=None, plan=None):
     """
     Check for configuration changes by reading local config files and comparing hashes with server.
     Reads logstash.yml, jvm.options, and log4j2.properties from settings_path and computes SHA256 hashes.
@@ -871,6 +1101,11 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
             'keystore': keystore_state,
             'keystore_password_hash': state.get('keystore_password_hash', ''),
             'pipelines': pipelines_state,
+            # Phase 2: the full SNMP hash maps ride along in this fetch so the
+            # server can compute the exact SNMP delta (set/delete + decrypt of
+            # only changed keys) and return it alongside the policy delta.
+            'snmp_pipelines': state.get('snmp_pipelines', {}),
+            'snmp_keystore': state.get('snmp_keystore', {}),
         }
         
         # Send request to server
@@ -1006,6 +1241,20 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
                                 logger.info("Created new keystore with updated password")
                                 agent_state.update_state('keystore_password', actual_password)
                                 agent_state.update_state('keystore_password_hash', new_hash)
+                                # Rebuilding the keystore wipes ALL keys, including the
+                                # SNMP-managed keys that arrive on the separate check-in
+                                # channel (they are intentionally excluded from this
+                                # policy-channel rebuild). Clear our SNMP keystore
+                                # hash-state so the next check-in reports them missing and
+                                # the server re-provisions this agent's SNMP keys.
+                                # Without this, the physical keystore would be permanently
+                                # missing SNMP secrets until an unrelated SNMP change.
+                                if state.get('snmp_keystore'):
+                                    agent_state.update_state('snmp_keystore', {})
+                                    logger.info(
+                                        "Cleared SNMP keystore state after password rebuild; "
+                                        "SNMP keys will be re-provisioned on next check-in"
+                                    )
                                 state = agent_state.get_state()
                                 update_logstash_env_file(actual_password)
                                 files_updated = True
@@ -1037,11 +1286,24 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
                     if not state.get('keystore_password'):
                         logger.warning("Skipping keystore key changes - no keystore password in agent state yet")
                         failed_operations.append('keystore changes skipped - no password in state')
+                    elif plan is not None:
+                        # Merge mode: defer the actual keystore write so it can be
+                        # batched with SNMP (and any other source) into ONE
+                        # `logstash-keystore add` and ONE restart in the caller.
+                        logger.info("Keystore changes detected (deferred to merged apply)")
+                        _merge_keystore_into(plan['keystore'], keystore_changes)
+                        files_updated = True
                     else:
                         logger.info("Keystore changes detected")
                         if update_keystore(settings_path, keystore_changes):
                             files_updated = True
-                            requires_restart = True
+                            # Only restart when keys were added or overwritten.
+                            # Logstash reads the keystore at startup, so new/updated
+                            # values require a restart. Delete-only operations don't:
+                            # the pipeline referencing the key is removed dynamically
+                            # and Logstash continues running without it.
+                            if keystore_changes.get('set'):
+                                requires_restart = True
                         else:
                             logger.error("Failed to update keystore - aborting rollout")
                             failed_operations.append('keystore update failed')
@@ -1051,13 +1313,37 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
             if not rollout_aborted:
                 pipeline_changes = changes.get('pipelines')
                 if pipeline_changes and pipeline_changes != False:
-                    logger.info("Pipeline changes detected")
-                    if update_pipelines(settings_path, pipeline_changes):
+                    if plan is not None:
+                        # Merge mode: defer so policy + SNMP pipelines share ONE
+                        # pipelines.yml rewrite in the caller.
+                        logger.info("Pipeline changes detected (deferred to merged apply)")
+                        _merge_pipelines_into(plan['pipelines'], pipeline_changes)
                         files_updated = True
                     else:
-                        logger.error("Failed to update pipelines - aborting rollout")
-                        failed_operations.append('pipelines update failed')
-                        rollout_aborted = True
+                        logger.info("Pipeline changes detected")
+                        if update_pipelines(settings_path, pipeline_changes):
+                            files_updated = True
+                        else:
+                            logger.error("Failed to update pipelines - aborting rollout")
+                            failed_operations.append('pipelines update failed')
+                            rollout_aborted = True
+
+            if plan is not None:
+                # Merge mode: the caller applies the merged keystore/pipeline plan,
+                # restarts once, and finalizes the revision / last_policy_apply.
+                # Config files + keystore-password rebuild were already applied above.
+                # `snmp_changes` (Phase 2) rides along in this same response so the
+                # caller can contribute the SNMP delta into the same merged plan.
+                return {
+                    'success': True,
+                    'ran': True,
+                    'current_revision': result.get('current_revision'),
+                    'files_updated': files_updated,
+                    'requires_restart': requires_restart,
+                    'failed_operations': failed_operations,
+                    'aborted': rollout_aborted,
+                    'snmp_changes': result.get('snmp_changes'),
+                }
 
             if rollout_aborted:
                 logger.error(f"Rollout aborted due to failures: {failed_operations}")
@@ -1336,6 +1622,143 @@ def get_logstash_process_info():
         return {'available': True, 'running': False, 'error': str(e)[:200]}
 
 
+def apply_snmp_changes(settings_path, snmp_changes, plan=None):
+    """
+    Apply SNMP-managed pipeline and keystore changes received during check-in.
+
+    SNMP changes are delivered independently of the policy revision number and
+    are tracked in dedicated agent-state namespaces ('snmp_pipelines' and
+    'snmp_keystore') so they never interfere with policy revision history.
+
+    Two modes:
+    - `plan is None` (standalone/legacy): apply keystore + pipelines directly and
+      restart if keystore values changed. Returns bool.
+    - `plan` provided (merge mode): contribute the SNMP deltas into the shared
+      apply plan and return a metadata dict; the caller (`_apply_merged_plan`)
+      applies keystore/pipelines ONCE alongside the policy channel, restarts once,
+      and — on success — updates the SNMP hash namespaces from this metadata.
+
+    Args:
+        settings_path: Path to Logstash settings directory
+        snmp_changes: {'pipelines': {'set': {...}, 'delete': [...]},
+                       'keystore':  {'set': {...}, 'delete': [...]}}
+        plan: optional shared apply plan for merged single-restart application
+
+    Returns:
+        bool (standalone mode) or dict (merge mode)
+    """
+    try:
+        pipeline_changes = snmp_changes.get('pipelines') or {}
+        keystore_changes = snmp_changes.get('keystore') or {}
+
+        keys_to_set = keystore_changes.get('set', {})
+        keys_to_delete = keystore_changes.get('delete', [])
+        pipelines_to_set = pipeline_changes.get('set', {})
+        pipelines_to_delete = pipeline_changes.get('delete', [])
+
+        if plan is not None:
+            # Merge mode: contribute the SNMP deltas into the shared apply plan.
+            # The caller applies keystore/pipelines once and, on success, updates
+            # the SNMP hash namespaces from the returned metadata below.
+            state = agent_state.get_state()
+            contributed = {
+                'ran': True,
+                'keystore_set_names': [],
+                'keystore_delete_names': [],
+                'keystore_skipped': False,
+                'pipeline_set': {
+                    name: data.get('pipeline_hash', '')
+                    for name, data in pipelines_to_set.items()
+                },
+                'pipeline_delete_names': list(pipelines_to_delete),
+            }
+            if keys_to_set or keys_to_delete:
+                # Setting keys needs the keystore password; if it isn't in state
+                # yet, skip the whole SNMP keystore this cycle (matches legacy;
+                # the policy channel provisions the password on a revision change).
+                if keys_to_set and not state.get('keystore_password'):
+                    logger.warning("Skipping SNMP keystore - no keystore password in agent state yet")
+                    contributed['keystore_skipped'] = True
+                else:
+                    _merge_keystore_into(plan['keystore'], keystore_changes)
+                    contributed['keystore_set_names'] = list(keys_to_set.keys())
+                    contributed['keystore_delete_names'] = list(keys_to_delete)
+            if pipelines_to_set or pipelines_to_delete:
+                _merge_pipelines_into(plan['pipelines'], pipeline_changes)
+            return contributed
+
+        ok = True
+
+        keystore_changed = False
+
+        # --- Keystore first (pipelines may reference these keys) ---
+        if keys_to_set or keys_to_delete:
+            state = agent_state.get_state()
+            # Setting keys requires the keystore password so the agent can
+            # open/create the keystore. If it isn't present yet, skip this cycle
+            # (the regular policy channel provisions it on revision change).
+            if keys_to_set and not state.get('keystore_password'):
+                logger.warning("Skipping SNMP keystore set - no keystore password in agent state yet")
+            elif update_keystore(settings_path, keystore_changes):
+                # regular_ks now uses lowercase key names (normalized in update_keystore),
+                # matching the lowercase names the server sends for SNMP entries.
+                # The lookup is now a direct match with no case conversion needed.
+                regular_ks = agent_state.get_state().get('keystore', {})
+                snmp_ks_state = agent_state.get_state().get('snmp_keystore', {})
+                for key_name in keys_to_delete:
+                    snmp_ks_state.pop(key_name, None)
+                for key_name in keys_to_set:
+                    if key_name in regular_ks:
+                        snmp_ks_state[key_name] = regular_ks[key_name]
+                agent_state.update_state('snmp_keystore', snmp_ks_state)
+                logger.info(
+                    f"Applied SNMP keystore changes: {len(keys_to_set)} set, "
+                    f"{len(keys_to_delete)} delete"
+                )
+                # Only restart when keys were added or overwritten — Logstash reads
+                # the keystore at startup, so new/updated values require a restart.
+                # Deletes don't need one: the pipeline referencing the key is being
+                # removed dynamically anyway, and Logstash continues running fine.
+                if keys_to_set:
+                    keystore_changed = True
+            else:
+                ok = False
+                logger.error("Failed to apply SNMP keystore changes")
+
+        # --- Pipelines (written first so Logstash picks them up on restart) ---
+        if pipelines_to_set or pipelines_to_delete:
+            if update_pipelines(settings_path, pipeline_changes):
+                snmp_pl_state = agent_state.get_state().get('snmp_pipelines', {})
+                for name in pipelines_to_delete:
+                    snmp_pl_state.pop(name, None)
+                for name, data in pipelines_to_set.items():
+                    snmp_pl_state[name] = data.get('pipeline_hash', '')
+                agent_state.update_state('snmp_pipelines', snmp_pl_state)
+                logger.info(
+                    f"Applied SNMP pipeline changes: {len(pipelines_to_set)} set, "
+                    f"{len(pipelines_to_delete)} delete"
+                )
+            else:
+                ok = False
+                logger.error("Failed to apply SNMP pipeline changes")
+
+        # Keystore values are only read by Logstash at startup, so a restart is
+        # required whenever keystore entries were added or removed.
+        if ok and keystore_changed:
+            logger.info("Keystore updated — restarting Logstash to apply new keystore values...")
+            if restart_logstash():
+                logger.info("Logstash restarted successfully after SNMP keystore update")
+            else:
+                logger.error("Logstash restart failed after SNMP keystore update — manual intervention may be required")
+
+        return ok
+
+    except Exception as e:
+        logger.error(f"Unexpected error in apply_snmp_changes: {e}")
+        logger.exception("apply_snmp_changes exception details:")
+        return False
+
+
 def check_in():
     """
     Send check-in to logstashui with current agent state
@@ -1506,6 +1929,7 @@ def check_in():
         status_blob['node_stats'] = get_logstash_node_stats(api_port)
         status_blob['process_info'] = get_logstash_process_info()
         status_blob['last_policy_apply'] = state.get('last_policy_apply')
+        status_blob['last_apply'] = state.get('last_apply')
 
         # Log state — prefer live watcher (near-realtime, clears warnings/errors
         # after each checkin); fall back to snapshot if watcher not yet started.
@@ -1516,11 +1940,21 @@ def check_in():
 
         logger.debug(f"Path validation status: {status_blob}")
         
-        # Prepare check-in data
+        # Prepare check-in data. Check-in stays cheap (Phase 2): instead of the
+        # full SNMP hash maps, send only a per-source rollup hash. The server
+        # compares it against the deployed state (no decryption) and returns a
+        # `managed_changes_available` flag; the actual delta is fetched via
+        # GetConfigChanges only when something is dirty.
         check_in_data = {
             'connection_id': connection_id,
             'revision_number': state.get('revision_number', 0),
-            'status_blob': status_blob
+            'status_blob': status_blob,
+            'managed_state_hashes': {
+                'snmp': _managed_rollup(
+                    state.get('snmp_pipelines', {}),
+                    state.get('snmp_keystore', {}),
+                ),
+            },
         }
         
         # Send check-in request
@@ -1559,20 +1993,73 @@ def check_in():
         if result.get('success'):
             logger.info("Check-in successful")
 
-            # Compare revision numbers
+            # Decide what's dirty from the cheap check-in response (Phase 2):
+            #   - policy: revision number differs
+            #   - snmp (and any future managed source): per-source rollup flag
             agent_revision = state.get('revision_number', 0)
             server_revision = result.get('current_revision_number', 0)
-            
-            if agent_revision == server_revision:
+            policy_dirty = agent_revision != server_revision
+            managed_available = result.get('managed_changes_available', {}) or {}
+            snmp_dirty = bool(managed_available.get('snmp'))
+
+            # Build ONE merged apply plan so the policy channel and the SNMP
+            # channel share a single keystore batch, a single pipelines.yml
+            # rewrite, and a single Logstash restart when both change in the same
+            # cycle (previously each applied + restarted independently).
+            plan = {
+                'keystore': {'set': {}, 'delete': []},
+                'pipelines': {'set': {}, 'delete': []},
+            }
+
+            policy_res = None
+            snmp_res = None
+            snmp_settings_path = result.get('settings_path') or state.get('settings_path')
+
+            if not policy_dirty and not snmp_dirty:
                 logger.info(f"Agent is up-to-date (revision {agent_revision})")
             else:
-                logger.warning(f"New revision detected, checking difference in config. Agent revision: {agent_revision}, Server revision: {server_revision}")
-                # Get config changes from server, using server-provided paths
-                # This ensures agent can check new paths even if state hasn't been updated
-                server_settings_path = result.get('settings_path')
-                server_logs_path = result.get('logs_path')
-                server_binary_path = result.get('binary_path')
-                get_config_changes(server_settings_path, server_logs_path, server_binary_path)
+                # Single unified fetch: GetConfigChanges returns BOTH the policy
+                # delta AND the SNMP delta for this agent, so both are applied in
+                # one merged pass. We fetch whenever EITHER source is dirty.
+                if policy_dirty:
+                    logger.warning(
+                        f"New revision detected, checking config difference. "
+                        f"Agent revision: {agent_revision}, Server revision: {server_revision}"
+                    )
+                if snmp_dirty:
+                    logger.info("SNMP-managed changes flagged at check-in — fetching delta")
+
+                # In merge mode get_config_changes applies config files + keystore
+                # password inline and defers keystore-key/pipeline changes into
+                # `plan`, and returns the SNMP delta from the same response.
+                fetch_res = get_config_changes(
+                    result.get('settings_path'),
+                    result.get('logs_path'),
+                    result.get('binary_path'),
+                    plan=plan,
+                )
+
+                # Finalize/restart the policy channel only when it actually did
+                # (or staged) work: either the revision changed, OR the fetch
+                # detected config/keystore/pipeline drift and applied it
+                # (files_updated). This restarts Logstash if a real policy change
+                # rode along on an SNMP-triggered fetch (e.g. self-healing manual
+                # config drift), while avoiding last_policy_apply churn + no-op
+                # revision writes on true SNMP-only cycles.
+                policy_did_work = fetch_res.get('files_updated') if fetch_res else False
+                policy_res = fetch_res if (policy_dirty or policy_did_work) else None
+
+                snmp_changes = (fetch_res or {}).get('snmp_changes')
+                if snmp_changes:
+                    logger.info("Applying SNMP-managed changes from fetch")
+                    snmp_res = apply_snmp_changes(snmp_settings_path, snmp_changes, plan=plan)
+
+            # Apply the merged plan once: one keystore batch, one pipelines.yml
+            # rewrite, one restart; then finalize revision + SNMP hash state.
+            apply_settings_path = snmp_settings_path
+            if apply_settings_path:
+                apply_settings_path = apply_settings_path.replace('\\', '/')
+            _apply_merged_plan(apply_settings_path, plan, policy_res, snmp_res)
 
             if result.get('restart'):
                 logger.warning("Server requested Logstash restart — restarting now")
@@ -1755,7 +2242,7 @@ def run_controller():
             # --- End restart state tracking ---
 
             # Wait for next check-in — wakes up early if watcher fires an event
-            _checkin_event.wait(timeout=check_in_interval)
+            _checkin_event.wait(timeout=check_in_interval + random.uniform(-10, 10))
             _checkin_event.clear()
             
     except KeyboardInterrupt:

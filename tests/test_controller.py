@@ -105,11 +105,12 @@ class TestUpdateKeystore:
         assert ok is True
         mock_create.assert_called_once()
         ks.add_key.assert_called_once_with({"mykey": "secret"})
-        expected_hash = hashlib.sha256(b"MYKEYsecret").hexdigest()
+        # Key names are normalised to lowercase before hashing
+        expected_hash = hashlib.sha256(b"mykeysecret").hexdigest()
         update_state.assert_called_once()
         call_kw = update_state.call_args
         assert call_kw[0][0] == "keystore"
-        assert call_kw[0][1] == {"MYKEY": expected_hash}
+        assert call_kw[0][1] == {"mykey": expected_hash}
 
     @patch.object(controller.LogstashKeystore, "load")
     def test_deletes_then_sets(self, mock_load):
@@ -382,6 +383,7 @@ class TestCheckIn:
         gcc.assert_not_called()
 
     def test_success_new_revision_triggers_get_config_changes(self):
+        from unittest.mock import ANY
         state = {
             "enrolled": True,
             "logstash_ui_url": "http://localhost:8000",
@@ -399,12 +401,20 @@ class TestCheckIn:
             "binary_path": "/b/",
         }
 
-        with patch.object(controller.agent_state, "get_state", return_value=state):
-            with patch.object(controller, "get_config_changes") as gcc:
-                with patch.object(controller.requests, "post", return_value=resp):
-                    controller.check_in()
+        gcc_result = {
+            "ran": False, "files_updated": False, "requires_restart": False,
+            "failed_operations": [], "aborted": False, "current_revision": 2,
+            "snmp_changes": None,
+        }
 
-        gcc.assert_called_once_with("/a/", "/l/", "/b/")
+        with patch.object(controller.agent_state, "get_state", return_value=state):
+            with patch.object(controller.agent_state, "update_state"):
+                with patch.object(controller, "get_config_changes", return_value=gcc_result) as gcc:
+                    with patch.object(controller, "_apply_merged_plan"):
+                        with patch.object(controller.requests, "post", return_value=resp):
+                            controller.check_in()
+
+        gcc.assert_called_once_with("/a/", "/l/", "/b/", plan=ANY)
 
     def test_request_failure_returns_none(self):
         state = {

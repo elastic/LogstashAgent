@@ -10,7 +10,7 @@ import sys
 
 # Check early whether we're in a non-simulation mode (--run, --enroll, install, upgrade, or uninstall).
 # slots starts background threads on import, so we skip it in these modes.
-_SKIP_SIMULATION_IMPORTS = '--run' in sys.argv or '--enroll' in sys.argv or 'install' in sys.argv or 'upgrade' in sys.argv or 'uninstall' in sys.argv
+_SKIP_SIMULATION_IMPORTS = '--run' in sys.argv or '--enroll' in sys.argv or 'install' in sys.argv or 'upgrade' in sys.argv or 'uninstall' in sys.argv or 'configure' in sys.argv
 
 from fastapi import FastAPI, HTTPException, Path as FastAPIPath, Query, Request
 from fastapi.responses import JSONResponse
@@ -1614,22 +1614,19 @@ def parse_arguments():
         epilog="""
 Examples:
   # Install and enroll agent with logstashui
-  python main.py install --enroll=TOKEN --logstash-ui-url=http://localhost:8080
-  
+  logstash-agent install --enroll TOKEN --logstash-ui-url http://localhost:8080
+
+  # Apply Logstash-specific setup after installing Logstash post-agent-install
+  sudo logstash-agent configure
+
   # Upgrade agent to a new version
-  python main.py upgrade --version 0.1.4
-  
+  logstash-agent upgrade --version 0.1.4
+
   # Uninstall agent (preserves state and logs)
-  python main.py uninstall
-  
+  logstash-agent uninstall
+
   # Uninstall agent and remove all data
-  python main.py uninstall --purge
-  
-  # Enroll agent with logstashui (legacy)
-  python main.py --enroll=TOKEN --logstash-ui-url=http://localhost:8080
-  
-  # Run in normal mode (simulation or agent mode based on config)
-  python main.py
+  logstash-agent uninstall --purge
         """
     )
     
@@ -1677,6 +1674,17 @@ Examples:
         help='Skip the uninstallation confirmation prompt'
     )
     
+    # Configure command
+    configure_parser = subparsers.add_parser(
+        'configure',
+        help='Apply Logstash-specific setup after Logstash is installed'
+    )
+    configure_parser.add_argument(
+        '--yes',
+        action='store_true',
+        help='Skip confirmation prompt'
+    )
+
     # Upgrade command
     upgrade_parser = subparsers.add_parser(
         'upgrade',
@@ -1770,6 +1778,31 @@ if __name__ == "__main__":
             logger.error(f"Unexpected installation error: {e}", exc_info=True)
             sys.exit(1)
     
+    # Check if we're in configure mode
+    if args.command == 'configure':
+        if not args.yes:
+            print("\nThis will configure Logstash for agent management.")
+            print("\nThe following will be applied:")
+            print("  - Ownership of /etc/logstash, /var/log/logstash, /usr/share/logstash/data")
+            print("    will be set to logstash:logstash")
+            print("  - /etc/sudoers.d/logstash-agent will be written (passwordless sudo grants)")
+            print("  - The logstash-agent systemd service will be updated to run as the logstash user")
+            print()
+            answer = input("Continue? [y/N]: ").strip().lower()
+            if answer != 'y':
+                print("Configure cancelled.")
+                sys.exit(0)
+
+        try:
+            installer.perform_configure()
+            sys.exit(0)
+        except installer.InstallError as e:
+            logger.error(f"Configure failed: {e}")
+            sys.exit(1)
+        except Exception as e:
+            logger.error(f"Unexpected configure error: {e}", exc_info=True)
+            sys.exit(1)
+
     # Check if we're in uninstall mode
     if args.command == 'uninstall':
         if not args.yes:
@@ -1877,7 +1910,15 @@ if __name__ == "__main__":
     
     # Check if we're in run mode (controller mode for enrolled agents)
     if args.run:
-        # Run the agent controller
+        # Persist the Logstash API port from the loaded config into agent state so
+        # the controller's check_in() always queries the correct port.
+        # Native installs use 9600 (Logstash default); simulation/Docker uses 9650.
+        # Writing it here overrides any stale value that may have been stored from
+        # a previous simulation session.
+        logstash_api_port = AGENT_CONFIG.get('logstash_api_port', 9600)
+        agent_state.update_state('api_port', logstash_api_port)
+        logger.info(f"Logstash API port set to {logstash_api_port} (from config)")
+
         controller.run_controller()
         sys.exit(0)
     
@@ -1899,7 +1940,7 @@ if __name__ == "__main__":
     
     # Get host and port from config or use defaults
     host = AGENT_CONFIG.get('host', '0.0.0.0')
-    port = AGENT_CONFIG.get('port', 9600)
+    port = AGENT_CONFIG.get('port', 9500)
     
     logger.info(f"Starting logstashagent in {agent_mode} mode on {host}:{port}")
     
