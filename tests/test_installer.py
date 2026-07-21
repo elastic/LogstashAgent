@@ -43,15 +43,16 @@ def test_install_paths_defined():
 
 
 def test_systemd_service_template():
-    """Test that systemd service template is properly formatted"""
-    template = installer.SYSTEMD_SERVICE_TEMPLATE
-    
-    # Check for required sections
+    """Test that the generated systemd service content is properly formatted"""
+    with patch('logstashagent.installer.pwd') as mock_pwd, \
+         patch('logstashagent.installer.grp') as mock_grp:
+        mock_pwd.getpwnam.return_value = MagicMock()
+        mock_grp.getgrnam.return_value = MagicMock()
+        template = installer._build_systemd_service()
+
     assert '[Unit]' in template
     assert '[Service]' in template
     assert '[Install]' in template
-    
-    # Check for required service settings
     assert 'User=logstash' in template
     assert 'Group=logstash' in template
     assert 'ExecStart=/opt/logstash-agent/bin/logstash-agent --run' in template
@@ -135,11 +136,13 @@ def test_get_logstash_uid_gid_success(mock_pwd):
 
 @patch('logstashagent.installer.pwd')
 def test_get_logstash_uid_gid_user_not_found(mock_pwd):
-    """Test error when logstash user doesn't exist"""
+    """Test fallback when logstash user doesn't exist — returns (0, 0) with a warning"""
     mock_pwd.getpwnam.side_effect = KeyError('logstash')
-    
-    with pytest.raises(installer.InstallError, match="Failed to get logstash user/group info"):
-        installer.get_logstash_uid_gid()
+
+    uid, gid = installer.get_logstash_uid_gid()
+
+    assert uid == 0
+    assert gid == 0
 
 
 @patch('subprocess.run')
@@ -299,22 +302,24 @@ def test_verify_logstash_installed_success(mock_isdir, mock_pwd):
 
 @patch('logstashagent.installer.pwd')
 def test_verify_logstash_installed_user_missing(mock_pwd):
-    """Test verify_logstash_installed when logstash user doesn't exist"""
+    """Test verify_logstash_installed returns False when logstash user doesn't exist"""
     mock_pwd.getpwnam.side_effect = KeyError('logstash')
-    
-    with pytest.raises(installer.InstallError, match="Logstash does not appear to be installed"):
-        installer.verify_logstash_installed()
+
+    result = installer.verify_logstash_installed()
+
+    assert result is False
 
 
 @patch('logstashagent.installer.pwd')
 @patch('os.path.isdir')
 def test_verify_logstash_installed_directory_missing(mock_isdir, mock_pwd):
-    """Test verify_logstash_installed when Logstash directories don't exist"""
+    """Test verify_logstash_installed returns False when Logstash directories don't exist"""
     mock_pwd.getpwnam.return_value = MagicMock()
     mock_isdir.return_value = False
-    
-    with pytest.raises(installer.InstallError, match="Logstash does not appear to be installed"):
-        installer.verify_logstash_installed()
+
+    result = installer.verify_logstash_installed()
+
+    assert result is False
 
 
 @patch('os.path.exists')
