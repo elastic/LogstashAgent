@@ -136,6 +136,6 @@ Please open an issue to discuss large changes before submitting a pull request.
 
 ## License
 
-Copyright 2024-2026 Elasticsearch and contributors.
+Copyright 2024–2026 Elasticsearch and contributors.
 
-Licensed under the Apache License, Version 2.0. See [LICENSE](../LICENSE.txt) for details.
+Licensed under the Elastic License 2.0 (ELv2). See [LICENSE](LICENSE.txt) for details.
