@@ -15,3 +15,6 @@ simulation_mode: embedded # embedded | host
 logstash_binary: /usr/share/logstash/bin/logstash
 logstash_settings: /etc/logstash
 logstash_log_path: /var/log/logstash
+
+# FastAPI agent API port (simulation mode only)
+port: 9500

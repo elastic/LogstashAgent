@@ -1940,7 +1940,7 @@ if __name__ == "__main__":
     
     # Get host and port from config or use defaults
     host = AGENT_CONFIG.get('host', '0.0.0.0')
-    port = AGENT_CONFIG.get('port', 9600)
+    port = AGENT_CONFIG.get('port', 9500)
     
     logger.info(f"Starting logstashagent in {agent_mode} mode on {host}:{port}")
     
