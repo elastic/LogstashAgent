@@ -263,17 +263,23 @@ class TestGetBagTimestamp:
         assert get_bag_timestamp(bag) is None
 
     def test_parses_time_value(self):
+        from logstashagent.ls_keystore_utils.settings import LOCAL_KEY_ID
+
         ts_ms = 1_700_000_000_000
-        attr = MagicMock()
+        type_mock = MagicMock()
+        type_mock.native = LOCAL_KEY_ID
         values_mock = MagicMock()
         values_mock.__getitem__ = MagicMock(
             return_value=MagicMock(native=f"Time {ts_ms}".encode("utf-8"))
         )
-        attr.__getitem__ = MagicMock(return_value=values_mock)
+        attr = MagicMock()
+        attr.__getitem__ = MagicMock(
+            side_effect=lambda k: type_mock if k == "type" else values_mock
+        )
 
         bag = MagicMock()
         bag.__getitem__ = MagicMock(return_value=[attr])
 
         result = get_bag_timestamp(bag)
-        if result is not None:
-            assert result == int(ts_ms / 1000)
+        # Timestamps are preserved as epoch milliseconds (Logstash attribute format).
+        assert result == ts_ms

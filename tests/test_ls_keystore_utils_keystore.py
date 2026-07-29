@@ -291,7 +291,7 @@ class TestCreateKey:
             result = ks.create_key("mykey", "myvalue")
 
         assert result is True
-        mock_add.assert_called_once_with("mykey", "myvalue")
+        mock_add.assert_called_once_with("mykey", "myvalue", use_cli=False)
 
     def test_dict_calls_add_batch_keys(self, tmp_path):
         ks, *_ = _make_ks(tmp_path, {})
@@ -303,7 +303,7 @@ class TestCreateKey:
             result = ks.create_key({"key1": "val1", "key2": "val2"})
 
         assert result is True
-        mock_batch.assert_called_once_with({"key1": "val1", "key2": "val2"})
+        mock_batch.assert_called_once_with({"key1": "val1", "key2": "val2"}, use_cli=False)
 
     def test_raises_value_error_when_value_missing_for_single_key(self, tmp_path):
         ks, *_ = _make_ks(tmp_path, {})
@@ -319,7 +319,7 @@ class TestCreateKey:
             result = ks.add_key("k", "v")
 
         assert result is True
-        mock_ck.assert_called_once_with("k", "v")
+        mock_ck.assert_called_once_with("k", "v", use_cli=False)
 
 
 # ---------------------------------------------------------------------------
@@ -330,15 +330,14 @@ class TestDeleteKey:
     def test_single_key_deletion(self, tmp_path):
         ks, settings, fake_bin, salt_iv = _make_ks(tmp_path, {"k": "v"})
 
-        mock_result = MagicMock(returncode=0, stdout="", stderr="")
-
         with patch.object(ks, "_check_timestamp"), \
              patch.object(ks, "_post_operation_update"), \
              patch.object(ks, "_verify_removed_keys"), \
-             patch("subprocess.run", return_value=mock_result):
+             patch.object(ks, "_remove_batch_keys") as mock_rb:
             result = ks.delete_key("K")
 
         assert result is True
+        mock_rb.assert_called_once_with(["K"], use_cli=False)
 
     def test_list_key_deletion_calls_remove_batch(self, tmp_path):
         ks, *_ = _make_ks(tmp_path, {"k1": "v1", "k2": "v2"})
@@ -349,7 +348,7 @@ class TestDeleteKey:
              patch.object(ks, "_verify_removed_keys"):
             ks.delete_key(["K1", "K2"])
 
-        mock_rb.assert_called_once_with(["K1", "K2"])
+        mock_rb.assert_called_once_with(["K1", "K2"], use_cli=False)
 
     def test_remove_key_delegates_to_delete_key(self, tmp_path):
         ks, *_ = _make_ks(tmp_path, {})
@@ -358,7 +357,7 @@ class TestDeleteKey:
             result = ks.remove_key("K")
 
         assert result is True
-        mock_dk.assert_called_once_with("K")
+        mock_dk.assert_called_once_with("K", use_cli=False)
 
 
 # ---------------------------------------------------------------------------
@@ -373,7 +372,7 @@ class TestUpdateKey:
             result = ks.update_key("existing", "new")
 
         assert result is True
-        mock_ck.assert_called_once_with("existing", "new")
+        mock_ck.assert_called_once_with("existing", "new", use_cli=False)
 
 
 # ---------------------------------------------------------------------------
@@ -441,7 +440,24 @@ class TestClassMethods:
             with pytest.raises(LogstashKeystoreException, match="Invalid keystore"):
                 LogstashKeystore.load(settings, password="p", exepath=fake_bin)
 
-    def test_create_calls_create_keystore(self, tmp_path):
+    def test_create_uses_pure_python_by_default(self, tmp_path):
+        fake_bin = _make_fake_bin(tmp_path)
+        settings = _make_fake_settings(tmp_path)
+
+        with patch(
+            "logstashagent.ls_keystore_utils.keystore.create_keystore"
+        ) as mock_ck, patch(
+            "logstashagent.ls_keystore_utils.keystore.find_keystore_binary",
+            return_value=fake_bin,
+        ):
+            ks = LogstashKeystore.create(settings, password="p", exepath=fake_bin)
+
+        mock_ck.assert_not_called()
+        assert isinstance(ks, LogstashKeystore)
+        assert ks.keystore.exists()
+        assert ks.uses_embedded_password is False
+
+    def test_create_with_use_cli_calls_create_keystore(self, tmp_path):
         fake_bin = _make_fake_bin(tmp_path)
         settings = _make_fake_settings(tmp_path)
 
@@ -456,7 +472,17 @@ class TestClassMethods:
             "logstashagent.ls_keystore_utils.keystore.read_keystore",
             return_value={},
         ):
-            ks = LogstashKeystore.create(settings, password="p", exepath=fake_bin)
+            ks = LogstashKeystore.create(
+                settings, password="p", exepath=fake_bin, use_cli=True
+            )
 
         mock_ck.assert_called_once()
         assert isinstance(ks, LogstashKeystore)
+
+    def test_create_unauthenticated_without_password(self, tmp_path):
+        settings = _make_fake_settings(tmp_path)
+        ks = LogstashKeystore.create(settings, password=None, exepath=None)
+        assert ks.uses_embedded_password is True
+        assert ks.keystore.exists()
+        reloaded = LogstashKeystore.load(settings, password=None, exepath=None)
+        assert reloaded.uses_embedded_password is True
