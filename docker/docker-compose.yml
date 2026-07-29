@@ -11,7 +11,7 @@ services:
       dockerfile: docker/Dockerfile
     container_name: logstash-agent-standalone
     ports:
-      - "9650:9650"  # Logstash API (simulation node)
+      - "9560:9560"  # Logstash API (embedded simulation node)
       - "9449:9449"  # Logstash HTTP input (simulation)
       - "9500:9500"  # FastAPI sidecar API
     volumes:

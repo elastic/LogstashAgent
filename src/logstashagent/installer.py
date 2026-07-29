@@ -30,7 +30,13 @@ INSTALL_PATHS = {
     'log_dir': '/var/log/logstash-agent',
     'cache_dir': '/var/cache/logstash-agent',
     'systemd_service': '/etc/systemd/system/logstash-agent.service',
+    'simulate_root': '/opt/LogstashAgent',
+    'lsagent_simulate_unit': '/etc/systemd/system/lsagent-simulate@.service',
+    'ls_simulate_unit': '/etc/systemd/system/ls-simulate@.service',
 }
+
+# Packaged unit templates ship beside this module under systemd/
+_SYSTEMD_TEMPLATE_DIR = Path(__file__).resolve().parent / 'systemd'
 
 def _build_systemd_service() -> str:
     """
@@ -275,25 +281,60 @@ def create_symlink():
     logger.info(f"✓ Created symlink {symlink_path} -> {INSTALL_PATHS['binary']}")
 
 
-def write_config_file(logstash_ui_url: str):
-    """Write the initial agent config file"""
+def write_config_file(logstash_ui_url: str, policy_config: Optional[dict] = None):
+    """Write the initial agent config file (default or simulate)."""
     logger.info("Writing configuration file...")
+    policy_config = policy_config or {}
+    policy_type = (policy_config.get('policy_type') or 'DEFAULT').upper()
+    is_simulate = policy_type == 'SIMULATE'
 
     logstash_present = os.path.isdir('/usr/share/logstash') and os.path.isdir('/etc/logstash')
 
-    if logstash_present:
-        path_comment = ""
-    else:
-        path_comment = (
-            "\n# ⚠  Logstash was NOT detected at install time.\n"
-            "# Update the three paths below to match your Logstash installation\n"
-            "# before starting the logstash-agent service.\n"
+    if is_simulate:
+        instance_id = policy_config.get('instance_id', 1)
+        binary = policy_config.get('binary_path', '/usr/share/logstash/bin')
+        if binary and not str(binary).endswith('logstash') and not str(binary).endswith('logstash.bat'):
+            binary = str(Path(binary) / 'logstash')
+        settings = policy_config.get(
+            'settings_path', f"/opt/LogstashAgent/simulate-{instance_id}/settings"
         )
+        logs = policy_config.get(
+            'logs_path', f"/opt/LogstashAgent/simulate-{instance_id}/logs"
+        )
+        agent_port = policy_config.get('agent_api_port', 9500 + int(instance_id))
+        ls_port = policy_config.get('logstash_api_port', 9560 + int(instance_id))
+        config_content = f"""# LogstashAgent Configuration
+# Generated during installation (SIMULATE instance)
+mode: simulate
+instance_id: {instance_id}
 
-    config_content = f"""# LogstashAgent Configuration
+logstash_binary: {binary}
+logstash_settings: {settings}
+logstash_log_path: {logs}
+
+logstash_api_port: {ls_port}
+logstash_source: {policy_config.get('logstash_source') or 'SYSTEM'}
+logstash_version: "{policy_config.get('logstash_version') or ''}"
+logstash_download_dir: {policy_config.get('logstash_download_dir') or '/opt/LogstashAgent/logstash-versions'}
+
+# FastAPI sim API (simulate agents)
+host: 0.0.0.0
+port: {agent_port}
+
+logstash_ui_url: {logstash_ui_url}
+"""
+    else:
+        path_comment = ""
+        if not logstash_present:
+            path_comment = (
+                "\n# ⚠  Logstash was NOT detected at install time.\n"
+                "# Update the three paths below to match your Logstash installation\n"
+                "# before starting the logstash-agent service.\n"
+            )
+        config_content = f"""# LogstashAgent Configuration
 # Generated during installation
 {path_comment}
-mode: agent
+mode: default
 
 # Paths to this Logstash installation
 logstash_binary: /usr/share/logstash/bin/logstash
@@ -301,28 +342,209 @@ logstash_settings: /etc/logstash
 logstash_log_path: /var/log/logstash
 
 # Port that Logstash's monitoring API listens on (default: 9600 for native installs)
-# Simulation/Docker mode uses 9650 — do not change this for a native install
+# Embedded Docker uses 9560; simulate instances use 9560+N
 logstash_api_port: 9600
 
-# Agent API server (not used in controller/agent mode)
+# Agent API server (not used in default controller mode)
 host: 127.0.0.1
 port: 9600
 
 # LogstashUI connection
 logstash_ui_url: {logstash_ui_url}
 """
-    
+
     config_path = os.path.join(INSTALL_PATHS['config_dir'], 'logstash-agent.yml')
-    
+
     with open(config_path, 'w') as f:
         f.write(config_content)
-    
-    # Set ownership to logstash
-    uid, gid = get_logstash_uid_gid()
-    os.chown(config_path, uid, gid)
+
+    try:
+        uid, gid = get_logstash_uid_gid()
+        os.chown(config_path, uid, gid)
+    except Exception:
+        pass
     os.chmod(config_path, 0o640)
-    
+
     logger.info(f"✓ Created configuration file {config_path}")
+
+
+def _read_unit_template(name: str) -> str:
+    path = _SYSTEMD_TEMPLATE_DIR / name
+    if not path.is_file():
+        raise InstallError(f"Missing systemd unit template: {path}")
+    return path.read_text(encoding='utf-8')
+
+
+def install_simulate_unit_templates() -> None:
+    """Install lsagent-simulate@.service and ls-simulate@.service templates."""
+    logger.info("Installing simulate systemd unit templates...")
+    for template_name, dest_key in (
+        ('lsagent-simulate@.service', 'lsagent_simulate_unit'),
+        ('ls-simulate@.service', 'ls_simulate_unit'),
+    ):
+        content = _read_unit_template(template_name)
+        # Inject User=logstash when available
+        try:
+            pwd.getpwnam('logstash')
+            grp.getgrnam('logstash')
+            if '# User=logstash' in content:
+                content = content.replace('# User=logstash', 'User=logstash')
+            if '# Group=logstash' in content:
+                content = content.replace('# Group=logstash', 'Group=logstash')
+        except (KeyError, OSError, TypeError):
+            pass
+        dest = INSTALL_PATHS[dest_key]
+        with open(dest, 'w') as f:
+            f.write(content)
+        os.chmod(dest, 0o644)
+        logger.info(f"✓ Installed {dest}")
+
+    try:
+        subprocess.run(
+            ['systemctl', 'daemon-reload'],
+            check=True, capture_output=True, text=True,
+        )
+        logger.info("✓ Reloaded systemd daemon")
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        logger.warning(f"daemon-reload failed (non-fatal): {e}")
+
+
+def materialize_simulate_instance(policy_config: dict) -> dict:
+    """
+    Create /opt/LogstashAgent/simulate-N tree, env files, seed configs.
+
+    Returns dict with resolved binary path and paths used.
+    """
+    from logstashagent.logstash_download import resolve_binary_from_policy
+
+    instance_id = policy_config.get('instance_id')
+    if instance_id is None:
+        raise InstallError("SIMULATE policy_config missing instance_id")
+
+    instance_id = int(instance_id)
+    root = Path(INSTALL_PATHS['simulate_root']) / f"simulate-{instance_id}"
+    settings = Path(policy_config.get('settings_path') or root / 'settings')
+    config_dir = Path(policy_config.get('config_path') or root / 'config')
+    logs = Path(policy_config.get('logs_path') or root / 'logs')
+    data = Path(policy_config.get('data_path') or root / 'data')
+    env_file = Path(policy_config.get('keystore_env_file') or root / 'env')
+    agent_env = root / 'agent.env'
+    state_dir = root / 'state'
+
+    for d in (settings, config_dir, logs, data, state_dir, settings / 'conf.d'):
+        d.mkdir(parents=True, exist_ok=True)
+        logger.info(f"✓ Ensured directory {d}")
+
+    # Seed config files from policy when provided
+    for name, key in (
+        ('logstash.yml', 'logstash_yml'),
+        ('jvm.options', 'jvm_options'),
+        ('log4j2.properties', 'log4j2_properties'),
+    ):
+        content = policy_config.get(key)
+        if content:
+            target = settings / name
+            target.write_text(content if content.endswith('\n') else content + '\n', encoding='utf-8')
+            logger.info(f"✓ Wrote {target}")
+
+    binary = resolve_binary_from_policy(
+        logstash_source=policy_config.get('logstash_source') or 'SYSTEM',
+        logstash_version=policy_config.get('logstash_version') or '',
+        logstash_download_dir=policy_config.get('logstash_download_dir')
+        or f"{INSTALL_PATHS['simulate_root']}/logstash-versions",
+        binary_path=policy_config.get('binary_path') or '/usr/share/logstash/bin',
+    )
+
+    agent_port = policy_config.get('agent_api_port', 9500 + instance_id)
+    ls_port = policy_config.get('logstash_api_port', 9560 + instance_id)
+
+    # EnvironmentFile for ls-simulate@N
+    env_lines = [
+        f"LOGSTASH_BINARY={binary}",
+        f"LOGSTASH_PATH_SETTINGS={settings}",
+        f"LOGSTASH_PATH_CONFIG={config_dir}",
+        f"LOGSTASH_PATH_LOGS={logs}",
+        f"LOGSTASH_PATH_DATA={data}",
+        # LOGSTASH_KEYSTORE_PASS added later when keystore password is set
+    ]
+    # Preserve existing keystore pass if re-materializing
+    if env_file.exists():
+        for line in env_file.read_text(encoding='utf-8').splitlines():
+            if line.startswith('LOGSTASH_KEYSTORE_PASS='):
+                env_lines.append(line)
+    env_file.write_text('\n'.join(env_lines) + '\n', encoding='utf-8')
+    os.chmod(env_file, 0o640)
+    logger.info(f"✓ Wrote {env_file}")
+
+    agent_env_lines = [
+        f"INSTANCE_ID={instance_id}",
+        f"AGENT_API_PORT={agent_port}",
+        f"LOGSTASH_API_PORT={ls_port}",
+        f"LOGSTASH_SETTINGS={settings}",
+    ]
+    agent_env.write_text('\n'.join(agent_env_lines) + '\n', encoding='utf-8')
+    os.chmod(agent_env, 0o640)
+    logger.info(f"✓ Wrote {agent_env}")
+
+    # Ownership
+    try:
+        uid, gid = get_logstash_uid_gid()
+        for path in (root, settings, config_dir, logs, data, state_dir, env_file, agent_env):
+            if path.exists():
+                if path.is_dir():
+                    for walk_root, dirs, files in os.walk(path):
+                        os.chown(walk_root, uid, gid)
+                        for name in dirs + files:
+                            try:
+                                os.chown(os.path.join(walk_root, name), uid, gid)
+                            except OSError:
+                                pass
+                else:
+                    os.chown(path, uid, gid)
+        logger.info(f"✓ Set ownership on {root}")
+    except Exception as e:
+        logger.warning(f"Could not set ownership on simulate tree: {e}")
+
+    return {
+        'root': str(root),
+        'binary': binary,
+        'settings_path': str(settings),
+        'config_path': str(config_dir),
+        'logs_path': str(logs),
+        'data_path': str(data),
+        'env_file': str(env_file),
+        'agent_env': str(agent_env),
+        'instance_id': instance_id,
+        'agent_api_port': agent_port,
+        'logstash_api_port': ls_port,
+    }
+
+
+def enable_simulate_services(instance_id: int) -> None:
+    """Enable (and optionally leave stopped) simulate agent unit for instance N."""
+    agent_unit = f"lsagent-simulate@{instance_id}"
+    ls_unit = f"ls-simulate@{instance_id}"
+    try:
+        subprocess.run(
+            ['systemctl', 'enable', agent_unit],
+            check=False, capture_output=True, text=True,
+        )
+        # Do not auto-start Logstash until agent applies config / first restart
+        subprocess.run(
+            ['systemctl', 'enable', ls_unit],
+            check=False, capture_output=True, text=True,
+        )
+        logger.info(f"✓ Enabled {agent_unit} and {ls_unit}")
+    except FileNotFoundError:
+        logger.warning("systemctl not available — skip enable of simulate units")
+
+
+def setup_simulate_from_policy(policy_config: dict) -> dict:
+    """Full simulate post-enroll setup: templates, tree, enable units."""
+    install_simulate_unit_templates()
+    result = materialize_simulate_instance(policy_config)
+    enable_simulate_services(result['instance_id'])
+    return result
 
 
 def configure_logstash() -> None:
@@ -424,11 +646,23 @@ def configure_logstash() -> None:
     sudoers_content = f"""# LogstashAgent - Allow logstash user to manage Logstash service
 # This file is managed by logstash-agent installation
 {requiretty_line}
-# Allow Logstash service management
+# Allow Logstash service management (default / production)
 logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart logstash
 logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop logstash
 logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl start logstash
 logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl status logstash
+
+# Allow simulate Logstash / agent template units (ls-simulate@N, lsagent-simulate@N)
+logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart ls-simulate@*
+logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop ls-simulate@*
+logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl start ls-simulate@*
+logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl status ls-simulate@*
+logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart lsagent-simulate@*
+logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop lsagent-simulate@*
+logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl start lsagent-simulate@*
+logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl status lsagent-simulate@*
+logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl is-active ls-simulate@*
+logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl is-active lsagent-simulate@*
 
 # Allow LogstashAgent service management (needed for upgrades)
 logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop logstash-agent
@@ -602,36 +836,48 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
         logger.info("\nStep 4: Creating symlink...")
         create_symlink()
         
-        # Step 5: Write config file
-        logger.info("\nStep 5: Writing configuration...")
-        write_config_file(logstash_ui_url)
-        
-        # Step 6: Install systemd service
-        logger.info("\nStep 6: Installing systemd service...")
-        install_systemd_service()
-        
-        # Step 7: Perform enrollment
-        logger.info("\nStep 7: Enrolling with LogstashUI...")
-        enrollment_func(
+        # Step 5: Enroll first so we know default vs simulate policy
+        logger.info("\nStep 5: Enrolling with LogstashUI...")
+        enroll_result = enrollment_func(
             encoded_token=enroll_token,
             logstash_ui_url=logstash_ui_url,
             agent_id=agent_id
         )
         logger.info("✓ Enrollment completed successfully")
-        
+        policy_config = {}
+        if isinstance(enroll_result, dict):
+            policy_config = enroll_result.get('policy_config') or {}
+        policy_type = (policy_config.get('policy_type') or 'DEFAULT').upper()
+        is_simulate = policy_type == 'SIMULATE'
+
+        # Step 6: Write config file (mode-aware)
+        logger.info("\nStep 6: Writing configuration...")
+        write_config_file(logstash_ui_url, policy_config=policy_config)
+
+        # Step 7: Install systemd units
+        logger.info("\nStep 7: Installing systemd service(s)...")
+        if is_simulate:
+            setup_simulate_from_policy(policy_config)
+            # Shared agent binary is still installed; default unit is optional
+            # for coexistence with a production agent on the same host — do not
+            # enable logstash-agent.service for pure simulate installs.
+            logger.info("✓ Simulate units installed (lsagent-simulate@ / ls-simulate@)")
+        else:
+            install_systemd_service()
+
         # Step 8: Set ownership on state files and clean up log files
         logger.info("\nStep 8: Setting ownership on state files...")
         uid, gid = get_logstash_uid_gid()
-        
+
         # Find and chown all files in state directory
         for root, dirs, files in os.walk(INSTALL_PATHS['state_dir']):
             for d in dirs:
                 os.chown(os.path.join(root, d), uid, gid)
             for f in files:
                 os.chown(os.path.join(root, f), uid, gid)
-        
+
         logger.info(f"✓ Set ownership on {INSTALL_PATHS['state_dir']}")
-        
+
         # Clean up any root-owned log files that may have been created during install
         log_file = os.path.join(INSTALL_PATHS['log_dir'], 'logstashagent.log')
         if os.path.exists(log_file):
@@ -643,14 +889,18 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
                     logger.info(f"✓ Removed root-owned log file (will be recreated by service)")
             except Exception as e:
                 logger.warning(f"Could not clean up log file: {e}")
-        
+
         # Step 9: Configure Logstash permissions for agent management
-        if logstash_present:
+        if is_simulate:
+            # Still write sudoers (simulate units + optional package logstash)
+            logger.info("\nStep 9: Configuring permissions (simulate + sudoers)...")
+            configure_logstash()
+        elif logstash_present:
             logger.info("\nStep 9: Configuring Logstash permissions...")
             configure_logstash()
         else:
             logger.info("\nStep 9: Skipping Logstash configuration (Logstash not installed)")
-        
+
         # Step 10: Final ownership fix for state files
         # This ensures state.json has correct ownership even if it was updated
         # during module initialization (agent_id, agent_version)
@@ -661,40 +911,54 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
             for f in files:
                 os.chown(os.path.join(root, f), uid, gid)
         logger.info(f"✓ Verified ownership on {INSTALL_PATHS['state_dir']}")
-        
+
         # Installation complete
         logger.info("\n" + "="*60)
         logger.info("INSTALLATION COMPLETED SUCCESSFULLY!")
         logger.info("="*60)
 
-        if not logstash_present:
-            logger.warning("\n" + "!"*60)
-            logger.warning("  ACTION REQUIRED: Logstash was NOT installed at install time.")
-            logger.warning("")
-            logger.warning("  You MUST run the following after you install Logstash to")
-            logger.warning("  complete the setup, otherwise you may see issues:")
-            logger.warning("")
-            logger.warning("    sudo logstash-agent configure")
-            logger.warning("")
-            logger.warning("  This applies required permissions and service account")
-            logger.warning("  configuration that could not be set up without Logstash.")
-            logger.warning("!" * 60)
+        if is_simulate:
+            instance_id = policy_config.get('instance_id')
+            logger.info("\nSimulate agent installed.")
+            logger.info("\nNext steps:")
+            logger.info(f"  1. Start the simulate agent:")
+            logger.info(f"     sudo systemctl start lsagent-simulate@{instance_id}")
+            logger.info(f"\n  2. Check status:")
+            logger.info(f"     sudo systemctl status lsagent-simulate@{instance_id}")
+            logger.info(f"\n  3. View logs:")
+            logger.info(f"     sudo journalctl -u lsagent-simulate@{instance_id} -f")
+            logger.info(f"\n  Logstash instance unit: ls-simulate@{instance_id}")
+            logger.info(f"  Paths under: /opt/LogstashAgent/simulate-{instance_id}/")
+            logger.info("="*60)
+        else:
+            if not logstash_present:
+                logger.warning("\n" + "!"*60)
+                logger.warning("  ACTION REQUIRED: Logstash was NOT installed at install time.")
+                logger.warning("")
+                logger.warning("  You MUST run the following after you install Logstash to")
+                logger.warning("  complete the setup, otherwise you may see issues:")
+                logger.warning("")
+                logger.warning("    sudo logstash-agent configure")
+                logger.warning("")
+                logger.warning("  This applies required permissions and service account")
+                logger.warning("  configuration that could not be set up without Logstash.")
+                logger.warning("!" * 60)
 
-        logger.info("\nNext steps:")
-        if not logstash_present:
-            logger.info("  0. Install Logstash, update /etc/logstash-agent/logstash-agent.yml")
-            logger.info("     with the correct paths, then run:")
-            logger.info("       sudo logstash-agent configure")
-            logger.info("")
-        logger.info("  1. Enable the service:")
-        logger.info("     sudo systemctl enable logstash-agent")
-        logger.info("\n  2. Start the service:")
-        logger.info("     sudo systemctl start logstash-agent")
-        logger.info("\n  3. Check status:")
-        logger.info("     sudo systemctl status logstash-agent")
-        logger.info("\n  4. View logs:")
-        logger.info("     sudo journalctl -u logstash-agent -f")
-        logger.info("="*60)
+            logger.info("\nNext steps:")
+            if not logstash_present:
+                logger.info("  0. Install Logstash, update /etc/logstash-agent/logstash-agent.yml")
+                logger.info("     with the correct paths, then run:")
+                logger.info("       sudo logstash-agent configure")
+                logger.info("")
+            logger.info("  1. Enable the service:")
+            logger.info("     sudo systemctl enable logstash-agent")
+            logger.info("\n  2. Start the service:")
+            logger.info("     sudo systemctl start logstash-agent")
+            logger.info("\n  3. Check status:")
+            logger.info("     sudo systemctl status logstash-agent")
+            logger.info("\n  4. View logs:")
+            logger.info("     sudo journalctl -u logstash-agent -f")
+            logger.info("="*60)
         
     except InstallError as e:
         logger.error(f"\nInstallation failed: {e}")

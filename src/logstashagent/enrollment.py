@@ -2,6 +2,7 @@
 #or more contributor license agreements. Licensed under the Elastic License;
 #you may not use this file except in compliance with the Elastic License.
 
+import os
 import requests
 import json
 import base64
@@ -233,13 +234,35 @@ def perform_enrollment(encoded_token: str, logstash_ui_url: str, agent_id: str):
         result = enroll_agent(encoded_token, ui_url, agent_id)
         
         # Save enrollment configuration
+        policy_config = result.get('policy_config', {}) or {}
         save_enrollment_config(
             api_key=result['api_key'],
             logstash_ui_url=ui_url,
             policy_id=result['policy_id'],
             connection_id=result['connection_id'],
-            policy_config=result.get('policy_config', {})
+            policy_config=policy_config
         )
+
+        # When enrolling a SIMULATE policy as root (standalone --enroll or install),
+        # materialize instance tree / units. Install path also calls this; it is
+        # idempotent.
+        if (policy_config.get('policy_type') or '').upper() == 'SIMULATE':
+            try:
+                if os.geteuid() == 0:
+                    from logstashagent import installer as _installer
+                    logger.info("Materializing simulate instance directories and units...")
+                    _installer.setup_simulate_from_policy(policy_config)
+                else:
+                    logger.warning(
+                        "SIMULATE enrollment saved, but not running as root — "
+                        "skipping /opt/LogstashAgent/simulate-N materialization. "
+                        "Re-run setup as root or use: sudo logstash-agent install ..."
+                    )
+            except Exception as setup_err:
+                logger.warning(
+                    "Simulate materialization failed (enrollment still valid): %s",
+                    setup_err,
+                )
         
         logger.info("=" * 60)
         logger.info("ENROLLMENT SUCCESSFUL!")
@@ -248,9 +271,15 @@ def perform_enrollment(encoded_token: str, logstash_ui_url: str, agent_id: str):
         logger.info(f"Connection ID: {result['connection_id']}")
         logger.info(f"Policy ID: {result['policy_id']}")
         logger.info(f"API Key: {result['api_key'][:10]}...")
-        logger.info("=" * 60)
-        logger.info("Configuration saved to state.json")
-        logger.info("You can now start the agent using the --run flag")
+        if (policy_config.get('policy_type') or '').upper() == 'SIMULATE':
+            logger.info(f"Mode: simulate instance_id={policy_config.get('instance_id')}")
+            logger.info(
+                f"Start with: sudo systemctl start "
+                f"lsagent-simulate@{policy_config.get('instance_id')}"
+            )
+        else:
+            logger.info("Configuration saved to state.json")
+            logger.info("You can now start the agent using the --run flag")
         logger.info("=" * 60)
         
         return result

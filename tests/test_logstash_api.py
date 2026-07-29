@@ -57,7 +57,7 @@ class TestLogstashAPIInitialization:
         ) as ctor:
             api = LogstashAPI(use_shared_client=False, timeout=5.0)
 
-        assert api.base_url == "http://localhost:9650"
+        assert api.base_url == "http://localhost:9560"
         assert api.timeout == 5.0
         assert api._owns_client is True
         ctor.assert_called_once_with(timeout=5.0)
@@ -102,17 +102,17 @@ class TestGetNodeAndHealth:
     def test_get_node_info(self, api, mock_http):
         mock_http.get.return_value = _ok_json({"version": "8.x"})
         assert api.get_node_info() == {"version": "8.x"}
-        mock_http.get.assert_called_with("http://localhost:9650/")
+        mock_http.get.assert_called_with("http://localhost:9560/")
 
     def test_get_health_report(self, api, mock_http):
         mock_http.get.return_value = _ok_json({"status": "green"})
         assert api.get_health_report() == {"status": "green"}
-        mock_http.get.assert_called_with("http://localhost:9650/_node/health_report")
+        mock_http.get.assert_called_with("http://localhost:9560/_node/health_report")
 
     def test_get_node_stats(self, api, mock_http):
         mock_http.get.return_value = _ok_json({"jvm": {}})
         assert api.get_node_stats() == {"jvm": {}}
-        mock_http.get.assert_called_with("http://localhost:9650/_node/stats")
+        mock_http.get.assert_called_with("http://localhost:9560/_node/stats")
 
 
 class TestGetRunningPipelinesFromHealth:
@@ -147,7 +147,7 @@ class TestGetPipelineStats:
 
         assert api.get_all_pipeline_stats() == body
         mock_http.get.assert_called_once_with(
-            "http://localhost:9650/_node/stats/pipelines"
+            "http://localhost:9560/_node/stats/pipelines"
         )
 
     def test_get_all_pipeline_stats_http_error(self, api, mock_http):
@@ -169,7 +169,7 @@ class TestGetPipelineStats:
 
         assert api.get_pipeline_stats("test-pipeline") == body
         mock_http.get.assert_called_once_with(
-            "http://localhost:9650/_node/stats/pipelines/test-pipeline"
+            "http://localhost:9560/_node/stats/pipelines/test-pipeline"
         )
 
     def test_get_pipeline_stats_not_found_status(self, api, mock_http):

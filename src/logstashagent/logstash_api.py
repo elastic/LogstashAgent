@@ -21,7 +21,9 @@ logger = logging.getLogger(__name__)
 
 # Logstash API configuration
 LOGSTASH_API_HOST = "localhost"
-LOGSTASH_API_PORT = 9650
+# Default for embedded / simulate-style agents (package Logstash often uses 9600;
+# agent state / config overrides via LogstashAPI(base_url=...) or api_port in state).
+LOGSTASH_API_PORT = 9560
 LOGSTASH_API_BASE_URL = f"http://{LOGSTASH_API_HOST}:{LOGSTASH_API_PORT}"
 
 # Shared HTTP client for connection pooling
@@ -89,7 +91,7 @@ class LogstashAPI:
         Initialize the Logstash API client.
         
         Args:
-            base_url: Base URL for the Logstash API (default: http://localhost:9650)
+            base_url: Base URL for the Logstash API (default: http://localhost:9560)
             timeout: Request timeout in seconds (default: 5.0)
             use_shared_client: Use shared connection pool (default: True, recommended for production)
         """
