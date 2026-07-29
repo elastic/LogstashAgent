@@ -25,7 +25,10 @@ def get_hostname():
 
 def decode_enrollment_token(encoded_token: str) -> dict:
     """
-    Decode the base64-encoded enrollment token
+    Decode the base64-encoded enrollment token.
+
+    Payload (v2) may include optional ``fingerprint`` (SHA-256 of product CA DER,
+    lowercase hex) and ``token_version``. Does not include ui_url (use CLI).
     
     Args:
         encoded_token: Base64-encoded JSON token
@@ -66,8 +69,21 @@ def enroll_agent(encoded_token: str, logstash_ui_url: str, agent_id: str) -> dic
     # Validate the enrollment token by decoding it
     token_payload = decode_enrollment_token(encoded_token)
     
-    # Use provided URL
-    ui_url = logstash_ui_url
+    # Use provided URL (not taken from token — CLI / generated command)
+    ui_url = logstash_ui_url.rstrip('/')
+    
+    # Pin product CA when token includes fingerprint (Approach A)
+    try:
+        from logstashagent.tls_trust import ensure_trust_from_token_payload, ssl_verify_argument
+
+        ensure_trust_from_token_payload(ui_url, token_payload)
+        verify = ssl_verify_argument()
+    except Exception as e:
+        logger.error(f"TLS trust setup from enrollment token failed: {e}")
+        raise Exception(
+            f"Failed to establish trust with LogstashUI CA: {e}. "
+            f"Check fingerprint and that {ui_url}/.well-known/logstashui/ca.crt is reachable."
+        ) from e
     
     # Get hostname
     hostname = get_hostname()
@@ -85,12 +101,12 @@ def enroll_agent(encoded_token: str, logstash_ui_url: str, agent_id: str) -> dic
     }
     
     try:
-        # Send enrollment request
+        # Send enrollment request (verify system CAs ± product CA)
         response = requests.post(
             enrollment_url,
             json=enrollment_data,
             timeout=30,
-            verify=False  # Allow self-signed certificates
+            verify=verify,
         )
         
         # Log response details for debugging

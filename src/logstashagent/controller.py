@@ -1603,12 +1603,14 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
         
         logger.debug(f"Checking config changes with {config_changes_url}")
         
+        from logstashagent.tls_trust import ssl_verify_argument
+
         response = requests.post(
             config_changes_url,
             json=request_data,
             headers=headers,
             timeout=30,
-            verify=False
+            verify=ssl_verify_argument(),
         )
         
         if response.status_code >= 400:
@@ -2415,12 +2417,14 @@ def check_in():
         
         logger.debug(f"Sending check-in to {check_in_url}")
         
+        from logstashagent.tls_trust import ssl_verify_argument
+
         response = requests.post(
             check_in_url,
             json=check_in_data,
             headers=headers,
             timeout=30,
-            verify=False  # Allow self-signed certificates
+            verify=ssl_verify_argument(),
         )
         
         # Check for error status codes

@@ -76,11 +76,14 @@ class TestEnrollAgent:
         }
         response.json.return_value = result_body
 
-        with patch.object(enrollment, "get_hostname", return_value="host-1"):
-            with patch.object(enrollment.requests, "post", return_value=response) as post:
-                out = enrollment.enroll_agent(
-                    encoded, "https://ui.example.com", "agent-uuid"
-                )
+        with patch.object(enrollment, "get_hostname", return_value="host-1"), patch(
+            "logstashagent.tls_trust.ensure_trust_from_token_payload", return_value=None
+        ), patch(
+            "logstashagent.tls_trust.ssl_verify_argument", return_value=True
+        ), patch.object(enrollment.requests, "post", return_value=response) as post:
+            out = enrollment.enroll_agent(
+                encoded, "https://ui.example.com", "agent-uuid"
+            )
 
         assert out == result_body
         post.assert_called_once()
@@ -92,7 +95,7 @@ class TestEnrollAgent:
             "agent_id": "agent-uuid",
         }
         assert kwargs["timeout"] == 30
-        assert kwargs["verify"] is False
+        assert kwargs["verify"] is True
 
     def test_success_false_raises(self):
         encoded = _encoded_token({"enrollment_token": "x"})
@@ -101,10 +104,13 @@ class TestEnrollAgent:
         response.raise_for_status = MagicMock()
         response.json.return_value = {"success": False, "error": "nope"}
 
-        with patch.object(enrollment, "get_hostname", return_value="h"):
-            with patch.object(enrollment.requests, "post", return_value=response):
-                with pytest.raises(Exception, match="Enrollment failed: nope"):
-                    enrollment.enroll_agent(encoded, "http://localhost", "aid")
+        with patch.object(enrollment, "get_hostname", return_value="h"), patch(
+            "logstashagent.tls_trust.ensure_trust_from_token_payload", return_value=None
+        ), patch(
+            "logstashagent.tls_trust.ssl_verify_argument", return_value=True
+        ), patch.object(enrollment.requests, "post", return_value=response):
+            with pytest.raises(Exception, match="Enrollment failed: nope"):
+                enrollment.enroll_agent(encoded, "http://localhost", "aid")
 
     def test_non_json_response_raises(self):
         encoded = _encoded_token({"enrollment_token": "x"})
@@ -114,21 +120,27 @@ class TestEnrollAgent:
         response.text = "<html>not json</html>"
         response.json.side_effect = json.JSONDecodeError("msg", "doc", 0)
 
-        with patch.object(enrollment, "get_hostname", return_value="h"):
-            with patch.object(enrollment.requests, "post", return_value=response):
-                with pytest.raises(Exception, match="Server returned non-JSON response"):
-                    enrollment.enroll_agent(encoded, "http://localhost:8000", "aid")
+        with patch.object(enrollment, "get_hostname", return_value="h"), patch(
+            "logstashagent.tls_trust.ensure_trust_from_token_payload", return_value=None
+        ), patch(
+            "logstashagent.tls_trust.ssl_verify_argument", return_value=True
+        ), patch.object(enrollment.requests, "post", return_value=response):
+            with pytest.raises(Exception, match="Server returned non-JSON response"):
+                enrollment.enroll_agent(encoded, "http://localhost:8000", "aid")
 
     def test_request_exception_wrapped(self):
         encoded = _encoded_token({"enrollment_token": "x"})
-        with patch.object(enrollment, "get_hostname", return_value="h"):
-            with patch.object(
-                enrollment.requests,
-                "post",
-                side_effect=requests.exceptions.ConnectionError("refused"),
-            ):
-                with pytest.raises(Exception, match="Failed to connect to logstashui"):
-                    enrollment.enroll_agent(encoded, "http://down", "aid")
+        with patch.object(enrollment, "get_hostname", return_value="h"), patch(
+            "logstashagent.tls_trust.ensure_trust_from_token_payload", return_value=None
+        ), patch(
+            "logstashagent.tls_trust.ssl_verify_argument", return_value=True
+        ), patch.object(
+            enrollment.requests,
+            "post",
+            side_effect=requests.exceptions.ConnectionError("refused"),
+        ):
+            with pytest.raises(Exception, match="Failed to connect to logstashui"):
+                enrollment.enroll_agent(encoded, "http://down", "aid")
 
 
 class TestComputeHash:
