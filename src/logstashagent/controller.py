@@ -835,8 +835,9 @@ def _merge_pipelines_into(plan_pipelines, incoming):
 def _apply_merged_plan(settings_path, plan, policy_res, snmp_res):
     """
     Apply a merged policy + SNMP change plan in a SINGLE pass:
-    one `logstash-keystore` batch, one pipelines.yml rewrite, and at most one
-    Logstash restart — instead of each channel applying and restarting on its own.
+    one keystore write batch (pure-Python PKCS#12 by default), one pipelines.yml
+    rewrite, and at most one Logstash restart — instead of each channel applying
+    and restarting on its own.
 
     Config files and the keystore-password rebuild are applied earlier, inline in
     `get_config_changes` (they are policy-only and order-sensitive). This function
@@ -866,7 +867,7 @@ def _apply_merged_plan(settings_path, plan, policy_res, snmp_res):
     pl_ok = True
 
     # Keystore first — pipelines may reference these keys. Single batched
-    # `logstash-keystore add` covers both policy and SNMP keys.
+    # keystore write covers both policy and SNMP keys (pure-Python by default).
     if ks_has:
         logger.info(f"Merged keystore apply: {len(ks['set'])} set, {len(ks['delete'])} delete")
         ks_ok = update_keystore(settings_path, ks)
@@ -1289,7 +1290,7 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
                     elif plan is not None:
                         # Merge mode: defer the actual keystore write so it can be
                         # batched with SNMP (and any other source) into ONE
-                        # `logstash-keystore add` and ONE restart in the caller.
+                        # keystore apply and ONE restart in the caller.
                         logger.info("Keystore changes detected (deferred to merged apply)")
                         _merge_keystore_into(plan['keystore'], keystore_changes)
                         files_updated = True
