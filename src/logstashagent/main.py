@@ -266,6 +266,130 @@ def log_resolved_agent_mode(mode: str, *, legacy: str | None = None, source: str
         logger.info(f"mode={mode} [{source}]")
 
 
+def is_systemctl_managed_simulate() -> bool:
+    """
+    True when this process is an enrolled/numbered simulate agent whose Logstash
+    is managed by systemd (``ls-simulate@N``), not by LogstashSupervisor.
+
+    Distinguishes from legacy UI "host mode" which maps to mode=simulate via
+    normalize_agent_mode but has no instance_id / ls-simulate unit and still
+    uses supervisor Popen.
+    """
+    state = agent_state.get_state() or {}
+    unit = (state.get('logstash_unit') or '') or ''
+    if str(unit).startswith('ls-simulate@'):
+        return True
+
+    mode = (state.get('mode') or (AGENT_CONFIG or {}).get('mode') or '').lower()
+    instance_id = state.get('instance_id')
+    if instance_id is None:
+        instance_id = (AGENT_CONFIG or {}).get('instance_id')
+
+    if mode == 'simulate' and instance_id is not None:
+        return True
+
+    policy_type = (state.get('policy_type') or '').upper()
+    if state.get('enrolled') and policy_type == 'SIMULATE' and instance_id is not None:
+        return True
+
+    return False
+
+
+def sim_logstash_api_port() -> int:
+    """HTTP API port for the Logstash instance this agent manages."""
+    state = agent_state.get_state() or {}
+    for key in ('logstash_api_port', 'api_port'):
+        if state.get(key) is not None:
+            try:
+                return int(state[key])
+            except (TypeError, ValueError):
+                pass
+    instance_id = state.get('instance_id')
+    if instance_id is None:
+        instance_id = (AGENT_CONFIG or {}).get('instance_id')
+    if instance_id is not None:
+        try:
+            return 9560 + int(instance_id)
+        except (TypeError, ValueError):
+            pass
+    return int((AGENT_CONFIG or {}).get('logstash_api_port') or 9560)
+
+
+# Restart counter for systemctl-managed simulate (supervisor has its own)
+_sim_systemctl_restart_count = 0
+
+
+def check_sim_logstash_health() -> dict:
+    """
+    Health for simulation endpoints.
+
+    - Systemctl-managed simulate: probe Logstash HTTP API (and fall back to :9449).
+    - Embedded / legacy host supervisor: use supervisor process flags.
+    """
+    if is_systemctl_managed_simulate():
+        port = sim_logstash_api_port()
+        healthy = False
+        try:
+            resp = requests.get(f'http://127.0.0.1:{port}/', timeout=2)
+            healthy = resp.status_code < 500
+        except Exception:
+            try:
+                # Input plugin may answer even if node API is slow
+                requests.get('http://127.0.0.1:9449', timeout=1)
+                healthy = True
+            except Exception:
+                healthy = False
+        return {
+            'healthy': healthy,
+            'restarting': False,
+            'restart_count': _sim_systemctl_restart_count,
+            'via': 'systemctl',
+            'logstash_api_port': port,
+        }
+
+    supervisor = logstash_supervisor.get_supervisor()
+    if supervisor:
+        return {
+            'healthy': bool(supervisor.is_healthy),
+            'restarting': bool(supervisor.is_restarting),
+            'restart_count': supervisor.restart_count,
+            'via': 'supervisor',
+        }
+    return {
+        'healthy': False,
+        'restarting': False,
+        'restart_count': 0,
+        'via': 'none',
+    }
+
+
+def trigger_sim_logstash_restart(reason: str = 'Manual restart') -> bool:
+    """
+    Restart Logstash for sim failure recovery.
+
+    Systemctl-managed simulate uses ``controller.restart_logstash`` (ls-simulate@N).
+    Embedded / legacy host uses the in-process supervisor.
+    """
+    global _sim_systemctl_restart_count
+    if is_systemctl_managed_simulate():
+        logger.warning(
+            "Triggering systemctl restart of simulate Logstash: %s", reason
+        )
+        ok = bool(controller.restart_logstash())
+        if ok:
+            _sim_systemctl_restart_count += 1
+        return ok
+    logstash_supervisor.trigger_restart(reason)
+    return True
+
+
+def _atexit_shutdown_supervisor():
+    """Do not stop systemctl-managed Logstash on agent exit."""
+    if is_systemctl_managed_simulate():
+        return
+    logstash_supervisor.shutdown_supervisor()
+
+
 # Global config
 AGENT_CONFIG = normalize_agent_mode(load_agent_config())
 if AGENT_CONFIG.get('_mode_legacy'):
@@ -286,21 +410,32 @@ _queue_processor_task: Optional[asyncio.Task] = None
 
 @app.on_event("startup")
 async def startup_event():
-    """Start Logstash under supervision when FastAPI starts"""
+    """Start Logstash under supervision when FastAPI starts (embedded / legacy host).
+
+    Enrolled simulate agents leave Logstash to systemd (``ls-simulate@N``).
+    """
     global _queue_processor_task
-    logger.info("FastAPI startup - initializing Logstash supervisor")
-    logstash_supervisor.start_supervised_logstash(config=AGENT_CONFIG)
-    # Wait for Logstash to initialize
-    await asyncio.sleep(5)
-    logger.info("Logstash supervision started")
-    
+    if is_systemctl_managed_simulate():
+        port = sim_logstash_api_port()
+        logger.info(
+            "FastAPI startup - enrolled simulate; Logstash managed by systemctl "
+            "(ls-simulate@); skip supervisor (API port %s)",
+            port,
+        )
+    else:
+        logger.info("FastAPI startup - initializing Logstash supervisor")
+        logstash_supervisor.start_supervised_logstash(config=AGENT_CONFIG)
+        # Wait for Logstash to initialize
+        await asyncio.sleep(5)
+        logger.info("Logstash supervision started")
+
     # Start queue processor
     _queue_processor_task = asyncio.create_task(_process_simulation_queue())
     logger.info("Simulation queue processor started")
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Shutdown Logstash supervisor when FastAPI stops"""
+    """Stop queue processor; stop supervisor only when we own the Logstash process."""
     global _queue_processor_task
     logger.info("FastAPI shutdown - stopping queue processor")
     if _queue_processor_task:
@@ -309,11 +444,16 @@ async def shutdown_event():
             await _queue_processor_task
         except asyncio.CancelledError:
             pass
-    logger.info("FastAPI shutdown - stopping Logstash supervisor")
-    logstash_supervisor.shutdown_supervisor()
+    if is_systemctl_managed_simulate():
+        logger.info(
+            "FastAPI shutdown - enrolled simulate; leaving systemctl Logstash running"
+        )
+    else:
+        logger.info("FastAPI shutdown - stopping Logstash supervisor")
+        logstash_supervisor.shutdown_supervisor()
 
-# Also register atexit handler for clean shutdown
-atexit.register(logstash_supervisor.shutdown_supervisor)
+# Also register atexit handler for clean shutdown (supervisor-owned Logstash only)
+atexit.register(_atexit_shutdown_supervisor)
 
 # Configuration paths - dynamically set based on mode
 def get_logstash_paths():
@@ -632,16 +772,20 @@ async def _process_simulation_queue():
     while True:
         try:
             await asyncio.sleep(2)  # Check every 2 seconds
-            
-            supervisor = logstash_supervisor.get_supervisor()
-            if not supervisor or not supervisor.is_healthy:
+
+            health = check_sim_logstash_health()
+            if not health.get('healthy'):
                 last_healthy_time = None
                 continue
-            
+
             # Track when Logstash became healthy
             if last_healthy_time is None:
                 last_healthy_time = time.time()
-                logger.info("Logstash became healthy, waiting 10s for full initialization before processing queue")
+                logger.info(
+                    "Logstash became healthy (via=%s), waiting 10s for full "
+                    "initialization before processing queue",
+                    health.get('via'),
+                )
                 continue
             
             # Wait at least 10 seconds after Logstash becomes healthy before processing
@@ -735,25 +879,27 @@ async def _process_simulation_queue():
 async def logstash_health():
     """
     Check if Logstash is healthy and ready to accept simulation requests.
-    Returns health status from supervisor.
+
+    Enrolled simulate: Logstash HTTP API (systemctl-managed).
+    Embedded / legacy host: in-process supervisor flags.
     """
-    supervisor = logstash_supervisor.get_supervisor()
+    health = check_sim_logstash_health()
     with _queue_lock:
         queue_size = len(_simulation_queue)
 
-    if supervisor:
-        return JSONResponse(
-            status_code=200 if supervisor.is_healthy else 503,
-            content={
-                "healthy": supervisor.is_healthy,
-                "restarting": supervisor.is_restarting,
-                "restart_count": supervisor.restart_count,
-                "queued_requests": queue_size
-            }
-        )
+    content = {
+        "healthy": health.get("healthy", False),
+        "restarting": health.get("restarting", False),
+        "restart_count": health.get("restart_count", 0),
+        "queued_requests": queue_size,
+        "via": health.get("via", "none"),
+    }
+    if health.get("logstash_api_port") is not None:
+        content["logstash_api_port"] = health["logstash_api_port"]
+
     return JSONResponse(
-        status_code=503,
-        content={"healthy": False, "restarting": False, "restart_count": 0, "queued_requests": queue_size}
+        status_code=200 if content["healthy"] else 503,
+        content=content,
     )
 
 
@@ -769,11 +915,10 @@ async def simulate_log(request: Request):
         # Get the JSON body from the request
         log_data = await request.json()
         slot_id = log_data.get('slot')
-        
-        # Check if Logstash is healthy
-        supervisor = logstash_supervisor.get_supervisor()
-        is_healthy = supervisor and supervisor.is_healthy
-        
+
+        # Check if Logstash is healthy (supervisor or systemctl-managed simulate)
+        is_healthy = bool(check_sim_logstash_health().get('healthy'))
+
         if not is_healthy:
             # Queue the request with slot configuration for restoration
             slot_config = None
@@ -858,9 +1003,11 @@ async def simulate_log(request: Request):
                         })
                         queue_size = len(_simulation_queue)
                     
-                    # Trigger restart
-                    logstash_supervisor.trigger_restart("Simulation POST failed - Logstash stunned/OOM")
-                    
+                    # Trigger restart (systemctl for enrolled simulate, else supervisor)
+                    trigger_sim_logstash_restart(
+                        "Simulation POST failed - Logstash stunned/OOM"
+                    )
+
                     logger.warning(f"Queued failed simulation for retry after restart (queue size: {queue_size})")
                     return JSONResponse(
                         status_code=202,
@@ -870,7 +1017,7 @@ async def simulate_log(request: Request):
                             "queue_position": queue_size
                         }
                     )
-                    
+
             except requests.exceptions.RequestException as e:
                 if attempt < max_retries - 1:
                     logger.warning(f"Simulation request failed on attempt {attempt + 1}, retrying: {e}")
@@ -879,7 +1026,7 @@ async def simulate_log(request: Request):
                 else:
                     # All retries failed - Logstash is likely stunned/OOM
                     logger.error(f"Simulation failed after {max_retries} attempts: {e} - triggering restart")
-                    
+
                     # Queue the request for retry after restart
                     slot_config = None
                     if slot_id:
@@ -891,7 +1038,7 @@ async def simulate_log(request: Request):
                                 'pipeline_name': slot_data.get('pipeline_name'),
                                 'pipelines': slot_data.get('pipelines')
                             }
-                    
+
                     with _queue_lock:
                         _simulation_queue.append({
                             'log_data': log_data,
@@ -899,10 +1046,11 @@ async def simulate_log(request: Request):
                             'queued_at': time.time()
                         })
                         queue_size = len(_simulation_queue)
-                    
-                    # Trigger restart
-                    logstash_supervisor.trigger_restart(f"Simulation POST failed: {str(e)}")
-                    
+
+                    trigger_sim_logstash_restart(
+                        f"Simulation POST failed: {str(e)}"
+                    )
+
                     logger.warning(f"Queued failed simulation for retry after restart (queue size: {queue_size})")
                     return JSONResponse(
                         status_code=202,

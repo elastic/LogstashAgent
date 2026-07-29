@@ -34,6 +34,7 @@
 ### Fixed
 
 - Corrected controller comments that incorrectly described merged keystore apply as a single `logstash-keystore add` invocation.
+- Enrolled simulate FastAPI no longer starts Logstash via the in-process supervisor (avoids double JVM / wrong paths); health, sim queue, and recovery restarts use the Logstash HTTP API and `systemctl restart ls-simulate@N`. Legacy UI host/embedded supervisor paths are unchanged.
 
 ### Upgrade notes
 
