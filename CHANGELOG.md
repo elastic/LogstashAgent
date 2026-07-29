@@ -17,6 +17,7 @@
 - Added `ensure_keystore` and `clear_keystore_password` helpers so future LogstashUI flows can switch keystore password modes without another library redesign (`clear_keystore_password` is not yet wired to check-in).
 - Added env-file handling so `LOGSTASH_KEYSTORE_PASS` can be set or cleared in `/etc/default/logstash` (and per-instance env for simulate).
 - Added unit coverage for pure-Python keystore write, unauthenticated keystores, env resolution, controller password migrate paths, simulate install, and keystore sync compare-and-skip.
+- Added controller apply for `logstash_runtime` (SYSTEM vs VERSION): downloads pinned Logstash releases on policy change without re-enroll, updates simulate `LOGSTASH_BINARY` env, and restarts when the binary path changes.
 
 ### Changed
 

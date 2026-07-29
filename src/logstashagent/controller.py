@@ -389,6 +389,133 @@ def clear_keystore_password(settings_path: str) -> dict:
 _log_watcher: Optional[log_analyzer.LogstashLogWatcher] = None
 
 
+def update_env_logstash_binary(env_file: Optional[str], binary: str) -> bool:
+    """
+    Set or replace LOGSTASH_BINARY= in a simulate instance env file
+    (e.g. /opt/LogstashAgent/simulate-N/env) without using sudo when the
+    agent owns the tree.
+    """
+    if not env_file or not binary:
+        return False
+    path = Path(env_file)
+    try:
+        lines = []
+        if path.exists():
+            lines = path.read_text(encoding='utf-8').splitlines()
+        filtered = [ln for ln in lines if not ln.startswith('LOGSTASH_BINARY=')]
+        filtered.append(f'LOGSTASH_BINARY={binary}')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('\n'.join(filtered) + '\n', encoding='utf-8')
+        try:
+            os.chmod(path, 0o640)
+        except OSError:
+            pass
+        logger.info(f"Updated LOGSTASH_BINARY in {path} -> {binary}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to update LOGSTASH_BINARY in {env_file}: {e}")
+        return False
+
+
+def apply_logstash_runtime(runtime: dict) -> dict:
+    """
+    Apply policy Logstash binary source (SYSTEM vs VERSION download).
+
+    Downloads VERSION artifacts when needed, updates agent state and the
+    simulate instance EnvironmentFile LOGSTASH_BINARY line.
+
+    Returns:
+        dict: success (bool), requires_restart (bool), binary (str|None),
+              error (str|None), source, version
+    """
+    from .logstash_download import (
+        resolve_binary_from_policy,
+        LogstashDownloadError,
+        DEFAULT_DOWNLOAD_ROOT,
+    )
+
+    if not runtime or runtime is False:
+        return {
+            'success': True,
+            'requires_restart': False,
+            'binary': None,
+            'error': None,
+            'source': None,
+            'version': None,
+        }
+
+    source = (runtime.get('source') or 'SYSTEM').upper()
+    version = (runtime.get('version') or '').strip()
+    download_dir = (runtime.get('download_dir') or DEFAULT_DOWNLOAD_ROOT).strip()
+    binary_path = runtime.get('binary_path') or '/usr/share/logstash/bin'
+
+    logger.info(
+        "Applying logstash_runtime: source=%s version=%s download_dir=%s binary_path=%s",
+        source, version or '(none)', download_dir, binary_path,
+    )
+
+    try:
+        binary = resolve_binary_from_policy(
+            logstash_source=source,
+            logstash_version=version,
+            logstash_download_dir=download_dir,
+            binary_path=binary_path,
+        )
+    except LogstashDownloadError as e:
+        logger.error(f"Logstash runtime apply failed: {e}")
+        return {
+            'success': False,
+            'requires_restart': False,
+            'binary': None,
+            'error': str(e),
+            'source': source,
+            'version': version,
+        }
+    except Exception as e:
+        logger.error(f"Unexpected error applying logstash_runtime: {e}", exc_info=True)
+        return {
+            'success': False,
+            'requires_restart': False,
+            'binary': None,
+            'error': str(e),
+            'source': source,
+            'version': version,
+        }
+
+    binary = str(binary)
+    # State binary_path is historically a directory used for existence checks
+    bin_dir = str(Path(binary).parent) if Path(binary).name in ('logstash', 'logstash.bat') else binary
+
+    prev_binary = agent_state.get_state().get('logstash_binary') or agent_state.get_state().get('binary_path')
+    agent_state.update_state('logstash_source', source)
+    agent_state.update_state('logstash_version', version)
+    agent_state.update_state('logstash_download_dir', download_dir)
+    agent_state.update_state('binary_path', bin_dir)
+    agent_state.update_state('logstash_binary', binary)
+    if version:
+        agent_state.update_state('logstash_version_resolved', version)
+
+    state = agent_state.get_state()
+    env_file = state.get('keystore_env_file')
+    mode = (state.get('mode') or '').lower()
+    if mode == 'simulate' or (env_file and str(env_file).endswith('/env')):
+        update_env_logstash_binary(env_file, binary)
+
+    requires_restart = (str(prev_binary) != binary) if prev_binary else True
+    logger.info(
+        "Logstash runtime applied: binary=%s requires_restart=%s",
+        binary, requires_restart,
+    )
+    return {
+        'success': True,
+        'requires_restart': requires_restart,
+        'binary': binary,
+        'error': None,
+        'source': source,
+        'version': version,
+    }
+
+
 def update_logstash_yml(settings_path, content):
     """
     Update logstash.yml file with new content.
@@ -1355,6 +1482,9 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
             'settings_path': settings_path,
             'logs_path': logs_path,
             'binary_path': binary_path,
+            'logstash_source': state.get('logstash_source') or 'SYSTEM',
+            'logstash_version': state.get('logstash_version') or '',
+            'logstash_download_dir': state.get('logstash_download_dir') or '',
             'keystore': keystore_state,
             'keystore_password_hash': state.get('keystore_password_hash', ''),
             'pipelines': pipelines_state,
@@ -1457,6 +1587,29 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
                 logger.info(f"Configuration change found for settings_path: {changes.get('settings_path')}")
             if changes.get('logs_path') and changes.get('logs_path') != False:
                 logger.info(f"Configuration change found for logs_path: {changes.get('logs_path')}")
+
+            # Apply Logstash binary source (SYSTEM vs VERSION download) before keystore/pipelines
+            if not rollout_aborted:
+                runtime = changes.get('logstash_runtime')
+                if runtime and runtime != False:
+                    logger.info("Logstash runtime change detected (source/version/binary)")
+                    rt_result = apply_logstash_runtime(runtime)
+                    if rt_result.get('success'):
+                        files_updated = True
+                        if rt_result.get('requires_restart'):
+                            requires_restart = True
+                        # Prefer server binary_path state already updated inside apply
+                        if rt_result.get('binary'):
+                            binary_path = str(Path(rt_result['binary']).parent)
+                    else:
+                        logger.error(
+                            "Failed to apply logstash_runtime: %s — aborting rollout",
+                            rt_result.get('error'),
+                        )
+                        failed_operations.append(
+                            f"logstash_runtime apply failed: {rt_result.get('error')}"
+                        )
+                        rollout_aborted = True
 
             # Handle keystore password change (must run BEFORE keystore key changes)
             if not rollout_aborted:
@@ -2207,6 +2360,30 @@ def check_in():
             managed_available = result.get('managed_changes_available', {}) or {}
             snmp_dirty = bool(managed_available.get('snmp'))
 
+            # Detect Logstash runtime drift (VERSION/SYSTEM) even if revision matches
+            # (e.g. partial enroll) so ensure_logstash_version can still run.
+            server_source = (result.get('logstash_source') or 'SYSTEM').upper()
+            server_version = result.get('logstash_version') or ''
+            server_download_dir = result.get('logstash_download_dir') or ''
+            agent_source = (state.get('logstash_source') or 'SYSTEM').upper()
+            agent_version = state.get('logstash_version') or ''
+            agent_download_dir = state.get('logstash_download_dir') or ''
+            runtime_dirty = (
+                server_source != agent_source
+                or (server_source == 'VERSION' and server_version != agent_version)
+                or (
+                    server_source == 'VERSION'
+                    and server_download_dir
+                    and server_download_dir != agent_download_dir
+                )
+            )
+            if runtime_dirty:
+                logger.info(
+                    "Logstash runtime drift detected (agent %s/%s vs server %s/%s)",
+                    agent_source, agent_version or '-',
+                    server_source, server_version or '-',
+                )
+
             # Build ONE merged apply plan so the policy channel and the SNMP
             # channel share a single keystore batch, a single pipelines.yml
             # rewrite, and a single Logstash restart when both change in the same
@@ -2220,7 +2397,7 @@ def check_in():
             snmp_res = None
             snmp_settings_path = result.get('settings_path') or state.get('settings_path')
 
-            if not policy_dirty and not snmp_dirty:
+            if not policy_dirty and not snmp_dirty and not runtime_dirty:
                 logger.info(f"Agent is up-to-date (revision {agent_revision})")
             else:
                 # Single unified fetch: GetConfigChanges returns BOTH the policy
@@ -2233,6 +2410,8 @@ def check_in():
                     )
                 if snmp_dirty:
                     logger.info("SNMP-managed changes flagged at check-in — fetching delta")
+                if runtime_dirty and not policy_dirty:
+                    logger.info("Fetching config changes for logstash_runtime (VERSION/SYSTEM) apply")
 
                 # In merge mode get_config_changes applies config files + keystore
                 # password inline and defers keystore-key/pipeline changes into
@@ -2252,7 +2431,7 @@ def check_in():
                 # config drift), while avoiding last_policy_apply churn + no-op
                 # revision writes on true SNMP-only cycles.
                 policy_did_work = fetch_res.get('files_updated') if fetch_res else False
-                policy_res = fetch_res if (policy_dirty or policy_did_work) else None
+                policy_res = fetch_res if (policy_dirty or policy_did_work or runtime_dirty) else None
 
                 snmp_changes = (fetch_res or {}).get('snmp_changes')
                 if snmp_changes:
