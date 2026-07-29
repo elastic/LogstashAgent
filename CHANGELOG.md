@@ -26,6 +26,7 @@
 - Normalized legacy config: `agent`/`host` → `default`; `simulation`+`embedded` → `embedded`; `simulation`+`host` → `simulate`.
 - Dev `config/logstashagent.yml` aligned to `default|simulate|embedded` vocabulary (`mode: embedded` for local FastAPI).
 - Archived abandoned `simulation_mode: target` plan under `docs/archive/abandoned/` (not for implementation).
+- **LogstashSupervisor is embedded-only process ownership** (`Popen` + monitor). Enrolled simulate uses systemctl + bare recovery/watchdog. Legacy `simulation_mode: host` only seeds layout / optional `run_as_logstash_user`; `setup_host_mode` is a deprecated alias for `ensure_sim_layout`.
 - Install config now writes `mode: default` or `mode: simulate` (no longer `mode: agent`).
 - Simulate agents restart Logstash via `systemctl restart ls-simulate@N` instead of the package `logstash` unit.
 - `update_logstash_env_file` accepts a policy/instance `keystore_env_file` path (simulate uses instance env, not only `/etc/default/logstash`).

@@ -472,11 +472,12 @@ async def startup_event():
     Enrolled simulate agents leave Logstash to systemd (``ls-simulate@N``).
     """
     global _queue_processor_task
+    # Process supervisor is embedded-only (Popen). Enrolled simulate uses systemctl + watchdog.
     if is_systemctl_managed_simulate():
         port = sim_logstash_api_port()
         logger.info(
             "FastAPI startup - enrolled simulate; Logstash managed by systemctl "
-            "(ls-simulate@); skip supervisor (API port %s)",
+            "(ls-simulate@) + watchdog; skip embedded supervisor (API port %s)",
             port,
         )
         # Ensure static harness exists under instance settings (idempotent)

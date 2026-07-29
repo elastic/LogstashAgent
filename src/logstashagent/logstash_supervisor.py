@@ -9,7 +9,6 @@ import time
 import logging
 import signal
 import psutil
-import shutil
 from typing import Optional
 from .logstash_api import LogstashAPI
 
@@ -18,12 +17,14 @@ logger.setLevel(logging.INFO)  # Set to INFO level for supervisor
 
 class LogstashSupervisor:
     """
-    Supervises the Logstash process with automatic restart on:
-    1. Process crash/OOM
-    2. JVM heap usage > 90% for 30+ seconds
-    3. RSS memory dynamically calculated based on heap size
-    
-    Currently always runs in simulation mode (supervised Logstash).
+    In-process Logstash supervisor for **embedded** FastAPI simulation only.
+
+    Owns a Logstash JVM via ``Popen`` and restarts on crash / high heap / API stun.
+
+    Enrolled simulate agents (``ls-simulate@N``) do **not** use this class — they
+    use systemd + ``simulate_recovery`` / watchdog. Legacy ``simulation_mode: host``
+    only toggles layout seeding and optional ``run_as_logstash_user``; process
+    ownership remains the same embedded Popen model.
     """
     
     def __init__(self, config: dict = None):
@@ -33,7 +34,18 @@ class LogstashSupervisor:
         
         # Load configuration
         self.config = config or {}
-        self.simulation_mode_type = self.config.get('simulation_mode', 'embedded')  # 'embedded' or 'host'
+        raw_sim = str(self.config.get('simulation_mode', 'embedded') or 'embedded').lower()
+        # Process model is always embedded (Popen). Legacy host only affects layout/user.
+        self.legacy_host_layout = raw_sim == 'host'
+        self.simulation_mode_type = 'embedded'
+        if self.legacy_host_layout:
+            logger.info(
+                "Legacy simulation_mode=host: using embedded process supervisor "
+                "with local path layout (prefer enrolled Simulate agents)"
+            )
+        self.run_as_logstash_user = bool(
+            self.config.get('run_as_logstash_user', self.legacy_host_layout)
+        )
         self.logstash_binary = self.config.get('logstash_binary', '/usr/share/logstash/bin/logstash')
         self.logstash_settings = self.config.get('logstash_settings', '/etc/logstash/')
         self.logstash_log_path = self.config.get('logstash_log_path', '/var/log/logstash')
@@ -46,8 +58,7 @@ class LogstashSupervisor:
         if self.logstash_log_path.endswith('/'):
             self.logstash_log_path = self.logstash_log_path.rstrip('/')
         
-        # For now, always default to simulation mode (supervised Logstash with memory monitoring)
-        # Production nodes would run Logstash without supervision
+        # Supervised Logstash with memory monitoring (embedded sim only)
         self.simulation_mode = True
         
         # Memory thresholds - CONSERVATIVE: Only restart in truly critical situations
@@ -74,156 +85,100 @@ class LogstashSupervisor:
         self.is_healthy = False  # Set to True once Logstash API responds
         self.is_restarting = False  # Set to True during restart process
         
-        logger.info(f"LogstashSupervisor initialized (mode={self.simulation_mode_type}, binary={self.logstash_binary}, settings={self.logstash_settings})")
-    
-    def setup_host_mode(self):
+        logger.info(
+            "LogstashSupervisor initialized (process=embedded, legacy_host=%s, "
+            "binary=%s, settings=%s)",
+            self.legacy_host_layout,
+            self.logstash_binary,
+            self.logstash_settings,
+        )
+
+    def ensure_sim_layout(self) -> None:
         """
-        Set up host mode by copying all config files from container to host.
-        This overwrites the host's Logstash configuration with our simulation configs.
+        Ensure dirs + static simulate harness under path.settings.
+
+        Uses packaged simulate confs (not a full docker config overwrite).
+        Idempotent; safe for embedded container and legacy local paths.
         """
-        logger.info(f"Setting up host mode - copying configs to {self.logstash_settings}")
-        
-        # Source directory - check local first (native mode), then Docker path
-        # Navigate up to LogstashAgent root (2 levels up from logstashagent/), then into docker/config
-        local_config_dir = os.path.join(os.path.dirname(__file__), "..", "..", "docker", "config")
-        docker_config_dir = "/app/config"
-        
-        if os.path.exists(local_config_dir):
-            container_config_dir = local_config_dir
-            logger.info(f"Using local config directory: {container_config_dir}")
-        elif os.path.exists(docker_config_dir):
-            container_config_dir = docker_config_dir
-            logger.info(f"Using Docker config directory: {container_config_dir}")
-        else:
-            raise FileNotFoundError(f"Config directory not found. Tried: {local_config_dir}, {docker_config_dir}")
-        
-        # Files to copy directly to settings root
-        config_files = [
-            'jvm.options',
-            'log4j2.properties',
-            'logstash.yml',
-            'pipelines.yml'
-        ]
-        
-        # Pipeline config files to copy to conf.d
-        pipeline_files = [
-            'simulate_start.conf',
-            'simulate_end.conf'
-        ]
-        
+        settings = self.logstash_settings.rstrip('/').rstrip('\\')
+        logger.info("Ensuring embedded sim layout under %s", settings)
+        os.makedirs(settings, exist_ok=True)
+        os.makedirs(os.path.join(settings, 'conf.d'), exist_ok=True)
+        os.makedirs(os.path.join(settings, 'config'), exist_ok=True)
+        os.makedirs(os.path.join(settings, 'pipeline-metadata'), exist_ok=True)
+        os.makedirs(self.logstash_log_path, exist_ok=True)
+
         try:
-            # Create settings directory if it doesn't exist
-            os.makedirs(self.logstash_settings, exist_ok=True)
-            logger.info(f"Ensured settings directory exists: {self.logstash_settings}")
-            
-            # Copy config files to settings root
-            for filename in config_files:
-                src = os.path.join(container_config_dir, filename)
-                dst = os.path.join(self.logstash_settings, filename)
-                
-                if os.path.exists(src):
-                    shutil.copy2(src, dst)
-                    logger.info(f"Copied {filename} to {dst}")
-                else:
-                    logger.warning(f"Source file not found: {src}")
-            
-            # Update log4j2.properties with custom log path if configured
-            log4j2_path = os.path.join(self.logstash_settings, 'log4j2.properties')
-            if os.path.exists(log4j2_path):
-                with open(log4j2_path, 'r') as f:
-                    log4j2_content = f.read()
-                
-                # Replace /var/log/logstash with custom log path (use forward slashes for consistency)
-                normalized_log_path = self.logstash_log_path.replace('\\', '/')
-                log4j2_content = log4j2_content.replace('/var/log/logstash', normalized_log_path)
-                
-                with open(log4j2_path, 'w') as f:
-                    f.write(log4j2_content)
-                logger.info(f"Updated log4j2.properties with log path: {normalized_log_path}")
-            
-            # Create config directory for static pipeline configs (simulate_start.conf, simulate_end.conf)
-            config_path = os.path.join(self.logstash_settings, 'config')
-            os.makedirs(config_path, exist_ok=True)
-            logger.info(f"Created config directory: {config_path}")
-            
-            # Copy pipeline files to config/ (not conf.d/)
-            for filename in pipeline_files:
-                src = os.path.join(container_config_dir, filename)
-                dst = os.path.join(config_path, filename)
-                
-                if os.path.exists(src):
-                    shutil.copy2(src, dst)
-                    logger.info(f"Copied {filename} to {dst}")
-                else:
-                    logger.warning(f"Source file not found: {src}")
-            
-            # Create conf.d directory for dynamic pipeline configs (slot pipelines)
-            conf_d_path = os.path.join(self.logstash_settings, 'conf.d')
-            os.makedirs(conf_d_path, exist_ok=True)
-            logger.info(f"Created conf.d directory for dynamic pipelines: {conf_d_path}")
-            
-            # Update pipelines.yml to use correct paths for host mode
-            pipelines_yml_path = os.path.join(self.logstash_settings, 'pipelines.yml')
-            if os.path.exists(pipelines_yml_path):
-                with open(pipelines_yml_path, 'r') as f:
-                    content = f.read()
-                
-                # Replace container paths with host paths
-                # Static pipelines (simulate_start/end) go in config/
-                # Convert backslashes to forward slashes for YAML compatibility on Windows
-                host_config_path = f'{self.logstash_settings}config/'.replace('\\', '/')
-                
-                # Replace both quoted and unquoted paths
-                # Handle quotes with and without spaces
-                content = content.replace('path.config: "/etc/logstash/config/', f'path.config: "{host_config_path}')
-                content = content.replace('path.config: /etc/logstash/config/', f'path.config: {host_config_path}')
-                content = content.replace('"/etc/logstash/config/', f'"{host_config_path}')
-                content = content.replace('/etc/logstash/config/', host_config_path)
-                
-                with open(pipelines_yml_path, 'w') as f:
-                    f.write(content)
-                logger.info(f"Updated pipelines.yml with host paths (using forward slashes): {host_config_path}")
-            
-            # Create pipeline-metadata directory
-            metadata_dir = os.path.join(self.logstash_settings, 'pipeline-metadata')
-            os.makedirs(metadata_dir, exist_ok=True)
-            logger.info(f"Created pipeline-metadata directory: {metadata_dir}")
-            
-            # Create log directory if it doesn't exist
-            os.makedirs(self.logstash_log_path, exist_ok=True)
-            logger.info(f"Ensured log directory exists: {self.logstash_log_path}")
-            
-            logger.info("Host mode setup complete")
-            
+            from . import simulate_recovery
+
+            seed = simulate_recovery.seed_static_harness(settings, force=False)
+            yml = os.path.join(settings, 'pipelines.yml')
+            if seed.get('ok') and not os.path.isfile(yml):
+                simulate_recovery.write_bare_pipelines_yml(settings)
+                logger.info("Wrote bare harness pipelines.yml for embedded supervisor")
+            elif not seed.get('ok'):
+                logger.warning(
+                    "Could not seed full simulate harness: %s",
+                    seed.get('missing_src'),
+                )
         except Exception as e:
-            logger.error(f"Error setting up host mode: {e}", exc_info=True)
-            raise
-    
+            logger.warning("ensure_sim_layout harness seed failed: %s", e)
+
+        # Optional log4j path rewrite when a custom log dir is used
+        log4j2_path = os.path.join(settings, 'log4j2.properties')
+        if os.path.exists(log4j2_path) and self.logstash_log_path:
+            try:
+                with open(log4j2_path, 'r', encoding='utf-8') as f:
+                    log4j2_content = f.read()
+                normalized_log_path = self.logstash_log_path.replace('\\', '/')
+                if '/var/log/logstash' in log4j2_content and normalized_log_path != '/var/log/logstash':
+                    log4j2_content = log4j2_content.replace(
+                        '/var/log/logstash', normalized_log_path
+                    )
+                    with open(log4j2_path, 'w', encoding='utf-8') as f:
+                        f.write(log4j2_content)
+                    logger.info(
+                        "Updated log4j2.properties log path: %s", normalized_log_path
+                    )
+            except Exception as e:
+                logger.debug("log4j2 path rewrite skipped: %s", e)
+
+    def setup_host_mode(self):
+        """Deprecated alias for ensure_sim_layout (legacy host tooling)."""
+        logger.info(
+            "setup_host_mode is deprecated; using ensure_sim_layout (embedded process model)"
+        )
+        self.ensure_sim_layout()
+
+    def _lock_file_path(self) -> str:
+        """Lock file under Logstash home derived from binary, with fallbacks."""
+        try:
+            logstash_home = os.path.dirname(os.path.dirname(self.logstash_binary))
+            candidate = os.path.join(logstash_home, 'data', '.lock')
+            if os.path.isdir(os.path.dirname(candidate)) or os.path.exists(
+                os.path.dirname(candidate)
+            ):
+                return candidate
+        except Exception:
+            pass
+        return '/usr/share/logstash/data/.lock'
+
     def start_logstash(self):
-        """Start the Logstash process"""
+        """Start the Logstash process under embedded (Popen) ownership."""
         logger.debug("[START] start_logstash() called")
         if self.process and self.process.poll() is not None:
             logger.warning("Logstash is already running")
             logger.debug(f"[START] Existing process PID: {self.process.pid}")
             return
-        
-        logger.info(f"Starting Logstash in {self.simulation_mode_type} mode...")
+
+        logger.info("Starting Logstash under embedded process supervisor...")
         logger.debug("[START] Preparing environment variables")
-        
-        # Setup host mode if needed (copy configs to host)
-        if self.simulation_mode_type == 'host':
-            logger.info("Host mode detected - setting up host configuration")
-            self.setup_host_mode()
-        
-        # Determine lock file path based on mode
-        if self.simulation_mode_type == 'embedded':
-            lock_file = "/usr/share/logstash/data/.lock"
-        else:  # host mode
-            # Derive from logstash binary path
-            # /usr/share/logstash/bin/logstash -> /usr/share/logstash/data/.lock
-            logstash_home = os.path.dirname(os.path.dirname(self.logstash_binary))
-            lock_file = os.path.join(logstash_home, "data", ".lock")
-        
+
+        # Seed harness / dirs (idempotent)
+        self.ensure_sim_layout()
+
+        lock_file = self._lock_file_path()
+
         # Clean up lock file from previous instance
         if os.path.exists(lock_file):
             try:
@@ -231,48 +186,52 @@ class LogstashSupervisor:
                 logger.info(f"Removed stale lock file: {lock_file}")
             except Exception as e:
                 logger.warning(f"Failed to remove lock file {lock_file}: {e}")
-        
+
         # Prepare environment - copy all environment variables
         env = os.environ.copy()
-        
-        # Set log4j config path based on mode
-        if self.simulation_mode_type == 'embedded':
-            env['LS_JAVA_OPTS'] = "-Dlog4j.configurationFile=/etc/logstash/log4j2.properties"
-        else:  # host mode
-            log4j_path = os.path.join(self.logstash_settings, 'log4j2.properties')
-            env['LS_JAVA_OPTS'] = f"-Dlog4j.configurationFile={log4j_path}"
-        
-        # Ensure LOGSTASH_URL is available to Logstash
-        # This is critical for http output plugin in simulate_end.conf and simulate_start.conf
-        # Always set based on mode to ensure correct routing, unless explicitly overridden
+
+        # Prefer log4j under path.settings when present
+        settings_root = self.logstash_settings.rstrip('/').rstrip('\\')
+        log4j_settings = os.path.join(settings_root, 'log4j2.properties')
+        if os.path.isfile(log4j_settings):
+            env['LS_JAVA_OPTS'] = f"-Dlog4j.configurationFile={log4j_settings}"
+        else:
+            env['LS_JAVA_OPTS'] = (
+                "-Dlog4j.configurationFile=/etc/logstash/log4j2.properties"
+            )
+
+        # Ensure LOGSTASH_URL is available to Logstash (simulate_start/end HTTP outputs)
         existing_url = env.get('LOGSTASH_URL', '')
-        
+
         # Only override if not explicitly set (i.e., using defaults)
         # Docker-compose sets this to https://nginx, which we should preserve
-        # Dockerfile default is http://host.docker.internal:8080
-        if not existing_url or existing_url in ['http://host.docker.internal:8080', 'http://localhost:8080']:
-            # Set based on mode:
-            # - Host mode: Logstash runs natively on host, access Django via nginx HTTPS proxy on localhost:443
-            #   https://localhost works from both inside and outside containers
-            # - Embedded mode: Container mode -> use host.docker.internal for standalone builds
-            if self.simulation_mode_type == 'host':
+        if not existing_url or existing_url in [
+            'http://host.docker.internal:8080',
+            'http://localhost:8080',
+        ]:
+            if self.legacy_host_layout:
+                # Native agent beside UI: nginx TLS on localhost
                 env['LOGSTASH_URL'] = 'https://localhost'
             else:
                 env['LOGSTASH_URL'] = 'http://host.docker.internal:8080'
-            logger.info(f"LOGSTASH_URL set for {self.simulation_mode_type} mode: {env['LOGSTASH_URL']}")
+            logger.info(
+                "LOGSTASH_URL set for embedded supervisor (legacy_host=%s): %s",
+                self.legacy_host_layout,
+                env['LOGSTASH_URL'],
+            )
         else:
             logger.info(f"LOGSTASH_URL already set (preserving): {env['LOGSTASH_URL']}")
-        
+
         # Validate binary exists
         if not os.path.exists(self.logstash_binary):
             error_msg = f"Logstash binary not found at: {self.logstash_binary}"
             logger.error(error_msg)
-            logger.error("For host mode, ensure:")
-            logger.error("1. If running natively: Use Windows paths (C:\\logstash-9.3.1\\...\\bin\\logstash.bat)")
-            logger.error("2. If running in container: Mount host directory and use container paths (/host/logstash/bin/logstash)")
-            logger.error("3. Start with bin/start_logstashui.bat to automatically detect mode")
+            logger.error(
+                "Configure logstash_binary in agent config, or use enrolled "
+                "Simulate agents (ls-simulate@N) instead of embedded supervisor."
+            )
             raise FileNotFoundError(error_msg)
-        
+
         # Make binary executable (needed for mounted Windows files on Linux)
         # Skip on Windows as chmod doesn't work the same way
         if os.name != 'nt':
@@ -281,15 +240,15 @@ class LogstashSupervisor:
                 logger.debug(f"Set executable permissions on {self.logstash_binary}")
             except Exception as e:
                 logger.warning(f"Could not set executable permissions: {e}")
-        
+
         # Start Logstash with configured paths
         logger.debug("[START] Launching Logstash subprocess")
         logger.info(f"Executing: {self.logstash_binary} --path.settings {self.logstash_settings}")
-        
+
         # Prepare subprocess arguments
         # On Windows, strip trailing slashes/backslashes; on Linux, strip trailing forward slashes
         settings_path = self.logstash_settings.rstrip('/').rstrip('\\')
-        
+
         # preexec_fn only works on Unix-like systems
         # Use DEVNULL for stdout/stderr to prevent pipe blocking on Windows
         # Logstash writes to its own log files configured via log4j2.properties
@@ -298,31 +257,40 @@ class LogstashSupervisor:
             'stdout': subprocess.DEVNULL,
             'stderr': subprocess.DEVNULL
         }
-        
+
         if os.name != 'nt':
             popen_kwargs['preexec_fn'] = os.setsid  # Create new process group for clean shutdown (Unix only)
-        
-        # On Linux host mode, run as logstash user (not root)
+
+        # Optional: run as logstash user when root (legacy local layout / package paths)
         # Logstash refuses to run as root for security reasons
-        if os.name != 'nt' and self.simulation_mode_type == 'host':
-            # Use sudo -E to run as logstash user and preserve environment variables (especially LOGSTASH_URL)
-            cmd = ['sudo', '-E', '-u', 'logstash', self.logstash_binary, '--path.settings', settings_path]
-            logger.info(f"Running as logstash user with preserved env: {' '.join(cmd)}")
-            logger.info(f"LOGSTASH_URL will be: {env.get('LOGSTASH_URL', 'NOT SET')}")
+        if (
+            os.name != 'nt'
+            and self.run_as_logstash_user
+            and hasattr(os, 'geteuid')
+            and os.geteuid() == 0
+        ):
+            cmd = [
+                'sudo', '-E', '-u', 'logstash',
+                self.logstash_binary, '--path.settings', settings_path,
+            ]
+            logger.info(
+                "Running as logstash user with preserved env: %s", ' '.join(cmd)
+            )
+            logger.info("LOGSTASH_URL will be: %s", env.get('LOGSTASH_URL', 'NOT SET'))
         else:
             cmd = [self.logstash_binary, '--path.settings', settings_path]
-        
+
         self.process = subprocess.Popen(
             cmd,
             **popen_kwargs
         )
-        
+
         logger.info(f"Logstash started with PID {self.process.pid}")
         if os.name != 'nt':
             logger.debug(f"[START] Process group ID: {os.getpgid(self.process.pid)}")
         else:
             logger.debug("[START] Running on Windows (process groups not applicable)")
-        
+
         # Start monitoring thread if in simulation mode
         if self.simulation_mode and not self.monitor_thread:
             logger.debug("[START] Starting monitoring thread")
