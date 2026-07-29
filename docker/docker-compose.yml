@@ -20,8 +20,10 @@ services:
       # Optional: Mount custom config (uncomment if needed)
       # - ./logstashui.yml:/app/logstashui.yml:ro
     environment:
-      # URL where LogstashUI is running (for enrollment/controller mode)
-      - LOGSTASH_URL=${LOGSTASH_URL:-http://host.docker.internal:8080}
+      # URL where LogstashUI is running (HTTPS :8443)
+      - LOGSTASH_UI_URL=${LOGSTASH_UI_URL:-https://host.docker.internal:8443}
+      - LOGSTASH_URL=${LOGSTASH_URL:-https://host.docker.internal:8443}
+      - LOGSTASHUI_AGENT_CSR_SECRET=${LOGSTASHUI_AGENT_CSR_SECRET:-logstashui-compose-dev}
     extra_hosts:
       # Allow container to reach host machine
       - "host.docker.internal:host-gateway"

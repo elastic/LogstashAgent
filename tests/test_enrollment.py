@@ -89,11 +89,12 @@ class TestEnrollAgent:
         post.assert_called_once()
         args, kwargs = post.call_args
         assert args[0] == "https://ui.example.com/ConnectionManager/Enroll/"
-        assert kwargs["json"] == {
-            "enrollment_token": encoded,
-            "host": "host-1",
-            "agent_id": "agent-uuid",
-        }
+        body = kwargs["json"]
+        assert body["enrollment_token"] == encoded
+        assert body["host"] == "host-1"
+        assert body["agent_id"] == "agent-uuid"
+        assert "csr_pem" in body
+        assert "BEGIN CERTIFICATE REQUEST" in body["csr_pem"]
         assert kwargs["timeout"] == 30
         assert kwargs["verify"] is True
 

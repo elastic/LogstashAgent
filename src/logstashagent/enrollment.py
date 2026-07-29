@@ -99,6 +99,13 @@ def enroll_agent(encoded_token: str, logstash_ui_url: str, agent_id: str) -> dic
         "host": hostname,
         "agent_id": agent_id
     }
+    # Request product-CA-signed server cert for agent HTTPS (key stays local)
+    try:
+        from logstashagent import tls_server
+
+        enrollment_data["csr_pem"] = tls_server.build_csr_pem().decode("utf-8")
+    except Exception as e:
+        logger.warning("Could not build agent server CSR for enroll: %s", e)
     
     try:
         # Send enrollment request (verify system CAs ± product CA)
@@ -131,6 +138,14 @@ def enroll_agent(encoded_token: str, logstash_ui_url: str, agent_id: str) -> dic
         if not result.get('success'):
             error_msg = result.get('error', 'Unknown error')
             raise Exception(f"Enrollment failed: {error_msg}")
+
+        try:
+            from logstashagent import tls_server
+
+            if tls_server.apply_signed_response(result):
+                logger.info("Agent server certificate issued at enroll")
+        except Exception as e:
+            logger.warning("Could not persist server certificate from enroll: %s", e)
         
         logger.info("Agent enrolled successfully!")
         logger.info(f"Connection ID: {result.get('connection_id')}")

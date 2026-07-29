@@ -2645,7 +2645,19 @@ if __name__ == "__main__":
                 or (9500 + int(state['instance_id']) if state.get('instance_id') is not None else 9500)
             )
             logger.info(f"Starting simulate FastAPI on port {agent_port}")
-            uvicorn.run(app, host="0.0.0.0", port=int(agent_port))
+            try:
+                from logstashagent import tls_server
+
+                tls_server.ensure_agent_server_tls(agent_config=AGENT_CONFIG)
+                ssl_kw = tls_server.uvicorn_ssl_kwargs()
+            except Exception as e:
+                logger.warning("Agent server TLS setup failed: %s", e)
+                ssl_kw = {}
+            if ssl_kw:
+                logger.info("Simulate FastAPI serving HTTPS (product-CA cert)")
+            else:
+                logger.warning("Simulate FastAPI serving HTTP (no agent server cert yet)")
+            uvicorn.run(app, host="0.0.0.0", port=int(agent_port), **ssl_kw)
             sys.exit(0)
 
         controller.run_controller()
@@ -2665,12 +2677,35 @@ if __name__ == "__main__":
     # Get host and port from config or use defaults
     host = AGENT_CONFIG.get('host', '0.0.0.0')
     port = AGENT_CONFIG.get('port', 9500)
+    env_port = (os.environ.get('LOGSTASH_AGENT_PORT') or '').strip()
+    if env_port.isdigit():
+        port = int(env_port)
     
     logger.info(f"Starting logstashagent in {agent_mode} mode on {host}:{port}")
-    
+
+    try:
+        from logstashagent import tls_server
+
+        # Embedded/compose: issue cert via LOGSTASHUI_AGENT_CSR_SECRET or prior enroll
+        tls_server.ensure_agent_server_tls(agent_config=AGENT_CONFIG)
+        ssl_kw = tls_server.uvicorn_ssl_kwargs()
+    except Exception as e:
+        logger.warning("Agent server TLS setup failed: %s", e)
+        ssl_kw = {}
+    if ssl_kw:
+        logger.info("Agent FastAPI serving HTTPS on %s:%s (product-CA cert)", host, port)
+    else:
+        logger.warning(
+            "Agent FastAPI serving HTTP on %s:%s — set LOGSTASH_UI_URL + "
+            "LOGSTASHUI_AGENT_CSR_SECRET or enroll to obtain a server cert",
+            host,
+            port,
+        )
+
     uvicorn.run(
         app,
         host=host,
         port=port,
-        log_level="info"
+        log_level="info",
+        **ssl_kw,
     )

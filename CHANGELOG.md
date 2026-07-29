@@ -22,6 +22,7 @@
 - Added **bare simulate recovery**: quarantine `slot*-filter*` pipelines, re-seed static `simulate-start` / `simulate-end` harness, write harness-only `pipelines.yml`, clear in-memory slots, then `systemctl restart ls-simulate@N`. CLI: `recover-simulate`; auto path on sim failure restart and a background watchdog for enrolled simulate.
 - Added **TLS trust pin** for LogstashUI: enrollment token optional `fingerprint` triggers fetch of `{logstash_ui_url}/.well-known/logstashui/ca.crt`, SHA-256(DER) verify, persist product CA; enroll/check-in use system CAs ∪ product CA (`verify` no longer always false when pinned).
 - Added **UI CA bootstrap loop** for embedded agents: retry-fetch well-known CA with verify=False until UI is up (TOFU or optional `LOGSTASHUI_CA_FINGERPRINT`), then full trust; `/_logstash/tls-status` and health `tls` block for online/secure indicators.
+- Added **agent server TLS** (`tls_server.py`): local key + CSR, product-CA leaf from enroll/check-in/`IssueServerCert`, uvicorn HTTPS on the agent API port; re-issue on check-in without re-enroll; compose secret `LOGSTASHUI_AGENT_CSR_SECRET` for embedded bootstrap.
 
 ### Changed
 

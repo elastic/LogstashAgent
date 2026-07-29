@@ -2407,6 +2407,19 @@ def check_in():
                 ),
             },
         }
+
+        # Upgrade path: re-issue product-CA server cert without re-enroll
+        try:
+            from logstashagent import tls_server
+
+            csr = tls_server.csr_pem_for_request()
+            if csr:
+                check_in_data['csr_pem'] = csr
+                status_blob['tls_server'] = {'needs_cert': True}
+            elif tls_server.has_server_cert():
+                status_blob['tls_server'] = {'has_cert': True}
+        except Exception as e:
+            logger.debug("Agent TLS server CSR for check-in skipped: %s", e)
         
         # Send check-in request
         check_in_url = f"{logstash_ui_url}/ConnectionManager/CheckIn/"
@@ -2445,6 +2458,14 @@ def check_in():
         
         if result.get('success'):
             logger.info("Check-in successful")
+
+            try:
+                from logstashagent import tls_server
+
+                if tls_server.apply_signed_response(result):
+                    logger.info("Agent server certificate issued/renewed on check-in")
+            except Exception as e:
+                logger.warning("Could not persist server certificate from check-in: %s", e)
 
             # Decide what's dirty from the cheap check-in response (Phase 2):
             #   - policy: revision number differs

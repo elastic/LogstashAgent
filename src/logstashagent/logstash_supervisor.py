@@ -204,16 +204,17 @@ class LogstashSupervisor:
         existing_url = env.get('LOGSTASH_URL', '')
 
         # Only override if not explicitly set (i.e., using defaults)
-        # Docker-compose sets this to https://nginx, which we should preserve
+        # Compose sets LOGSTASH_URL=https://logstashui:8443 for embedded
         if not existing_url or existing_url in [
             'http://host.docker.internal:8080',
             'http://localhost:8080',
+            'https://nginx',
+            'https://nginx:443',
         ]:
             if self.legacy_host_layout:
-                # Native agent beside UI: nginx TLS on localhost
-                env['LOGSTASH_URL'] = 'https://localhost'
+                env['LOGSTASH_URL'] = 'https://localhost:8443'
             else:
-                env['LOGSTASH_URL'] = 'http://host.docker.internal:8080'
+                env['LOGSTASH_URL'] = 'https://logstashui:8443'
             logger.info(
                 "LOGSTASH_URL set for embedded supervisor (legacy_host=%s): %s",
                 self.legacy_host_layout,
