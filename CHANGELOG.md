@@ -1,3 +1,30 @@
+## [Unreleased] - Agent roles: default / simulate / embedded
+
+### Added
+
+- Added first-class agent **roles/modes**: `default` (production), `simulate` (enrolled simulation instances), and `embedded` (Docker-local sim).
+- Added simulate instance layout under `/opt/LogstashAgent/simulate-N/` with isolated `--path.settings|config|logs|data`.
+- Added systemd templates `lsagent-simulate@.service` and `ls-simulate@.service` for numbered simulate instances.
+- Added enrollment `policy_config` fields for simulate: `instance_id`, ports (`9500+N` / `9560+N`), path bundle, units, `logstash_source` / version download dir.
+- Added `logstash_download.py` to fetch pinned Logstash versions from Elastic artifacts when policy `logstash_source=VERSION`.
+- Added `POST /_logstash/keystore/sync` and `GET /_logstash/keystore` for pre-simulation keystore clone with **compare-and-skip** (no write/restart when secrets already match).
+- Added CLI `--mode` and `--instance` for simulate runtime.
+- Added startup log lines such as `mode=default (legacy 'agent' mapped)` so upgraded installs confirm mapping without re-enroll.
+
+### Changed
+
+- Normalized legacy config: `agent`/`host` → `default`; `simulation`+`embedded` → `embedded`; `simulation`+`host` → `simulate`.
+- Install config now writes `mode: default` or `mode: simulate` (no longer `mode: agent`).
+- Simulate agents restart Logstash via `systemctl restart ls-simulate@N` instead of the package `logstash` unit.
+- `update_logstash_env_file` accepts a policy/instance `keystore_env_file` path (simulate uses instance env, not only `/etc/default/logstash`).
+- Embedded / simulate-style Logstash HTTP API default is **9560** (was often 9650 in docker).
+
+### Upgrade notes
+
+- **Existing production (default) agents do not need to re-enroll.** Check-in identity (`api_key`, `connection_id`) is unchanged. Migrate LogstashUI, upgrade the agent package, restart the service.
+- On first start after upgrade, look for `mode=default (legacy '…' mapped)` or `mode=default [state|config]`.
+- To run pipeline simulation on a dedicated instance, enroll against a **Simulate** policy (new system policy in LogstashUI) rather than reusing the production agent.
+
 ## [0.5.1] - Pure-Python keystore writes and unauthenticated keystores
 
 ### Added

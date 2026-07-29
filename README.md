@@ -10,13 +10,25 @@ LogstashAgent is the host-side runtime for LogstashUI-managed instances.
 
 It enrolls with LogstashUI, persists local agent state, checks in for policy and configuration changes, and applies those changes directly to the local Logstash installation.
 
+## Agent roles
+
+| Mode | Role |
+|------|------|
+| `default` | Production agent (enrolled). Manages package Logstash via `systemctl`. |
+| `simulate` | Simulation agent instance **N** (enrolled). Isolated under `/opt/LogstashAgent/simulate-N/`; units `lsagent-simulate@N` / `ls-simulate@N`. |
+| `embedded` | Docker/local sim without enrollment (FastAPI + supervisor). |
+
+Legacy `mode: agent|host` and `simulation`/`simulation_mode` are mapped at startup (see logs: `mode=default (legacy '…' mapped)`).
+
+**Upgrade:** Existing production agents keep working **without re-enroll** after package upgrade. Use a **Simulate** policy token only when adding simulation instances.
+
 ## Features
 
 <details>
 <summary><b>Enrollment + Reconciliation Loop</b> - Enroll with LogstashUI and continuously reconcile desired state to the local Logstash instance.</summary>
 
-- Enrollment mode: `python src/logstashagent/main.py --enroll=<TOKEN> --logstash-ui-url=<URL>`
-- Controller mode: `python src/logstashagent/main.py --run`
+- Install + enroll (root): `sudo logstash-agent install --enroll=<TOKEN> --logstash-ui-url=<URL>`
+- Controller: `logstash-agent --run` (or systemd `logstash-agent` / `lsagent-simulate@N`)
 - Agent state includes enrollment identity, policy assignment, and revision tracking.
 
 </details>
