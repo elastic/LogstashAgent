@@ -28,6 +28,8 @@ Legacy `mode: agent|host` and `simulation`/`simulation_mode` are mapped at start
 <summary><b>Enrollment + Reconciliation Loop</b> - Enroll with LogstashUI and continuously reconcile desired state to the local Logstash instance.</summary>
 
 - Install + enroll (root): `sudo logstash-agent install --enroll=<TOKEN> --logstash-ui-url=<URL>`
+- Non-root enroll (token only): `logstash-agent --enroll=<TOKEN> --logstash-ui-url=<URL>` — enrollment always succeeds; for **Simulate** policies the agent tries passwordless sudo, then a partial tree write, otherwise leaves `simulate_setup_pending` and prints `sudo logstash-agent setup-simulate`
+- Finish simulate host setup: `sudo logstash-agent setup-simulate` (materialize `/opt/LogstashAgent/simulate-N/`, install units)
 - Controller: `logstash-agent --run` (or systemd `logstash-agent` / `lsagent-simulate@N`)
 - Agent state includes enrollment identity, policy assignment, and revision tracking.
 
@@ -105,6 +107,20 @@ By default this starts the agent service (including management API) on `0.0.0.0:
 ```bash
 python src/logstashagent/main.py --enroll=<BASE64_TOKEN> --logstash-ui-url=http://localhost:8080
 ```
+
+Prefer root install for production/default agents:
+```bash
+sudo logstash-agent install --enroll=<BASE64_TOKEN> --logstash-ui-url=http://localhost:8080
+```
+
+### Simulate policy, non-root enroll
+If you enroll a **Simulate** token without root, enrollment still saves state. Finish privileged setup with:
+```bash
+sudo logstash-agent setup-simulate
+# then:
+sudo systemctl start lsagent-simulate@N
+```
+When passwordless sudo is configured for the agent binary, non-root enroll may complete setup automatically. Otherwise the CLI prints deferred instructions and sets `simulate_setup_pending` in state.
 
 ### 2. Start controller mode
 ```bash

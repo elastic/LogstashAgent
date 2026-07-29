@@ -198,6 +198,11 @@ def save_enrollment_config(api_key: str, logstash_ui_url: str, policy_id: int, c
             agent_state.update_state(
                 'logstash_download_dir', policy_config.get('logstash_download_dir')
             )
+        # Full policy_config for deferred root setup (non-root --enroll)
+        if policy_config:
+            agent_state.update_state('policy_config', policy_config)
+            if policy_type == 'SIMULATE':
+                agent_state.update_state('simulate_setup_pending', True)
         
         # Set initial revision number to 0 (agent has no configuration yet)
         agent_state.update_state('revision_number', 0)
@@ -243,26 +248,17 @@ def perform_enrollment(encoded_token: str, logstash_ui_url: str, agent_id: str):
             policy_config=policy_config
         )
 
-        # When enrolling a SIMULATE policy as root (standalone --enroll or install),
-        # materialize instance tree / units. Install path also calls this; it is
-        # idempotent.
+        # SIMULATE: materialize dirs/units (root, passwordless sudo, or deferred)
+        setup_result = None
         if (policy_config.get('policy_type') or '').upper() == 'SIMULATE':
-            try:
-                if os.geteuid() == 0:
-                    from logstashagent import installer as _installer
-                    logger.info("Materializing simulate instance directories and units...")
-                    _installer.setup_simulate_from_policy(policy_config)
-                else:
-                    logger.warning(
-                        "SIMULATE enrollment saved, but not running as root — "
-                        "skipping /opt/LogstashAgent/simulate-N materialization. "
-                        "Re-run setup as root or use: sudo logstash-agent install ..."
-                    )
-            except Exception as setup_err:
-                logger.warning(
-                    "Simulate materialization failed (enrollment still valid): %s",
-                    setup_err,
-                )
+            from logstashagent import installer as _installer
+            logger.info("Setting up simulate instance (dirs, units, binary)...")
+            setup_result = _installer.ensure_simulate_setup(policy_config)
+            result['simulate_setup'] = setup_result
+            if setup_result.get('status') == 'complete':
+                agent_state.update_state('simulate_setup_pending', False)
+            else:
+                agent_state.update_state('simulate_setup_pending', True)
         
         logger.info("=" * 60)
         logger.info("ENROLLMENT SUCCESSFUL!")
@@ -273,10 +269,20 @@ def perform_enrollment(encoded_token: str, logstash_ui_url: str, agent_id: str):
         logger.info(f"API Key: {result['api_key'][:10]}...")
         if (policy_config.get('policy_type') or '').upper() == 'SIMULATE':
             logger.info(f"Mode: simulate instance_id={policy_config.get('instance_id')}")
-            logger.info(
-                f"Start with: sudo systemctl start "
-                f"lsagent-simulate@{policy_config.get('instance_id')}"
-            )
+            if setup_result and setup_result.get('status') == 'complete':
+                logger.info(
+                    f"Simulate setup complete. Start with: "
+                    f"sudo systemctl start lsagent-simulate@{policy_config.get('instance_id')}"
+                )
+            else:
+                logger.warning("=" * 60)
+                logger.warning("SIMULATE SETUP INCOMPLETE (enrollment is still valid)")
+                for line in (setup_result or {}).get('messages') or []:
+                    logger.warning("  %s", line)
+                logger.warning(
+                    "Finish with:  sudo logstash-agent setup-simulate"
+                )
+                logger.warning("=" * 60)
         else:
             logger.info("Configuration saved to state.json")
             logger.info("You can now start the agent using the --run flag")

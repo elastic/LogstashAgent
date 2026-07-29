@@ -10,7 +10,15 @@ import sys
 
 # Check early whether we're in a non-simulation mode (--run, --enroll, install, upgrade, or uninstall).
 # slots starts background threads on import, so we skip it in these modes.
-_SKIP_SIMULATION_IMPORTS = '--run' in sys.argv or '--enroll' in sys.argv or 'install' in sys.argv or 'upgrade' in sys.argv or 'uninstall' in sys.argv or 'configure' in sys.argv
+_SKIP_SIMULATION_IMPORTS = (
+    '--run' in sys.argv
+    or '--enroll' in sys.argv
+    or 'install' in sys.argv
+    or 'upgrade' in sys.argv
+    or 'uninstall' in sys.argv
+    or 'configure' in sys.argv
+    or 'setup-simulate' in sys.argv
+)
 
 from fastapi import FastAPI, HTTPException, Path as FastAPIPath, Query, Request
 from fastapi.responses import JSONResponse
@@ -1920,6 +1928,9 @@ Examples:
   # Apply Logstash-specific setup after installing Logstash post-agent-install
   sudo logstash-agent configure
 
+  # Finish simulate materialization after non-root --enroll
+  sudo logstash-agent setup-simulate
+
   # Upgrade agent to a new version
   logstash-agent upgrade --version 0.1.4
 
@@ -1981,6 +1992,17 @@ Examples:
         help='Apply Logstash-specific setup after Logstash is installed'
     )
     configure_parser.add_argument(
+        '--yes',
+        action='store_true',
+        help='Skip confirmation prompt'
+    )
+
+    # setup-simulate: finish privileged materialization after non-root enroll
+    setup_sim_parser = subparsers.add_parser(
+        'setup-simulate',
+        help='Materialize simulate-N dirs/units (run as root after non-root --enroll)'
+    )
+    setup_sim_parser.add_argument(
         '--yes',
         action='store_true',
         help='Skip confirmation prompt'
@@ -2118,6 +2140,18 @@ if __name__ == "__main__":
             sys.exit(1)
         except Exception as e:
             logger.error(f"Unexpected configure error: {e}", exc_info=True)
+            sys.exit(1)
+
+    # Finish simulate host setup after non-root --enroll
+    if args.command == 'setup-simulate':
+        try:
+            installer.perform_setup_simulate(yes=getattr(args, 'yes', False))
+            sys.exit(0)
+        except installer.InstallError as e:
+            logger.error(f"setup-simulate failed: {e}")
+            sys.exit(1)
+        except Exception as e:
+            logger.error(f"Unexpected setup-simulate error: {e}", exc_info=True)
             sys.exit(1)
 
     # Check if we're in uninstall mode

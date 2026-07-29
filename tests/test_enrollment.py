@@ -164,6 +164,31 @@ class TestSaveEnrollmentConfig:
         assert ("revision_number", 0) in calls
         assert ("policy_type", "DEFAULT") in calls
         assert ("mode", "default") in calls
+        assert ("policy_config", policy) in calls
+
+    def test_simulate_saves_policy_blob_and_pending_flag(self):
+        policy = {
+            "policy_type": "SIMULATE",
+            "instance_id": 2,
+            "settings_path": "/opt/LogstashAgent/simulate-2/settings",
+            "logs_path": "/opt/LogstashAgent/simulate-2/logs",
+        }
+
+        with patch.object(enrollment.agent_state, "update_state") as upd:
+            enrollment.save_enrollment_config(
+                api_key="key",
+                logstash_ui_url="http://ui",
+                policy_id=3,
+                connection_id=7,
+                policy_config=policy,
+            )
+
+        calls = [c[0] for c in upd.call_args_list]
+        assert ("mode", "simulate") in calls
+        assert ("policy_type", "SIMULATE") in calls
+        assert ("policy_config", policy) in calls
+        assert ("simulate_setup_pending", True) in calls
+        assert ("instance_id", 2) in calls
 
     def test_propagates_update_state_failure(self):
         with patch.object(
@@ -206,6 +231,81 @@ class TestPerformEnrollment:
             connection_id=2,
             policy_config={"settings_path": "/s", "logs_path": "/l"},
         )
+
+    def test_simulate_setup_complete_clears_pending(self):
+        encoded = _encoded_token({"enrollment_token": "t"})
+        policy_config = {
+            "policy_type": "SIMULATE",
+            "instance_id": 3,
+            "settings_path": "/opt/LogstashAgent/simulate-3/settings",
+            "logs_path": "/opt/LogstashAgent/simulate-3/logs",
+        }
+        enroll_result = {
+            "success": True,
+            "api_key": "long-api-key-value",
+            "policy_id": 1,
+            "connection_id": 2,
+            "policy_config": policy_config,
+        }
+        setup_out = {
+            "status": "complete",
+            "via": "root",
+            "messages": ["ok"],
+        }
+
+        with patch.object(enrollment, "enroll_agent", return_value=enroll_result):
+            with patch.object(enrollment, "save_enrollment_config"):
+                with patch(
+                    "logstashagent.installer.ensure_simulate_setup",
+                    return_value=setup_out,
+                ) as ensure:
+                    with patch.object(
+                        enrollment.agent_state, "update_state"
+                    ) as upd:
+                        out = enrollment.perform_enrollment(
+                            encoded, "https://example.com", "agent-1"
+                        )
+
+        ensure.assert_called_once_with(policy_config)
+        assert out["simulate_setup"] == setup_out
+        upd.assert_any_call("simulate_setup_pending", False)
+
+    def test_simulate_setup_pending_keeps_flag(self):
+        encoded = _encoded_token({"enrollment_token": "t"})
+        policy_config = {
+            "policy_type": "SIMULATE",
+            "instance_id": 5,
+            "settings_path": "/opt/LogstashAgent/simulate-5/settings",
+            "logs_path": "/opt/LogstashAgent/simulate-5/logs",
+        }
+        enroll_result = {
+            "success": True,
+            "api_key": "long-api-key-value",
+            "policy_id": 1,
+            "connection_id": 2,
+            "policy_config": policy_config,
+        }
+        setup_out = {
+            "status": "pending",
+            "via": "deferred",
+            "messages": ["need root"],
+        }
+
+        with patch.object(enrollment, "enroll_agent", return_value=enroll_result):
+            with patch.object(enrollment, "save_enrollment_config"):
+                with patch(
+                    "logstashagent.installer.ensure_simulate_setup",
+                    return_value=setup_out,
+                ):
+                    with patch.object(
+                        enrollment.agent_state, "update_state"
+                    ) as upd:
+                        out = enrollment.perform_enrollment(
+                            encoded, "https://example.com", "agent-1"
+                        )
+
+        assert out["simulate_setup"]["status"] == "pending"
+        upd.assert_any_call("simulate_setup_pending", True)
 
     def test_re_raises_on_enroll_failure(self):
         encoded = _encoded_token({"enrollment_token": "t"})

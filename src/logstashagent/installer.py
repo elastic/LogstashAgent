@@ -547,6 +547,281 @@ def setup_simulate_from_policy(policy_config: dict) -> dict:
     return result
 
 
+def policy_config_from_state(state: Optional[dict] = None) -> dict:
+    """
+    Rebuild a policy_config dict from agent state (for deferred setup-simulate).
+    Prefers the full ``policy_config`` blob saved at enroll.
+    """
+    from logstashagent import agent_state as _agent_state
+
+    state = state if state is not None else _agent_state.get_state()
+    if state.get('policy_config') and isinstance(state['policy_config'], dict):
+        cfg = dict(state['policy_config'])
+        # Ensure policy_type for SIMULATE setup detection
+        if not cfg.get('policy_type') and state.get('mode') == 'simulate':
+            cfg['policy_type'] = 'SIMULATE'
+        return cfg
+
+    instance_id = state.get('instance_id')
+    cfg = {
+        'policy_type': state.get('policy_type') or (
+            'SIMULATE' if state.get('mode') == 'simulate' else 'DEFAULT'
+        ),
+        'instance_id': instance_id,
+        'settings_path': state.get('settings_path'),
+        'config_path': state.get('config_path'),
+        'logs_path': state.get('logs_path'),
+        'data_path': state.get('data_path'),
+        'binary_path': state.get('binary_path'),
+        'keystore_env_file': state.get('keystore_env_file'),
+        'agent_api_port': state.get('agent_api_port'),
+        'logstash_api_port': state.get('logstash_api_port'),
+        'logstash_source': state.get('logstash_source') or 'SYSTEM',
+        'logstash_version': state.get('logstash_version') or '',
+        'logstash_download_dir': state.get('logstash_download_dir')
+        or f"{INSTALL_PATHS['simulate_root']}/logstash-versions",
+        'logstash_yml': '',
+        'jvm_options': '',
+        'log4j2_properties': '',
+    }
+    return cfg
+
+
+def _can_write_simulate_tree(policy_config: dict) -> bool:
+    """True if current user can create/write the simulate instance root."""
+    instance_id = policy_config.get('instance_id')
+    if instance_id is None:
+        return False
+    root = Path(INSTALL_PATHS['simulate_root']) / f"simulate-{instance_id}"
+    parent = root.parent
+    try:
+        if root.exists():
+            test = root / '.write_test'
+            test.write_text('ok', encoding='utf-8')
+            test.unlink(missing_ok=True)
+            return True
+        if parent.exists() and os.access(parent, os.W_OK):
+            return True
+        # Parent may not exist — check grandparent
+        if parent.parent.exists() and os.access(parent.parent, os.W_OK):
+            return True
+    except OSError:
+        return False
+    return False
+
+
+def _try_sudo_setup_simulate() -> Optional[dict]:
+    """
+    Attempt passwordless sudo to finish setup via setup-simulate subcommand.
+    Returns result dict if sudo ran, None if sudo unavailable/denied.
+    """
+    binary_candidates = [
+        INSTALL_PATHS.get('binary'),
+        shutil.which('logstash-agent'),
+        '/usr/local/bin/logstash-agent',
+        '/opt/logstash-agent/bin/logstash-agent',
+    ]
+    agent_bin = next((b for b in binary_candidates if b and os.path.isfile(b)), None)
+    if not agent_bin:
+        # Fall back to current interpreter + module
+        cmd = ['sudo', '-n', sys.executable, '-m', 'logstashagent.main', 'setup-simulate', '--yes']
+    else:
+        cmd = ['sudo', '-n', agent_bin, 'setup-simulate', '--yes']
+
+    try:
+        logger.info("Attempting passwordless sudo for simulate setup: %s", ' '.join(cmd))
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        if result.returncode == 0:
+            logger.info("✓ Simulate setup completed via passwordless sudo")
+            if result.stdout:
+                for line in result.stdout.strip().splitlines()[-20:]:
+                    logger.info("  sudo: %s", line)
+            return {
+                'status': 'complete',
+                'via': 'sudo',
+                'messages': ['Simulate setup completed via passwordless sudo'],
+            }
+        logger.warning(
+            "Passwordless sudo setup-simulate failed (rc=%s): %s",
+            result.returncode,
+            (result.stderr or result.stdout or '')[:500],
+        )
+        return None
+    except FileNotFoundError:
+        logger.debug("sudo not found")
+        return None
+    except subprocess.TimeoutExpired:
+        logger.warning("sudo setup-simulate timed out")
+        return None
+    except Exception as e:
+        logger.warning("sudo setup-simulate error: %s", e)
+        return None
+
+
+def ensure_simulate_setup(policy_config: dict) -> dict:
+    """
+    Ensure simulate instance is fully set up after enrollment.
+
+    Order:
+      1. If root → full setup_simulate_from_policy
+      2. Else try passwordless ``sudo -n … setup-simulate``
+      3. Else if tree is writable → materialize only (no unit install); report partial
+      4. Else pending with clear instructions
+
+    Returns:
+        dict with status: complete | partial | pending, messages: list[str]
+    """
+    policy_config = policy_config or {}
+    if (policy_config.get('policy_type') or '').upper() != 'SIMULATE':
+        return {'status': 'complete', 'messages': ['Not a SIMULATE policy'], 'via': 'n/a'}
+
+    instance_id = policy_config.get('instance_id')
+    messages = []
+
+    # 1. Root
+    try:
+        if os.geteuid() == 0:
+            logger.info("Running as root — full simulate setup")
+            result = setup_simulate_from_policy(policy_config)
+            return {
+                'status': 'complete',
+                'via': 'root',
+                'messages': [f"Materialized simulate-{instance_id} and installed units"],
+                'result': result,
+            }
+    except Exception as e:
+        logger.error("Root simulate setup failed: %s", e, exc_info=True)
+        return {
+            'status': 'pending',
+            'via': 'root_failed',
+            'messages': [f"Root setup failed: {e}", "Retry: sudo logstash-agent setup-simulate"],
+        }
+
+    # 2. Passwordless sudo
+    sudo_result = _try_sudo_setup_simulate()
+    if sudo_result and sudo_result.get('status') == 'complete':
+        return sudo_result
+
+    # 3. Partial: writable tree only (no systemd unit install)
+    if _can_write_simulate_tree(policy_config):
+        try:
+            logger.info(
+                "Non-root but simulate tree is writable — materializing dirs/env "
+                "(systemd units still need root)"
+            )
+            result = materialize_simulate_instance(policy_config)
+            messages.append(
+                f"Wrote simulate-{instance_id} directories and env files as non-root"
+            )
+            messages.append(
+                "Still need root for systemd units: sudo logstash-agent setup-simulate"
+            )
+            return {
+                'status': 'partial',
+                'via': 'user_writable',
+                'messages': messages,
+                'result': result,
+            }
+        except Exception as e:
+            logger.warning("Partial materialize failed: %s", e)
+            messages.append(f"Partial materialize failed: {e}")
+
+    # 4. Pending
+    messages.extend([
+        "Enrollment saved, but simulate host setup needs elevated privileges.",
+        "Run as root (recommended):",
+        "  sudo logstash-agent setup-simulate",
+        "Or re-enroll with install:",
+        "  sudo logstash-agent install --enroll <TOKEN> --logstash-ui-url <URL>",
+    ])
+    if sudo_result is None:
+        messages.append(
+            "(Passwordless sudo for setup-simulate was not available; "
+            "configure NOPASSWD for setup-simulate if you want non-interactive finish.)"
+        )
+    return {
+        'status': 'pending',
+        'via': 'deferred',
+        'messages': messages,
+    }
+
+
+def perform_setup_simulate(yes: bool = False) -> dict:
+    """
+    Entry point for ``logstash-agent setup-simulate``.
+
+    Requires root. Reads enrollment state (policy_config) and runs full
+    setup_simulate_from_policy. Idempotent.
+    """
+    from logstashagent import agent_state as _agent_state
+
+    logger.info("=" * 60)
+    logger.info("LOGSTASH AGENT - SETUP SIMULATE")
+    logger.info("=" * 60)
+
+    verify_root()
+    verify_platform()
+
+    state = _agent_state.get_state()
+    if not state.get('enrolled'):
+        raise InstallError(
+            "Agent is not enrolled. Run enroll or install first, then setup-simulate."
+        )
+
+    policy_config = policy_config_from_state(state)
+    if (policy_config.get('policy_type') or '').upper() != 'SIMULATE' and state.get('mode') != 'simulate':
+        raise InstallError(
+            "Agent is not a simulate enrollment (mode/policy_type is not SIMULATE). "
+            f"mode={state.get('mode')} policy_type={policy_config.get('policy_type')}"
+        )
+    policy_config['policy_type'] = 'SIMULATE'
+    if policy_config.get('instance_id') is None:
+        raise InstallError(
+            "Missing instance_id in agent state. Re-enroll with a Simulate policy token."
+        )
+
+    if not yes:
+        print(f"\nThis will materialize /opt/LogstashAgent/simulate-{policy_config['instance_id']}/")
+        print("and install/enable lsagent-simulate@ and ls-simulate@ units.")
+        answer = input("Continue? [y/N]: ").strip().lower()
+        if answer != 'y':
+            raise InstallError("setup-simulate cancelled")
+
+    # Also write agent config if install path exists
+    ui_url = state.get('logstash_ui_url') or ''
+    if os.path.isdir(INSTALL_PATHS['config_dir']):
+        try:
+            write_config_file(ui_url, policy_config=policy_config)
+        except Exception as e:
+            logger.warning("Could not write agent config file: %s", e)
+
+    result = setup_simulate_from_policy(policy_config)
+    try:
+        configure_logstash()
+    except Exception as e:
+        logger.warning("configure_logstash after setup-simulate: %s", e)
+
+    _agent_state.update_state('simulate_setup_pending', False)
+
+    logger.info("=" * 60)
+    logger.info("SIMULATE SETUP COMPLETE")
+    logger.info("=" * 60)
+    logger.info(
+        "Start: sudo systemctl start lsagent-simulate@%s",
+        policy_config['instance_id'],
+    )
+    logger.info(
+        "Status: sudo systemctl status lsagent-simulate@%s",
+        policy_config['instance_id'],
+    )
+    return result
+
+
 def configure_logstash() -> None:
     """
     Apply Logstash-specific setup required for agent management.

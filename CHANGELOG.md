@@ -18,6 +18,7 @@
 - Added env-file handling so `LOGSTASH_KEYSTORE_PASS` can be set or cleared in `/etc/default/logstash` (and per-instance env for simulate).
 - Added unit coverage for pure-Python keystore write, unauthenticated keystores, env resolution, controller password migrate paths, simulate install, and keystore sync compare-and-skip.
 - Added controller apply for `logstash_runtime` (SYSTEM vs VERSION): downloads pinned Logstash releases on policy change without re-enroll, updates simulate `LOGSTASH_BINARY` env, and restarts when the binary path changes.
+- Added `logstash-agent setup-simulate` for finishing privileged simulate materialization after non-root `--enroll`; non-root enroll tries passwordless sudo, then partial tree write, then clear deferred instructions (`simulate_setup_pending` in state).
 
 ### Changed
 
