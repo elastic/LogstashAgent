@@ -10,6 +10,13 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Note: This module encrypts agent-local credentials (e.g. api_key, optional
+# keystore_password in state.json). It is not related to Logstash PKCS#12
+# keystore cryptography. Unauthenticated Logstash keystores simply omit
+# keystore_password from agent state; encrypt_credential/decrypt_credential
+# pass through empty/None values unchanged.
+
+
 def get_encryption_key():
     """
     Get or generate the encryption key for credential storage.

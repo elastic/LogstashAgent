@@ -158,6 +158,49 @@ class TestUpdateKeystore:
                     is False
                 )
 
+    def test_unauthenticated_create_and_set(self, temp_dir):
+        """No keystore_password in state: create unauth keystore and set keys."""
+        settings = temp_dir.replace("\\", "/") + "/"
+        with patch.object(
+            controller.agent_state,
+            "get_state",
+            return_value={"api_key": "test_key"},
+        ), patch.object(controller.agent_state, "update_state") as update_state, patch.object(
+            controller, "_decrypt_from_server", side_effect=lambda k, v: v
+        ):
+            ok = controller.update_keystore(
+                settings, {"set": {"alpha": "a1"}, "delete": []}
+            )
+        assert ok is True
+        ks_path = Path(settings) / "logstash.keystore"
+        assert ks_path.exists()
+        # Load without password (unauthenticated trailer)
+        from logstashagent.ls_keystore_utils import LogstashKeystore
+        loaded = LogstashKeystore.load(settings, password=None, exepath=None)
+        assert loaded.uses_embedded_password is True
+        assert loaded.get_key("alpha") == "a1"
+        # Hash state updated with lowercase key names
+        assert update_state.called
+        assert update_state.call_args[0][0] == "keystore"
+        assert "alpha" in update_state.call_args[0][1]
+
+    def test_snmp_merge_without_password_contributes_keystore(self):
+        plan = {"keystore": {"set": {}, "delete": []}, "pipelines": {"set": {}, "delete": []}}
+        with patch.object(controller.agent_state, "get_state", return_value={}):
+            res = controller.apply_snmp_changes(
+                "/cfg/",
+                {
+                    "keystore": {"set": {"k1": "enc"}, "delete": []},
+                    "pipelines": {},
+                },
+                plan=plan,
+            )
+        assert res["ran"] is True
+        assert res["keystore_skipped"] is False
+        assert res["keystore_set_names"] == ["k1"]
+        assert "k1" in plan["keystore"]["set"]
+
+
 
 class TestRestartLogstash:
     @patch.object(controller.subprocess, "run")

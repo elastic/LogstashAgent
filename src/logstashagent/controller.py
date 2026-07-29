@@ -243,30 +243,34 @@ def update_log4j2_properties(settings_path, content):
 def update_keystore(settings_path, keystore_changes):
     """
     Update the Logstash keystore with set/delete operations.
-    
+
+    Supports authenticated keystores (password in agent state) and unauthenticated
+    Logstash keystores (password=None; default-password trailer on disk). Uses
+    pure-Python PKCS#12 writes by default.
+
     Args:
         settings_path: Path to Logstash settings directory
         keystore_changes: Dictionary with 'set' and 'delete' keys
             - 'set': Dictionary of {key_name: key_value} to add/update
             - 'delete': List of key names to remove
-    
+
     Returns:
         bool: True if successful, False otherwise
     """
     try:
         logger.info(f"Starting keystore update at {settings_path}")
         logger.debug(f"Keystore changes requested: {keystore_changes}")
-        
-        # Get keystore password from agent state
-        # Pass None (not empty string) for passwordless keystores — LogstashKeystore
-        # requires None when no password is set; an empty string leaves self.password unset.
+
+        # Get keystore password from agent state.
+        # Pass None (not empty string) for unauthenticated keystores — LogstashKeystore
+        # recovers the embedded trailer password when password is None.
         state = agent_state.get_state()
         keystore_password = state.get('keystore_password') or None
 
         if keystore_password:
             logger.info("Keystore password: CONFIGURED (using provided password)")
         else:
-            logger.info("Keystore password: NOT CONFIGURED (passwordless keystore)")
+            logger.info("Keystore password: NOT CONFIGURED (unauthenticated keystore)")
         
         # Normalize path separators
         if settings_path:
@@ -315,7 +319,8 @@ def update_keystore(settings_path, keystore_changes):
         except LogstashKeystoreException as e:
             logger.warning(f"Failed to load keystore: {e}")
             try:
-                logger.info("Keystore does not exist - creating new keystore...")
+                mode = "authenticated" if keystore_password else "unauthenticated"
+                logger.info(f"Keystore does not exist - creating new {mode} keystore...")
                 ks = LogstashKeystore.create(
                     path_settings=settings_path,
                     password=keystore_password
@@ -324,6 +329,10 @@ def update_keystore(settings_path, keystore_changes):
             except Exception as create_error:
                 logger.error(f"Failed to create keystore: {create_error}")
                 return False
+        except ValueError as e:
+            # Authenticated file but no password in state (or no trailer).
+            logger.error(f"Cannot open keystore without a password: {e}")
+            return False
         except Exception as e:
             logger.error(f"Unexpected error loading keystore: {e}")
             return False
@@ -1284,10 +1293,9 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
             if not rollout_aborted:
                 keystore_changes = changes.get('keystore')
                 if keystore_changes and keystore_changes != False:
-                    if not state.get('keystore_password'):
-                        logger.warning("Skipping keystore key changes - no keystore password in agent state yet")
-                        failed_operations.append('keystore changes skipped - no password in state')
-                    elif plan is not None:
+                    # Unauthenticated keystores (no password in state) are supported;
+                    # secret values are still decrypted with the agent API key.
+                    if plan is not None:
                         # Merge mode: defer the actual keystore write so it can be
                         # batched with SNMP (and any other source) into ONE
                         # keystore apply and ONE restart in the caller.
@@ -1674,16 +1682,10 @@ def apply_snmp_changes(settings_path, snmp_changes, plan=None):
                 'pipeline_delete_names': list(pipelines_to_delete),
             }
             if keys_to_set or keys_to_delete:
-                # Setting keys needs the keystore password; if it isn't in state
-                # yet, skip the whole SNMP keystore this cycle (matches legacy;
-                # the policy channel provisions the password on a revision change).
-                if keys_to_set and not state.get('keystore_password'):
-                    logger.warning("Skipping SNMP keystore - no keystore password in agent state yet")
-                    contributed['keystore_skipped'] = True
-                else:
-                    _merge_keystore_into(plan['keystore'], keystore_changes)
-                    contributed['keystore_set_names'] = list(keys_to_set.keys())
-                    contributed['keystore_delete_names'] = list(keys_to_delete)
+                # Unauthenticated keystores are supported (password may be absent).
+                _merge_keystore_into(plan['keystore'], keystore_changes)
+                contributed['keystore_set_names'] = list(keys_to_set.keys())
+                contributed['keystore_delete_names'] = list(keys_to_delete)
             if pipelines_to_set or pipelines_to_delete:
                 _merge_pipelines_into(plan['pipelines'], pipeline_changes)
             return contributed
@@ -1695,12 +1697,8 @@ def apply_snmp_changes(settings_path, snmp_changes, plan=None):
         # --- Keystore first (pipelines may reference these keys) ---
         if keys_to_set or keys_to_delete:
             state = agent_state.get_state()
-            # Setting keys requires the keystore password so the agent can
-            # open/create the keystore. If it isn't present yet, skip this cycle
-            # (the regular policy channel provisions it on revision change).
-            if keys_to_set and not state.get('keystore_password'):
-                logger.warning("Skipping SNMP keystore set - no keystore password in agent state yet")
-            elif update_keystore(settings_path, keystore_changes):
+            # Unauthenticated keystores are supported when keystore_password is absent.
+            if update_keystore(settings_path, keystore_changes):
                 # regular_ks now uses lowercase key names (normalized in update_keystore),
                 # matching the lowercase names the server sends for SNMP entries.
                 # The lookup is now a direct match with no case conversion needed.

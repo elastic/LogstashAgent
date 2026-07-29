@@ -181,3 +181,13 @@ class TestEncryptDecryptCredential:
             encrypted = encrypt_credential(plaintext)
             decrypted = decrypt_credential(encrypted)
             assert decrypted == plaintext
+
+
+class TestPasswordlessCredentialPassthrough:
+    """Empty/None values are not Fernet-encrypted (unauth keystore_password)."""
+
+    def test_empty_and_none_passthrough(self):
+        assert encrypt_credential("") == ""
+        assert encrypt_credential(None) is None
+        assert decrypt_credential("") == ""
+        assert decrypt_credential(None) is None
