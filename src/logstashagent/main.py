@@ -1451,6 +1451,120 @@ async def get_pipelines_status():
         )
 
 
+@app.post("/_logstash/keystore/sync")
+async def keystore_sync(request: Request):
+    """
+    Replace the simulate instance Logstash keystore with the provided secrets.
+
+    Used by LogstashUI before pipeline simulation when the pipeline references
+    ${keystore} variables. Pure-Python write (no logstash-keystore CLI).
+
+    Request body (JSON):
+      {
+        "secrets": {"KEY": "value", ...},   # full user secret map
+        "password": "optional",             # omit/null => unauthenticated (embedded trailer)
+        "restart": true                     # restart Logstash after write (default true)
+      }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    secrets = body.get("secrets") or {}
+    if not isinstance(secrets, dict):
+        raise HTTPException(status_code=400, detail="'secrets' must be an object")
+
+    password = body.get("password") or None
+    do_restart = body.get("restart", True)
+
+    state = agent_state.get_state()
+    settings_path = (
+        state.get("settings_path")
+        or AGENT_CONFIG.get("logstash_settings")
+        or "/etc/logstash"
+    )
+    settings_path = str(settings_path).replace("\\", "/")
+    if not settings_path.endswith("/"):
+        settings_path = settings_path + "/"
+    keystore_path = Path(settings_path) / "logstash.keystore"
+
+    try:
+        from logstashagent.ls_keystore_utils.keystore_write import (
+            create_keystore_file,
+            generate_default_keystore_password,
+            write_keystore_secrets,
+        )
+        from logstashagent import controller as _controller
+
+        # Normalize secret keys to strings
+        secrets_map = {str(k): str(v) for k, v in secrets.items() if v is not None}
+
+        os.makedirs(settings_path, exist_ok=True)
+
+        if password:
+            write_keystore_secrets(
+                keystore_path, password, secrets_map, embed_password=False
+            )
+            agent_state.update_state("keystore_password", password)
+            env_file = state.get("keystore_env_file")
+            try:
+                _controller.update_logstash_env_file(password, env_file=env_file)
+            except Exception as env_err:
+                logger.warning("Keystore written but env file update failed: %s", env_err)
+        else:
+            # Unauthenticated keystore with embedded default-password trailer
+            gen = generate_default_keystore_password()
+            if not keystore_path.exists():
+                create_keystore_file(keystore_path, password=gen, embed_password=True)
+            write_keystore_secrets(
+                keystore_path, gen, secrets_map, embed_password=True
+            )
+            agent_state.update_state("keystore_password", None)
+            env_file = state.get("keystore_env_file")
+            try:
+                _controller.update_logstash_env_file(None, env_file=env_file)
+            except Exception as env_err:
+                logger.debug("Env clear skipped/failed: %s", env_err)
+
+        restarted = False
+        if do_restart:
+            mode = (state.get("mode") or AGENT_CONFIG.get("mode") or "").lower()
+            # systemctl for enrolled simulate/default; supervisor for embedded FastAPI path
+            if mode in ("simulate", "default", "agent", "host") or state.get("logstash_unit"):
+                restarted = bool(_controller.restart_logstash())
+            else:
+                try:
+                    sup = logstash_supervisor.get_supervisor()
+                    if sup is not None:
+                        sup.restart_logstash(reason="keystore sync")
+                        restarted = True
+                except Exception as sup_err:
+                    logger.warning("Supervisor restart after keystore sync failed: %s", sup_err)
+
+        logger.info(
+            "Keystore sync: wrote %d secret(s) to %s (restarted=%s)",
+            len(secrets_map),
+            keystore_path,
+            restarted,
+        )
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "success",
+                "secrets_count": len(secrets_map),
+                "keystore_path": str(keystore_path),
+                "restarted": restarted,
+                "authenticated": bool(password),
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Keystore sync failed: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Keystore sync failed: {e}")
+
+
 @app.post("/_logstash/write-file")
 async def write_file(request: Request):
     """
