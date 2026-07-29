@@ -1451,19 +1451,136 @@ async def get_pipelines_status():
         )
 
 
+def _sim_settings_path() -> str:
+    state = agent_state.get_state()
+    settings_path = (
+        state.get("settings_path")
+        or AGENT_CONFIG.get("logstash_settings")
+        or "/etc/logstash"
+    )
+    settings_path = str(settings_path).replace("\\", "/")
+    if not settings_path.endswith("/"):
+        settings_path = settings_path + "/"
+    return settings_path
+
+
+def _normalize_secrets_map(secrets: dict) -> dict:
+    """Lowercase keys for Logstash keystore comparison (keystore stores lowercase)."""
+    return {
+        str(k).lower(): str(v)
+        for k, v in (secrets or {}).items()
+        if v is not None and str(k).lower() != "keystore.seed"
+    }
+
+
+def _read_instance_keystore_secrets(password: str | None = None) -> tuple[dict, bool]:
+    """
+    Read user secrets from the local Logstash keystore.
+
+    Returns (secrets_map lowercase keys, exists).
+    """
+    from logstashagent.ls_keystore_utils.keystore_write import (
+        _load_existing_secrets,
+        extract_embedded_password,
+        resolve_keystore_password,
+    )
+
+    settings_path = _sim_settings_path()
+    keystore_path = Path(settings_path) / "logstash.keystore"
+    if not keystore_path.is_file():
+        return {}, False
+
+    state = agent_state.get_state()
+    try_passwords = []
+    if password:
+        try_passwords.append(password)
+    if state.get("keystore_password"):
+        try_passwords.append(state.get("keystore_password"))
+    # Unauthenticated trailer
+    try:
+        emb = extract_embedded_password(keystore_path)
+        if emb:
+            try_passwords.append(emb)
+    except Exception:
+        pass
+
+    last_err = None
+    for pwd in try_passwords:
+        try:
+            secrets = _load_existing_secrets(keystore_path, pwd)
+            # Drop seed
+            secrets = {k: v for k, v in secrets.items() if k != "keystore.seed"}
+            return secrets, True
+        except Exception as e:
+            last_err = e
+            continue
+
+    # Last attempt: resolve_keystore_password
+    try:
+        pwd, _emb = resolve_keystore_password(keystore_path, password)
+        secrets = _load_existing_secrets(keystore_path, pwd)
+        secrets = {k: v for k, v in secrets.items() if k != "keystore.seed"}
+        return secrets, True
+    except Exception as e:
+        logger.debug("Could not read instance keystore: %s (last=%s)", e, last_err)
+        return {}, True  # exists but unreadable → treat as different on compare
+
+
+def _restart_logstash_for_sim() -> bool:
+    from logstashagent import controller as _controller
+
+    state = agent_state.get_state()
+    mode = (state.get("mode") or AGENT_CONFIG.get("mode") or "").lower()
+    if mode in ("simulate", "default", "agent", "host") or state.get("logstash_unit"):
+        return bool(_controller.restart_logstash())
+    try:
+        sup = logstash_supervisor.get_supervisor()
+        if sup is not None:
+            sup.restart_logstash(reason="keystore sync")
+            return True
+    except Exception as sup_err:
+        logger.warning("Supervisor restart after keystore sync failed: %s", sup_err)
+    return False
+
+
+@app.get("/_logstash/keystore")
+async def keystore_get():
+    """
+    Return the current simulate-instance keystore user secrets (for comparison).
+
+    Does not include keystore.seed. Values are returned so LogstashUI can compare
+    against the source policy before deciding to sync.
+    """
+    state = agent_state.get_state()
+    secrets, exists = _read_instance_keystore_secrets(
+        password=state.get("keystore_password")
+    )
+    return JSONResponse(
+        status_code=200,
+        content={
+            "exists": exists,
+            "secrets": secrets,
+            "secrets_count": len(secrets),
+            "keys": sorted(secrets.keys()),
+        },
+    )
+
+
 @app.post("/_logstash/keystore/sync")
 async def keystore_sync(request: Request):
     """
-    Replace the simulate instance Logstash keystore with the provided secrets.
+    Replace the simulate instance Logstash keystore with the provided secrets
+    only when contents differ from the current keystore.
 
     Used by LogstashUI before pipeline simulation when the pipeline references
     ${keystore} variables. Pure-Python write (no logstash-keystore CLI).
+    No Logstash restart when the keystore already matches.
 
     Request body (JSON):
       {
         "secrets": {"KEY": "value", ...},   # full user secret map
         "password": "optional",             # omit/null => unauthenticated (embedded trailer)
-        "restart": true                     # restart Logstash after write (default true)
+        "restart": true                     # restart only if a write occurs (default true)
       }
     """
     try:
@@ -1479,14 +1596,7 @@ async def keystore_sync(request: Request):
     do_restart = body.get("restart", True)
 
     state = agent_state.get_state()
-    settings_path = (
-        state.get("settings_path")
-        or AGENT_CONFIG.get("logstash_settings")
-        or "/etc/logstash"
-    )
-    settings_path = str(settings_path).replace("\\", "/")
-    if not settings_path.endswith("/"):
-        settings_path = settings_path + "/"
+    settings_path = _sim_settings_path()
     keystore_path = Path(settings_path) / "logstash.keystore"
 
     try:
@@ -1497,8 +1607,28 @@ async def keystore_sync(request: Request):
         )
         from logstashagent import controller as _controller
 
-        # Normalize secret keys to strings
-        secrets_map = {str(k): str(v) for k, v in secrets.items() if v is not None}
+        secrets_map = _normalize_secrets_map(secrets)
+
+        # Compare to current on-disk keystore (no write / no restart if equal)
+        current, exists = _read_instance_keystore_secrets(password=password)
+        if exists and current == secrets_map:
+            # Also require auth mode compatibility: if password expected vs embedded
+            # When both empty and both unauthenticated, equal is enough.
+            logger.info(
+                "Keystore sync: no changes (%d secret(s) already match) — skip write/restart",
+                len(secrets_map),
+            )
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "status": "success",
+                    "unchanged": True,
+                    "secrets_count": len(secrets_map),
+                    "keystore_path": str(keystore_path),
+                    "restarted": False,
+                    "authenticated": bool(password),
+                },
+            )
 
         os.makedirs(settings_path, exist_ok=True)
 
@@ -1529,21 +1659,10 @@ async def keystore_sync(request: Request):
 
         restarted = False
         if do_restart:
-            mode = (state.get("mode") or AGENT_CONFIG.get("mode") or "").lower()
-            # systemctl for enrolled simulate/default; supervisor for embedded FastAPI path
-            if mode in ("simulate", "default", "agent", "host") or state.get("logstash_unit"):
-                restarted = bool(_controller.restart_logstash())
-            else:
-                try:
-                    sup = logstash_supervisor.get_supervisor()
-                    if sup is not None:
-                        sup.restart_logstash(reason="keystore sync")
-                        restarted = True
-                except Exception as sup_err:
-                    logger.warning("Supervisor restart after keystore sync failed: %s", sup_err)
+            restarted = _restart_logstash_for_sim()
 
         logger.info(
-            "Keystore sync: wrote %d secret(s) to %s (restarted=%s)",
+            "Keystore sync: wrote %d secret(s) to %s (restarted=%s, was_unchanged=false)",
             len(secrets_map),
             keystore_path,
             restarted,
@@ -1552,6 +1671,7 @@ async def keystore_sync(request: Request):
             status_code=200,
             content={
                 "status": "success",
+                "unchanged": False,
                 "secrets_count": len(secrets_map),
                 "keystore_path": str(keystore_path),
                 "restarted": restarted,
