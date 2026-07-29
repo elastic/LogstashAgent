@@ -1,4 +1,4 @@
-## [Unreleased] - Agent roles: default / simulate / embedded
+## [0.5.1] - Agent roles (default / simulate / embedded) and pure-Python keystores
 
 ### Added
 
@@ -10,6 +10,13 @@
 - Added `POST /_logstash/keystore/sync` and `GET /_logstash/keystore` for pre-simulation keystore clone with **compare-and-skip** (no write/restart when secrets already match).
 - Added CLI `--mode` and `--instance` for simulate runtime.
 - Added startup log lines such as `mode=default (legacy 'agent' mapped)` so upgraded installs confirm mapping without re-enroll.
+- Added pure-Python PKCS#12 keystore create, add, update, and remove support via the vendored `ls_keystore_utils` package (default path; no JVM startup for routine keystore writes).
+- Added support for unauthenticated Logstash keystores (default-password trailer mode), matching native `logstash-keystore create` without `LOGSTASH_KEYSTORE_PASS`.
+- Added policy and SNMP keystore set/delete when the agent has no stored keystore password (unauthenticated mode).
+- Added `set_keystore_password` to upgrade an unauthenticated keystore to authenticated mode when the server provisions a password, preferring secret-preserving migrate over wipe-and-recreate.
+- Added `ensure_keystore` and `clear_keystore_password` helpers so future LogstashUI flows can switch keystore password modes without another library redesign (`clear_keystore_password` is not yet wired to check-in).
+- Added env-file handling so `LOGSTASH_KEYSTORE_PASS` can be set or cleared in `/etc/default/logstash` (and per-instance env for simulate).
+- Added unit coverage for pure-Python keystore write, unauthenticated keystores, env resolution, controller password migrate paths, simulate install, and keystore sync compare-and-skip.
 
 ### Changed
 
@@ -18,27 +25,6 @@
 - Simulate agents restart Logstash via `systemctl restart ls-simulate@N` instead of the package `logstash` unit.
 - `update_logstash_env_file` accepts a policy/instance `keystore_env_file` path (simulate uses instance env, not only `/etc/default/logstash`).
 - Embedded / simulate-style Logstash HTTP API default is **9560** (was often 9650 in docker).
-
-### Upgrade notes
-
-- **Existing production (default) agents do not need to re-enroll.** Check-in identity (`api_key`, `connection_id`) is unchanged. Migrate LogstashUI, upgrade the agent package, restart the service.
-- On first start after upgrade, look for `mode=default (legacy '…' mapped)` or `mode=default [state|config]`.
-- To run pipeline simulation on a dedicated instance, enroll against a **Simulate** policy (new system policy in LogstashUI) rather than reusing the production agent.
-
-## [0.5.1] - Pure-Python keystore writes and unauthenticated keystores
-
-### Added
-
-- Added pure-Python PKCS#12 keystore create, add, update, and remove support via the vendored `ls_keystore_utils` package (default path; no JVM startup for routine keystore writes).
-- Added support for unauthenticated Logstash keystores (default-password trailer mode), matching native `logstash-keystore create` without `LOGSTASH_KEYSTORE_PASS`.
-- Added policy and SNMP keystore set/delete when the agent has no stored keystore password (unauthenticated mode).
-- Added `set_keystore_password` to upgrade an unauthenticated keystore to authenticated mode when the server provisions a password, preferring secret-preserving migrate over wipe-and-recreate.
-- Added `ensure_keystore` and `clear_keystore_password` helpers so future LogstashUI flows can switch keystore password modes without another library redesign (`clear_keystore_password` is not yet wired to check-in).
-- Added env-file handling so `LOGSTASH_KEYSTORE_PASS` can be set or cleared in `/etc/default/logstash`.
-- Added unit coverage for pure-Python keystore write, unauthenticated keystores, env resolution, and controller password migrate paths.
-
-### Changed
-
 - Synced vendored `ls_keystore_utils` with ls-keystore-utils dockertests (v0.4.0), including `keystore_write.py` and `resolve.py`.
 - Keystore write operations default to pure-Python PKCS#12 construction; optional `use_cli=True` retains `logstash-keystore` binary fallback.
 - Keystore bag timestamps are tracked in milliseconds for reliable change detection during pure-Python updates.
@@ -46,6 +32,12 @@
 ### Fixed
 
 - Corrected controller comments that incorrectly described merged keystore apply as a single `logstash-keystore add` invocation.
+
+### Upgrade notes
+
+- **Existing production (default) agents do not need to re-enroll.** Check-in identity (`api_key`, `connection_id`) is unchanged. Migrate LogstashUI, upgrade the agent package, restart the service.
+- On first start after upgrade, look for `mode=default (legacy '…' mapped)` or `mode=default [state|config]`.
+- To run pipeline simulation on a dedicated instance, enroll against a **Simulate** policy (new system policy in LogstashUI) rather than reusing the production agent.
 
 ## [0.3.2] - SNMP compatibility
 
