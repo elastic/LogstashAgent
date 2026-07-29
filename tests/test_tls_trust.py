@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -95,3 +96,46 @@ def test_ensure_trust_with_fingerprint(tmp_path, monkeypatch):
             "https://ui", {"enrollment_token": "x", "fingerprint": fp}
         )
     assert out == fp
+
+
+def test_bootstrap_tofu_without_fingerprint(tmp_path, monkeypatch):
+    pem, fp = _make_ca()
+    monkeypatch.setattr(tls_trust, "tls_dir", lambda: tmp_path)
+    mock_resp = MagicMock()
+    mock_resp.content = pem
+    mock_resp.raise_for_status = MagicMock()
+    with patch.object(tls_trust.requests, "get", return_value=mock_resp):
+        path = tls_trust.fetch_product_ca_bootstrap("http://logstashui:8080")
+    assert path.is_file()
+    assert tls_trust.load_persisted_fingerprint() == fp
+
+
+def test_bootstrap_loop_retries_then_ok(tmp_path, monkeypatch):
+    pem, fp = _make_ca()
+    monkeypatch.setattr(tls_trust, "tls_dir", lambda: tmp_path)
+    # Reset global bootstrap state
+    tls_trust._bootstrap_state.update(
+        {"status": "idle", "attempts": 0, "last_error": None}
+    )
+
+    calls = {"n": 0}
+
+    def fake_get(*a, **k):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise requests.exceptions.ConnectionError("not ready")
+        m = MagicMock()
+        m.content = pem
+        m.raise_for_status = MagicMock()
+        return m
+
+    with patch.object(tls_trust.requests, "get", side_effect=fake_get), patch.object(
+        tls_trust.time, "sleep"
+    ):
+        tls_trust._bootstrap_loop("http://ui:8080", None, interval_sec=0.01, max_attempts=0)
+        # force exit after success — loop returns on success
+    assert tls_trust.product_ca_already_pinned()
+    status = tls_trust.get_tls_status()
+    assert status["secure"] is True
+    assert status["bootstrap_status"] == "ok"
+    assert calls["n"] >= 3

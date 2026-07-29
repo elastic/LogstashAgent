@@ -507,6 +507,14 @@ async def startup_event():
         # Wait for Logstash to initialize
         await asyncio.sleep(5)
         logger.info("Logstash supervision started")
+        # Embedded (and other non-systemctl) agents: retry-fetch product CA until UI is up.
+        # Bootstrap GET uses verify=False once; all later UI calls use the pinned CA.
+        try:
+            from logstashagent import tls_trust
+
+            tls_trust.start_ui_ca_bootstrap_loop(agent_config=AGENT_CONFIG)
+        except Exception as e:
+            logger.warning("Could not start UI CA bootstrap loop: %s", e)
 
     # Start queue processor
     _queue_processor_task = asyncio.create_task(_process_simulation_queue())
@@ -961,6 +969,8 @@ async def logstash_health():
 
     Enrolled simulate: Logstash HTTP API (systemctl-managed).
     Embedded / legacy host: in-process supervisor flags.
+
+    Also includes TLS trust indicators (product CA pin / bootstrap) for the UI.
     """
     health = check_sim_logstash_health()
     with _queue_lock:
@@ -976,10 +986,35 @@ async def logstash_health():
     if health.get("logstash_api_port") is not None:
         content["logstash_api_port"] = health["logstash_api_port"]
 
+    try:
+        from logstashagent import tls_trust
+
+        content["tls"] = tls_trust.get_tls_status()
+    except Exception as e:
+        content["tls"] = {"secure": False, "error": str(e)}
+
     return JSONResponse(
         status_code=200 if content["healthy"] else 503,
         content=content,
     )
+
+
+@app.get("/_logstash/tls-status")
+async def tls_status():
+    """
+    Product CA pin / bootstrap status for UI online+secure indicators.
+
+    Does not require Logstash to be healthy.
+    """
+    try:
+        from logstashagent import tls_trust
+
+        return tls_trust.get_tls_status()
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"secure": False, "ca_pinned": False, "error": str(e)},
+        )
 
 
 @app.post("/_logstash/simulate")
