@@ -152,17 +152,18 @@ class TestSaveEnrollmentConfig:
             )
 
         calls = [c[0] for c in upd.call_args_list]
-        assert calls == [
-            ("enrolled", True),
-            ("logstash_ui_url", "http://ui"),
-            ("api_key", "key"),
-            ("policy_id", 3),
-            ("connection_id", 7),
-            ("settings_path", "/etc/logstash"),
-            ("logs_path", "/var/log"),
-            ("binary_path", None),
-            ("revision_number", 0),
-        ]
+        # Core enrollment fields must be present; additive mode/policy fields may follow.
+        assert ("enrolled", True) in calls
+        assert ("logstash_ui_url", "http://ui") in calls
+        assert ("api_key", "key") in calls
+        assert ("policy_id", 3) in calls
+        assert ("connection_id", 7) in calls
+        assert ("settings_path", "/etc/logstash") in calls
+        assert ("logs_path", "/var/log") in calls
+        assert ("binary_path", None) in calls
+        assert ("revision_number", 0) in calls
+        assert ("policy_type", "DEFAULT") in calls
+        assert ("mode", "default") in calls
 
     def test_propagates_update_state_failure(self):
         with patch.object(

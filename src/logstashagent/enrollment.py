@@ -162,14 +162,52 @@ def save_enrollment_config(api_key: str, logstash_ui_url: str, policy_id: int, c
         agent_state.update_state('settings_path', policy_config.get('settings_path'))
         agent_state.update_state('logs_path', policy_config.get('logs_path'))
         agent_state.update_state('binary_path', policy_config.get('binary_path'))
+        if policy_config.get('data_path') is not None:
+            agent_state.update_state('data_path', policy_config.get('data_path'))
+        if policy_config.get('config_path') is not None:
+            agent_state.update_state('config_path', policy_config.get('config_path'))
+
+        # Agent role / simulate instance fields (policy_type: DEFAULT|SIMULATE|EMBEDDED)
+        policy_type = (policy_config.get('policy_type') or 'DEFAULT').upper()
+        agent_state.update_state('policy_type', policy_type)
+        if policy_type == 'SIMULATE':
+            agent_state.update_state('mode', 'simulate')
+        elif policy_type == 'EMBEDDED':
+            agent_state.update_state('mode', 'embedded')
+        else:
+            agent_state.update_state('mode', 'default')
+
+        if policy_config.get('instance_id') is not None:
+            agent_state.update_state('instance_id', policy_config.get('instance_id'))
+        if policy_config.get('agent_api_port') is not None:
+            agent_state.update_state('agent_api_port', policy_config.get('agent_api_port'))
+        if policy_config.get('logstash_api_port') is not None:
+            agent_state.update_state('logstash_api_port', policy_config.get('logstash_api_port'))
+        if policy_config.get('keystore_env_file') is not None:
+            agent_state.update_state('keystore_env_file', policy_config.get('keystore_env_file'))
+        if policy_config.get('logstash_unit'):
+            agent_state.update_state('logstash_unit', policy_config.get('logstash_unit'))
+        if policy_config.get('agent_unit'):
+            agent_state.update_state('agent_unit', policy_config.get('agent_unit'))
+        if policy_config.get('logstash_source'):
+            agent_state.update_state('logstash_source', policy_config.get('logstash_source'))
+        if policy_config.get('logstash_version') is not None:
+            agent_state.update_state('logstash_version', policy_config.get('logstash_version'))
+        if policy_config.get('logstash_download_dir'):
+            agent_state.update_state(
+                'logstash_download_dir', policy_config.get('logstash_download_dir')
+            )
         
         # Set initial revision number to 0 (agent has no configuration yet)
         agent_state.update_state('revision_number', 0)
         
         logger.info(f"Enrollment configuration saved to state.json")
+        logger.info(f"Mode/policy_type: {agent_state.get_state().get('mode')}/{policy_type}")
         logger.info(f"Settings path: {policy_config.get('settings_path')}")
         logger.info(f"Logs path: {policy_config.get('logs_path')}")
         logger.info(f"Binary path: {policy_config.get('binary_path')}")
+        if policy_config.get('instance_id') is not None:
+            logger.info(f"Simulate instance_id: {policy_config.get('instance_id')}")
         logger.info(f"Revision number set to 0 (no configuration deployed yet)")
         logger.info(f"Agent is now enrolled and managed by logstashui at {logstash_ui_url}")
         

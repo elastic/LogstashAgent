@@ -73,100 +73,128 @@ def _record_last_apply(source, success, failed_operations, revision=None):
     agent_state.update_state('last_apply', last_apply)
 
 
-# Default environment file sourced by the Logstash systemd unit.
+# Default environment file sourced by the package Logstash systemd unit.
 _LOGSTASH_ENV_FILE = Path('/etc/default/logstash')
 
 
-def update_logstash_env_file(password: Optional[str]) -> None:
+def _resolve_keystore_env_file(env_file: Optional[str] = None) -> Path:
+    """Prefer explicit path, then agent state, then package default."""
+    if env_file:
+        return Path(env_file)
+    try:
+        state_path = agent_state.get_state().get('keystore_env_file')
+        if state_path:
+            return Path(state_path)
+    except Exception:
+        pass
+    return _LOGSTASH_ENV_FILE
+
+
+def update_logstash_env_file(
+    password: Optional[str],
+    env_file: Optional[str] = None,
+) -> None:
     """
-    Write, update, or clear LOGSTASH_KEYSTORE_PASS in /etc/default/logstash.
+    Write, update, or clear LOGSTASH_KEYSTORE_PASS in the Logstash env file.
 
     When ``password`` is a non-empty string, the variable is set so the Logstash
     systemd service can open a password-protected keystore on startup.
     When ``password`` is None or empty, any existing LOGSTASH_KEYSTORE_PASS line
     is removed (unauthenticated / trailer keystores).
 
-    Uses sudo tee/cat as configured in /etc/sudoers.d/logstash-agent since the agent
-    runs as the logstash user and /etc/default/logstash is root-owned.
-
-    The file is written with mode 0o640 so that Logstash (running as the
-    logstash user/group) can read it but unprivileged users cannot.
+    ``env_file`` overrides the path (policy ``keystore_env_file``). For package
+    Logstash the default is ``/etc/default/logstash`` (sudo cat/tee). For simulate
+    instances the path is typically ``/opt/LogstashAgent/simulate-N/env`` and is
+    written directly when the agent owns the tree.
 
     Raises:
-        FileNotFoundError: If /etc/default/logstash doesn't exist
+        FileNotFoundError: If a required package env file doesn't exist
         OSError: If unable to read or write the file
     """
     var_name = 'LOGSTASH_KEYSTORE_PASS'
+    env_path = _resolve_keystore_env_file(env_file)
+    use_sudo = str(env_path) == str(_LOGSTASH_ENV_FILE) or str(env_path).startswith('/etc/')
 
-    # Verify the file exists - it should always exist on a proper Logstash installation
-    if not _LOGSTASH_ENV_FILE.exists():
-        logger.error(f"{_LOGSTASH_ENV_FILE} does not exist - Logstash may not be properly installed")
+    # Package env file must already exist; simulate instance env may be created.
+    if use_sudo and not env_path.exists():
+        logger.error(f"{env_path} does not exist - Logstash may not be properly installed")
         raise FileNotFoundError(
-            f"{_LOGSTASH_ENV_FILE} not found. "
+            f"{env_path} not found. "
             "This file should be created by the Logstash package installation. "
             "Please verify Logstash is properly installed."
         )
 
-    # Read existing lines using sudo cat since we don't have read permission
+    # Read existing lines
     existing_lines = []
     try:
-        result = subprocess.run(
-            ['sudo', 'cat', str(_LOGSTASH_ENV_FILE)],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        if result.returncode == 0:
-            existing_lines = result.stdout.splitlines()
-        else:
-            logger.error(f"Failed to read {_LOGSTASH_ENV_FILE}: {result.stderr}")
-            raise OSError(f"Cannot read {_LOGSTASH_ENV_FILE}")
+        if use_sudo:
+            result = subprocess.run(
+                ['sudo', 'cat', str(env_path)],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                existing_lines = result.stdout.splitlines()
+            else:
+                logger.error(f"Failed to read {env_path}: {result.stderr}")
+                raise OSError(f"Cannot read {env_path}")
+        elif env_path.exists():
+            existing_lines = env_path.read_text(encoding='utf-8').splitlines()
     except subprocess.TimeoutExpired:
-        logger.error(f"Timeout reading {_LOGSTASH_ENV_FILE}")
+        logger.error(f"Timeout reading {env_path}")
+        raise
+    except OSError:
         raise
     except Exception as e:
-        logger.error(f"Failed to read {_LOGSTASH_ENV_FILE}: {e}")
+        logger.error(f"Failed to read {env_path}: {e}")
         raise
 
     # Drop any existing LOGSTASH_KEYSTORE_PASS line; re-add only when setting a password
     filtered = [ln for ln in existing_lines if not ln.startswith(f'{var_name}=')]
     if password:
         filtered.append(f'{var_name}={password}')
-        logger.info(f"Setting {var_name} in {_LOGSTASH_ENV_FILE}")
+        logger.info(f"Setting {var_name} in {env_path}")
     else:
-        logger.info(f"Clearing {var_name} from {_LOGSTASH_ENV_FILE} (unauthenticated keystore)")
+        logger.info(f"Clearing {var_name} from {env_path} (unauthenticated keystore)")
 
     content = '\n'.join(filtered) + '\n'
-    
-    # Use sudo tee to write the file since we don't have direct write permission
+
     try:
-        result = subprocess.run(
-            ['sudo', 'tee', str(_LOGSTASH_ENV_FILE)],
-            input=content,
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        
-        if result.returncode == 0:
-            # Set permissions using sudo chmod
+        if use_sudo:
+            result = subprocess.run(
+                ['sudo', 'tee', str(env_path)],
+                input=content,
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            if result.returncode != 0:
+                logger.error(f"Failed to write {env_path}: {result.stderr}")
+                raise OSError(f"Cannot write to {env_path}")
             chmod_result = subprocess.run(
-                ['sudo', 'chmod', '640', str(_LOGSTASH_ENV_FILE)],
+                ['sudo', 'chmod', '640', str(env_path)],
                 capture_output=True,
                 timeout=5,
                 check=False
             )
             if chmod_result.returncode != 0:
-                logger.warning(f"Failed to set permissions on {_LOGSTASH_ENV_FILE}: {chmod_result.stderr}")
-            logger.info(f"Updated {var_name} in {_LOGSTASH_ENV_FILE}")
+                logger.warning(f"Failed to set permissions on {env_path}: {chmod_result.stderr}")
         else:
-            logger.error(f"Failed to write {_LOGSTASH_ENV_FILE}: {result.stderr}")
-            raise OSError(f"Cannot write to {_LOGSTASH_ENV_FILE}")
+            env_path.parent.mkdir(parents=True, exist_ok=True)
+            env_path.write_text(content, encoding='utf-8')
+            try:
+                os.chmod(env_path, 0o640)
+            except OSError as chmod_err:
+                logger.warning(f"Failed to set permissions on {env_path}: {chmod_err}")
+        logger.info(f"Updated {var_name} in {env_path}")
     except subprocess.TimeoutExpired:
-        logger.error(f"Timeout writing {_LOGSTASH_ENV_FILE}")
+        logger.error(f"Timeout writing {env_path}")
+        raise
+    except OSError:
         raise
     except Exception as e:
-        logger.error(f"Failed to write {_LOGSTASH_ENV_FILE}: {e}")
+        logger.error(f"Failed to write {env_path}: {e}")
         raise
 
 
@@ -951,60 +979,83 @@ def update_pipelines(settings_path, pipeline_changes):
         return False
 
 
+def _logstash_unit_name() -> str:
+    """
+    Systemd unit for this agent role.
+
+    - default: ``logstash``
+    - simulate: ``ls-simulate@N`` from state (or derived from instance_id)
+    """
+    state = agent_state.get_state()
+    unit = state.get('logstash_unit')
+    if unit:
+        return unit
+    mode = (state.get('mode') or 'default').lower()
+    if mode == 'simulate':
+        instance_id = state.get('instance_id')
+        if instance_id is not None:
+            return f'ls-simulate@{instance_id}'
+    return 'logstash'
+
+
 def restart_logstash():
     """
-    Restart the Logstash service.
+    Restart the Logstash service for this agent role.
     Uses sudo as configured in /etc/sudoers.d/logstash-agent
-    
+
+    Default agents restart ``logstash``; simulate agents restart ``ls-simulate@N``.
+
     Returns:
         bool: True if successful, False otherwise
     """
+    unit = _logstash_unit_name()
     try:
-        logger.info("Restarting Logstash service...")
-        
+        logger.info(f"Restarting Logstash service ({unit})...")
+
         # Try systemctl first (most common on Linux)
         # Use sudo since agent runs as logstash user
         try:
             result = subprocess.run(
-                ['sudo', 'systemctl', 'restart', 'logstash'],
+                ['sudo', 'systemctl', 'restart', unit],
                 capture_output=True,
                 text=True,
                 timeout=30
             )
-            
+
             if result.returncode == 0:
-                logger.info("Logstash service restarted successfully via systemctl")
+                logger.info(f"Logstash service restarted successfully via systemctl ({unit})")
                 return True
             else:
-                logger.warning(f"systemctl restart failed: {result.stderr}")
+                logger.warning(f"systemctl restart {unit} failed: {result.stderr}")
         except FileNotFoundError:
             logger.debug("systemctl not found, trying service command")
-        
-        # Try service command as fallback
-        try:
-            result = subprocess.run(
-                ['sudo', 'service', 'logstash', 'restart'],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            
-            if result.returncode == 0:
-                logger.info("Logstash service restarted successfully via service command")
-                return True
-            else:
-                logger.warning(f"service restart failed: {result.stderr}")
-        except FileNotFoundError:
-            logger.debug("service command not found")
-        
-        logger.error("Failed to restart Logstash - no suitable service manager found")
+
+        # Try service command as fallback (default unit only)
+        if unit == 'logstash':
+            try:
+                result = subprocess.run(
+                    ['sudo', 'service', 'logstash', 'restart'],
+                    capture_output=True,
+                    text=True,
+                    timeout=30
+                )
+
+                if result.returncode == 0:
+                    logger.info("Logstash service restarted successfully via service command")
+                    return True
+                else:
+                    logger.warning(f"service restart failed: {result.stderr}")
+            except FileNotFoundError:
+                logger.debug("service command not found")
+
+        logger.error(f"Failed to restart Logstash unit {unit} - no suitable service manager found")
         return False
-        
+
     except subprocess.TimeoutExpired:
-        logger.error("Logstash restart timed out after 30 seconds")
+        logger.error(f"Logstash restart timed out after 30 seconds ({unit})")
         return False
     except Exception as e:
-        logger.error(f"Failed to restart Logstash service: {e}")
+        logger.error(f"Failed to restart Logstash service ({unit}): {e}")
         return False
 
 

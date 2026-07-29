@@ -1,0 +1,21 @@
+[Unit]
+Description=LogstashAgent simulate instance %i
+After=network.target
+Documentation=https://github.com/elastic/LogstashAgent
+
+[Service]
+Type=simple
+EnvironmentFile=-/opt/LogstashAgent/simulate-%i/agent.env
+# Runs controller + FastAPI for this simulate instance
+ExecStart=/opt/logstash-agent/bin/logstash-agent --run --mode simulate --instance %i
+Restart=always
+RestartSec=10
+WorkingDirectory=/opt/LogstashAgent/simulate-%i
+StandardOutput=journal
+StandardError=journal
+# Prefer logstash user when present (installer rewrites User= as needed)
+# User=logstash
+# Group=logstash
+
+[Install]
+WantedBy=multi-user.target

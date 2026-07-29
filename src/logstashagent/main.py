@@ -199,8 +199,40 @@ def load_agent_config() -> dict:
         logger.error(f"Error loading config: {e}")
         raise
 
+def normalize_agent_mode(config: dict) -> dict:
+    """
+    Normalize legacy mode/simulation_mode into mode: default|simulate|embedded.
+
+    Mapping:
+      agent|host                         -> default
+      simulation + embedded (or missing) -> embedded
+      simulation + host                  -> simulate
+      default|simulate|embedded          -> unchanged
+    """
+    if not config:
+        return {'mode': 'embedded'}
+    mode = str(config.get('mode', '') or '').lower()
+    sim_mode = str(config.get('simulation_mode', '') or '').lower()
+
+    if mode in ('default', 'simulate', 'embedded'):
+        config['mode'] = mode
+        return config
+    if mode in ('agent', 'host'):
+        config['mode'] = 'default'
+        return config
+    if mode == 'simulation' or mode == '':
+        if sim_mode == 'host':
+            config['mode'] = 'simulate'
+        else:
+            config['mode'] = 'embedded'
+        return config
+    # Unknown -> embedded (safest for docker-ish defaults)
+    config['mode'] = 'embedded'
+    return config
+
+
 # Global config
-AGENT_CONFIG = load_agent_config()
+AGENT_CONFIG = normalize_agent_mode(load_agent_config())
 
 app = FastAPI(title="logstashagent API", version="0.0.1")
 
@@ -1721,7 +1753,23 @@ Examples:
     parser.add_argument(
         '--run',
         action='store_true',
-        help='Run the agent controller (for enrolled agents in host mode)'
+        help='Run the agent controller (enrolled default or simulate agents)'
+    )
+
+    parser.add_argument(
+        '--mode',
+        type=str,
+        choices=['default', 'simulate', 'embedded'],
+        default=None,
+        help='Agent role: default (production), simulate (enrolled sim), embedded (docker sim)'
+    )
+
+    parser.add_argument(
+        '--instance',
+        type=int,
+        metavar='N',
+        default=None,
+        help='Simulate instance number N (for --mode simulate / lsagent-simulate@N)'
     )
 
     parser.add_argument(
@@ -1908,32 +1956,64 @@ if __name__ == "__main__":
     # This creates the log file with the correct user permissions
     setup_file_logging()
     
-    # Check if we're in run mode (controller mode for enrolled agents)
+    # CLI overrides for mode / instance
+    if getattr(args, 'mode', None):
+        AGENT_CONFIG['mode'] = args.mode
+        agent_state.update_state('mode', args.mode)
+    if getattr(args, 'instance', None) is not None:
+        AGENT_CONFIG['instance_id'] = args.instance
+        agent_state.update_state('instance_id', args.instance)
+        if not agent_state.get_state().get('logstash_unit'):
+            agent_state.update_state('logstash_unit', f'ls-simulate@{args.instance}')
+        if not agent_state.get_state().get('agent_api_port'):
+            agent_state.update_state('agent_api_port', 9500 + int(args.instance))
+        if not agent_state.get_state().get('logstash_api_port'):
+            agent_state.update_state('logstash_api_port', 9560 + int(args.instance))
+
+    agent_mode = (AGENT_CONFIG.get('mode') or agent_state.get_state().get('mode') or 'embedded').lower()
+    agent_mode = normalize_agent_mode({'mode': agent_mode}).get('mode', agent_mode)
+
+    # Check if we're in run mode (controller for enrolled default/simulate agents)
     if args.run:
-        # Persist the Logstash API port from the loaded config into agent state so
-        # the controller's check_in() always queries the correct port.
-        # Native installs use 9600 (Logstash default); simulation/Docker uses 9650.
-        # Writing it here overrides any stale value that may have been stored from
-        # a previous simulation session.
-        logstash_api_port = AGENT_CONFIG.get('logstash_api_port', 9600)
+        # Persist the Logstash API port from config/state so check_in uses the right port.
+        # default package Logstash: 9600; simulate: 9560+N; embedded: 9560
+        state = agent_state.get_state()
+        if state.get('logstash_api_port'):
+            logstash_api_port = state.get('logstash_api_port')
+        elif agent_mode == 'simulate' and state.get('instance_id') is not None:
+            logstash_api_port = 9560 + int(state['instance_id'])
+        elif agent_mode == 'embedded':
+            logstash_api_port = AGENT_CONFIG.get('logstash_api_port', 9560)
+        else:
+            logstash_api_port = AGENT_CONFIG.get('logstash_api_port', 9600)
         agent_state.update_state('api_port', logstash_api_port)
-        logger.info(f"Logstash API port set to {logstash_api_port} (from config)")
+        logger.info(f"Logstash API port set to {logstash_api_port} (mode={agent_mode})")
+
+        if agent_mode == 'simulate':
+            # Simulate agents need both controller reconciliation and FastAPI sim API.
+            # Run controller in a background thread; uvicorn serves sim routes on agent port.
+            import threading
+            t = threading.Thread(target=controller.run_controller, name='simulate-controller', daemon=True)
+            t.start()
+            agent_port = (
+                state.get('agent_api_port')
+                or AGENT_CONFIG.get('port')
+                or (9500 + int(state['instance_id']) if state.get('instance_id') is not None else 9500)
+            )
+            logger.info(f"Starting simulate FastAPI on port {agent_port}")
+            uvicorn.run(app, host="0.0.0.0", port=int(agent_port))
+            sys.exit(0)
 
         controller.run_controller()
         sys.exit(0)
     
-    # Check the mode from config
-    agent_mode = AGENT_CONFIG.get('mode', 'simulation')
-    
-    if agent_mode != 'simulation':
-        logger.info("=" * 60)
-        logger.info("LOGSTASH AGENT MODE")
-        logger.info("=" * 60)
-        logger.info("Agent mode is not yet fully implemented")
-        logger.info("The agent will check in with logstashui and receive policies")
-        logger.info("For now, starting in simulation mode...")
-        logger.info("=" * 60)
-        # For now, fall through to start FastAPI server
+    # Non-run entry: FastAPI for embedded (and legacy simulation) only
+    if agent_mode == 'default':
+        logger.info("mode=default requires --run after enrollment (controller only)")
+        sys.exit(1)
+    if agent_mode not in ('embedded', 'simulate', 'simulation'):
+        logger.info(f"Unrecognized mode {agent_mode}; starting embedded-style FastAPI")
+        # fall through to FastAPI
     
     # Start FastAPI server (simulation or host mode)
 
