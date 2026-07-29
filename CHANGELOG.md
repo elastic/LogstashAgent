@@ -14,7 +14,7 @@
 - Added support for unauthenticated Logstash keystores (default-password trailer mode), matching native `logstash-keystore create` without `LOGSTASH_KEYSTORE_PASS`.
 - Added policy and SNMP keystore set/delete when the agent has no stored keystore password (unauthenticated mode).
 - Added `set_keystore_password` to upgrade an unauthenticated keystore to authenticated mode when the server provisions a password, preferring secret-preserving migrate over wipe-and-recreate.
-- Added `ensure_keystore` and `clear_keystore_password` helpers so future LogstashUI flows can switch keystore password modes without another library redesign (`clear_keystore_password` is not yet wired to check-in).
+- Added `ensure_keystore` and `clear_keystore_password` helpers; **check-in applies clear** when GetConfigChanges returns `keystore_password: null` (policy has no password, agent still reported a hash).
 - Added env-file handling so `LOGSTASH_KEYSTORE_PASS` can be set or cleared in `/etc/default/logstash` (and per-instance env for simulate).
 - Added unit coverage for pure-Python keystore write, unauthenticated keystores, env resolution, controller password migrate paths, simulate install, and keystore sync compare-and-skip.
 - Added controller apply for `logstash_runtime` (SYSTEM vs VERSION): downloads pinned Logstash releases on policy change without re-enroll, updates simulate `LOGSTASH_BINARY` env, and restarts when the binary path changes.
@@ -37,6 +37,7 @@
 
 - Corrected controller comments that incorrectly described merged keystore apply as a single `logstash-keystore add` invocation.
 - Enrolled simulate FastAPI no longer starts Logstash via the in-process supervisor (avoids double JVM / wrong paths); health, sim queue, and recovery restarts use the Logstash HTTP API and `systemctl restart ls-simulate@N`. Legacy UI host/embedded supervisor paths are unchanged.
+- Keystore password clear is applied on check-in (`keystore_password: null` → unauthenticated migrate + env clear), not left as a no-op when the policy password is removed.
 
 ### Upgrade notes
 

@@ -891,6 +891,62 @@ class TestSetKeystorePassword:
         assert loaded.uses_embedded_password is True
 
 
+class TestApplyKeystorePasswordChange:
+    """Check-in protocol: false=no-op, null=clear, string=set."""
+
+    def test_false_is_noop(self, temp_dir):
+        settings = temp_dir.replace("\\", "/") + "/"
+        with patch.object(controller, "clear_keystore_password") as clear, patch.object(
+            controller, "set_keystore_password"
+        ) as set_pw:
+            out = controller.apply_keystore_password_change(settings, False, "api-key")
+        assert out["applied"] is False
+        assert out["success"] is True
+        clear.assert_not_called()
+        set_pw.assert_not_called()
+
+    def test_null_clears_password(self, temp_dir):
+        settings = temp_dir.replace("\\", "/") + "/"
+        with patch.object(
+            controller,
+            "clear_keystore_password",
+            return_value={"success": True, "action": "migrated_unauth"},
+        ) as clear:
+            out = controller.apply_keystore_password_change(settings, None, "api-key")
+        assert out["applied"] is True
+        assert out["success"] is True
+        assert out["requires_restart"] is True
+        assert out["action"] == "migrated_unauth"
+        clear.assert_called_once_with(settings)
+
+    def test_encrypted_string_sets_password(self, temp_dir):
+        settings = temp_dir.replace("\\", "/") + "/"
+        with patch.object(
+            controller, "_decrypt_from_server", return_value="plain-pass"
+        ), patch.object(
+            controller,
+            "set_keystore_password",
+            return_value={"success": True, "action": "migrated", "wiped": False},
+        ) as set_pw:
+            out = controller.apply_keystore_password_change(
+                settings, "encrypted-blob", "api-key"
+            )
+        assert out["applied"] is True
+        assert out["success"] is True
+        set_pw.assert_called_once_with(settings, "plain-pass")
+
+    def test_clear_failure_reports_error(self, temp_dir):
+        settings = temp_dir.replace("\\", "/") + "/"
+        with patch.object(
+            controller,
+            "clear_keystore_password",
+            return_value={"success": False, "action": "failed"},
+        ):
+            out = controller.apply_keystore_password_change(settings, None, "api-key")
+        assert out["success"] is False
+        assert "clear" in (out.get("error") or "")
+
+
 class TestUpdateLogstashEnvFileClear:
     @patch.object(controller.subprocess, "run")
     def test_clears_password_line(self, mock_run):

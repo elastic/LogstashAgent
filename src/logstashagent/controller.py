@@ -322,9 +322,10 @@ def clear_keystore_password(settings_path: str) -> dict:
     """
     Convert an authenticated keystore to unauthenticated (embedded trailer).
 
-    Ready for LogstashUI to call later; not wired into check-in protocol yet.
-    Requires the current password in agent state so secrets can be re-encrypted.
+    Invoked from check-in when GetConfigChanges returns ``keystore_password: null``
+    (policy no longer has a password; agent still reported a hash).
 
+    Requires the current password in agent state so secrets can be re-encrypted.
     Clears keystore_password from agent state and removes LOGSTASH_KEYSTORE_PASS
     from the Logstash env file.
 
@@ -383,6 +384,104 @@ def clear_keystore_password(settings_path: str) -> dict:
         logger.error(f"clear_keystore_password failed: {e}")
         logger.exception("clear_keystore_password exception details:")
         return {'success': False, 'action': 'failed'}
+
+
+def apply_keystore_password_change(
+    settings_path: str,
+    keystore_password_response,
+    api_key: str,
+) -> dict:
+    """
+    Apply the ``keystore_password`` field from GetConfigChanges.
+
+    Protocol:
+      - ``False``: no change
+      - ``None`` (JSON null): clear → unauthenticated (``clear_keystore_password``)
+      - encrypted string: set/rotate via ``set_keystore_password``
+
+    Returns:
+        dict: applied (bool), success (bool), requires_restart (bool),
+        error (str|None), action (str|None)
+    """
+    if keystore_password_response is False:
+        return {
+            'applied': False,
+            'success': True,
+            'requires_restart': False,
+            'error': None,
+            'action': None,
+        }
+
+    if keystore_password_response is None:
+        logger.info("Keystore password clear requested (policy has no password)")
+        result = clear_keystore_password(settings_path)
+        if result.get('success'):
+            logger.info(
+                "Keystore password cleared (action=%s)",
+                result.get('action'),
+            )
+            return {
+                'applied': True,
+                'success': True,
+                'requires_restart': True,
+                'error': None,
+                'action': result.get('action'),
+            }
+        return {
+            'applied': True,
+            'success': False,
+            'requires_restart': False,
+            'error': 'keystore password clear failed',
+            'action': result.get('action'),
+        }
+
+    # Encrypted password string from server
+    logger.info("Keystore password change detected")
+    try:
+        actual_password = _decrypt_from_server(api_key, keystore_password_response)
+        logger.info("Successfully decrypted new keystore password")
+        result = set_keystore_password(settings_path, actual_password)
+        if result.get('success'):
+            logger.info(
+                "Keystore password applied (action=%s, wiped=%s)",
+                result.get('action'),
+                result.get('wiped'),
+            )
+            return {
+                'applied': True,
+                'success': True,
+                'requires_restart': True,
+                'error': None,
+                'action': result.get('action'),
+            }
+        return {
+            'applied': True,
+            'success': False,
+            'requires_restart': False,
+            'error': 'keystore password apply failed',
+            'action': result.get('action'),
+        }
+    except Exception as decrypt_error:
+        logger.error(
+            "Failed to decrypt keystore password from server: %s",
+            decrypt_error,
+        )
+        keystore_file = Path(settings_path) / 'logstash.keystore'
+        try:
+            keystore_file.unlink(missing_ok=True)
+            logger.warning(
+                "Deleted keystore file - will recreate with correct password "
+                "on next successful sync"
+            )
+        except Exception as del_e:
+            logger.warning("Could not delete keystore file: %s", del_e)
+        return {
+            'applied': True,
+            'success': False,
+            'requires_restart': False,
+            'error': f'keystore_password decrypt failed: {decrypt_error}',
+            'action': 'decrypt_failed',
+        }
 
 
 # Module-level watcher — started once by run_controller(), consulted by check_in()
@@ -1611,41 +1710,33 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
                         )
                         rollout_aborted = True
 
-            # Handle keystore password change (must run BEFORE keystore key changes)
-            if not rollout_aborted:
-                keystore_password_response = changes.get('keystore_password')
-                if keystore_password_response and keystore_password_response != False:
-                    logger.info("Keystore password change detected")
-                    try:
-                        actual_password = _decrypt_from_server(api_key, keystore_password_response)
-                        logger.info("Successfully decrypted new keystore password")
-
-                        # Prefer migrate (unauth→auth or password rotate) to preserve secrets.
-                        result = set_keystore_password(settings_path, actual_password)
-                        if result.get('success'):
-                            state = agent_state.get_state()
-                            files_updated = True
+            # Handle keystore password change/clear (must run BEFORE keystore key changes)
+            # Protocol: false=no-op, null=clear to unauth, string=encrypted set/rotate
+            if not rollout_aborted and 'keystore_password' in changes:
+                pw_result = apply_keystore_password_change(
+                    settings_path,
+                    changes.get('keystore_password'),
+                    api_key,
+                )
+                if pw_result.get('applied'):
+                    if pw_result.get('success'):
+                        state = agent_state.get_state()
+                        files_updated = True
+                        if pw_result.get('requires_restart'):
                             requires_restart = True
-                            logger.info(
-                                f"Keystore password applied (action={result.get('action')}, "
-                                f"wiped={result.get('wiped')})"
-                            )
-                        else:
-                            failed_operations.append('keystore password apply failed')
+                    else:
+                        failed_operations.append(
+                            pw_result.get('error') or 'keystore password change failed'
+                        )
+                        # Decrypt failure leaves keystore deleted; still abort key writes
+                        if pw_result.get('action') != 'decrypt_failed':
                             rollout_aborted = True
-
-                    except Exception as decrypt_error:
-                        # Decrypt failed — delete the keystore file so we're in a clean
-                        # state for the next sync. Skip key changes this cycle since the
-                        # values are encrypted with the same key and will also fail.
-                        logger.error(f"Failed to decrypt keystore password from server: {decrypt_error}")
-                        failed_operations.append(f'keystore_password decrypt failed: {decrypt_error}')
-                        keystore_file = Path(settings_path) / 'logstash.keystore'
-                        try:
-                            keystore_file.unlink(missing_ok=True)
-                            logger.warning("Deleted keystore file - will recreate with correct password on next successful sync")
-                        except Exception as del_e:
-                            logger.warning(f"Could not delete keystore file: {del_e}")
+                        else:
+                            # Match prior behavior: do not hard-abort entire rollout on
+                            # decrypt fail, but skip subsequent keystore key updates
+                            # by leaving state without password (keys still attempted
+                            # only if password in state — update_keystore handles unauth).
+                            pass
 
             # Handle keystore changes — skip if keystore password is not yet in state
             # (e.g. decrypt failed this cycle; will be retried next sync)
