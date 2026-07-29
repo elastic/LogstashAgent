@@ -208,9 +208,15 @@ def normalize_agent_mode(config: dict) -> dict:
       simulation + embedded (or missing) -> embedded
       simulation + host                  -> simulate
       default|simulate|embedded          -> unchanged
+
+    When a legacy value is rewritten, sets config['_mode_legacy'] to a short
+    description of the original value (for startup logging).
     """
     if not config:
-        return {'mode': 'embedded'}
+        return {'mode': 'embedded', '_mode_legacy': '(empty config)'}
+    # Drop prior annotation if re-normalizing
+    config.pop('_mode_legacy', None)
+
     mode = str(config.get('mode', '') or '').lower()
     sim_mode = str(config.get('simulation_mode', '') or '').lower()
 
@@ -218,21 +224,50 @@ def normalize_agent_mode(config: dict) -> dict:
         config['mode'] = mode
         return config
     if mode in ('agent', 'host'):
+        config['_mode_legacy'] = mode
         config['mode'] = 'default'
         return config
     if mode == 'simulation' or mode == '':
         if sim_mode == 'host':
+            config['_mode_legacy'] = 'simulation/host' if mode == 'simulation' else 'host (via simulation_mode)'
             config['mode'] = 'simulate'
         else:
+            legacy = 'simulation/embedded' if mode == 'simulation' else (
+                f'simulation/{sim_mode}' if sim_mode else 'simulation (defaulted)'
+            )
+            if mode == '':
+                legacy = f'(empty mode; simulation_mode={sim_mode or "embedded"})'
+            config['_mode_legacy'] = legacy
             config['mode'] = 'embedded'
         return config
     # Unknown -> embedded (safest for docker-ish defaults)
+    config['_mode_legacy'] = mode or '(unknown)'
     config['mode'] = 'embedded'
     return config
 
 
+def log_resolved_agent_mode(mode: str, *, legacy: str | None = None, source: str = 'config') -> None:
+    """
+    Emit a clear startup line so operators can confirm upgraded default agents
+    without re-enrolling. Example:
+      mode=default (legacy 'agent' mapped) [config]
+    """
+    if legacy:
+        logger.info(f"mode={mode} (legacy '{legacy}' mapped) [{source}]")
+    else:
+        logger.info(f"mode={mode} [{source}]")
+
+
 # Global config
 AGENT_CONFIG = normalize_agent_mode(load_agent_config())
+if AGENT_CONFIG.get('_mode_legacy'):
+    log_resolved_agent_mode(
+        AGENT_CONFIG.get('mode', 'embedded'),
+        legacy=AGENT_CONFIG.get('_mode_legacy'),
+        source='config',
+    )
+else:
+    log_resolved_agent_mode(AGENT_CONFIG.get('mode', 'embedded'), source='config')
 
 app = FastAPI(title="logstashagent API", version="0.0.1")
 
@@ -1970,8 +2005,25 @@ if __name__ == "__main__":
         if not agent_state.get_state().get('logstash_api_port'):
             agent_state.update_state('logstash_api_port', 9560 + int(args.instance))
 
-    agent_mode = (AGENT_CONFIG.get('mode') or agent_state.get_state().get('mode') or 'embedded').lower()
-    agent_mode = normalize_agent_mode({'mode': agent_mode}).get('mode', agent_mode)
+    # Resolve effective mode: CLI > state > config (with legacy mapping)
+    state_preview = agent_state.get_state()
+    raw_mode = (
+        getattr(args, 'mode', None)
+        or state_preview.get('mode')
+        or AGENT_CONFIG.get('mode')
+        or 'embedded'
+    )
+    mode_probe = normalize_agent_mode({
+        'mode': raw_mode,
+        'simulation_mode': AGENT_CONFIG.get('simulation_mode'),
+    })
+    agent_mode = mode_probe.get('mode', 'embedded')
+    mode_legacy = mode_probe.get('_mode_legacy') or AGENT_CONFIG.get('_mode_legacy')
+    mode_source = (
+        'cli' if getattr(args, 'mode', None)
+        else ('state' if state_preview.get('mode') else 'config')
+    )
+    log_resolved_agent_mode(agent_mode, legacy=mode_legacy, source=mode_source)
 
     # Check if we're in run mode (controller for enrolled default/simulate agents)
     if args.run:
@@ -1987,6 +2039,9 @@ if __name__ == "__main__":
         else:
             logstash_api_port = AGENT_CONFIG.get('logstash_api_port', 9600)
         agent_state.update_state('api_port', logstash_api_port)
+        # Persist normalized mode so later restarts and status_blob use the new vocabulary
+        if not state.get('mode') or mode_legacy:
+            agent_state.update_state('mode', agent_mode)
         logger.info(f"Logstash API port set to {logstash_api_port} (mode={agent_mode})")
 
         if agent_mode == 'simulate':

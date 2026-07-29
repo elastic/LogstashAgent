@@ -2299,11 +2299,30 @@ def run_controller():
         logger.error("Please enroll the agent first using:")
         logger.error("  python main.py --enroll <TOKEN> --logstash-ui-url <URL>")
         return
+
+    # Confirm role for upgraded installs (no re-enroll required for default agents)
+    raw_mode = (state.get('mode') or 'default')
+    mode = str(raw_mode).lower()
+    if mode in ('agent', 'host'):
+        logger.info(f"mode=default (legacy '{mode}' mapped) [state]")
+        mode = 'default'
+        try:
+            agent_state.update_state('mode', 'default')
+        except Exception:
+            pass
+    elif mode in ('default', 'simulate', 'embedded'):
+        logger.info(f"mode={mode} [state]")
+    else:
+        logger.info(f"mode={mode} [state]")
     
     logger.info(f"Agent ID: {state.get('agent_id')}")
     logger.info(f"Connection ID: {state.get('connection_id')}")
     logger.info(f"logstashui URL: {state.get('logstash_ui_url')}")
     logger.info(f"Policy ID: {state.get('policy_id')}")
+    if state.get('instance_id') is not None:
+        logger.info(f"Simulate instance_id: {state.get('instance_id')}")
+    if state.get('logstash_unit'):
+        logger.info(f"Logstash unit: {state.get('logstash_unit')}")
     logger.info("=" * 60)
     logger.info("Starting check-in loop (every 60 seconds)")
     logger.info("Press Ctrl+C to stop")
