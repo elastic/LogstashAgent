@@ -1,0 +1,4 @@
+# Local runtime secrets and logs — never commit
+.secret_key
+*.log
+logs/
