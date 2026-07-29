@@ -1,5 +1,14 @@
 # Simulation Mode: target Implementation Plan
 
+> **ARCHIVED / ABANDONED (historical only).**  
+> Do **not** implement this plan. Product direction is **default | simulate | embedded** agent roles  
+> with enrolled Simulate policies (`lsagent-simulate@N` / `ls-simulate@N`), not `simulation_mode: target`.  
+> Kept for archaeology; see `docs/archive/README.md`.
+
+---
+
+# Simulation Mode: target Implementation Plan
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add support for `simulation_mode: target` in LogstashAgent so it can act as the control plane for a dedicated (custom-path) Logstash instance used in simulation by LogstashUI (without requiring enrollment token for now). Support CLI overrides for paths and --logstash-ui-url (boilerplate for now), extend install for target setup (skip enroll, sim-style config, non--run service), reuse existing "host" simulation_mode logic for LS management per clarifications. Full sim API parity. Minimal additive changes, TDD, no unrelated refactors.
