@@ -19,6 +19,7 @@
 - Added unit coverage for pure-Python keystore write, unauthenticated keystores, env resolution, controller password migrate paths, simulate install, and keystore sync compare-and-skip.
 - Added controller apply for `logstash_runtime` (SYSTEM vs VERSION): downloads pinned Logstash releases on policy change without re-enroll, updates simulate `LOGSTASH_BINARY` env, and restarts when the binary path changes.
 - Added `logstash-agent setup-simulate` for finishing privileged simulate materialization after non-root `--enroll`; non-root enroll tries passwordless sudo, then partial tree write, then clear deferred instructions (`simulate_setup_pending` in state).
+- Added **bare simulate recovery**: quarantine `slot*-filter*` pipelines, re-seed static `simulate-start` / `simulate-end` harness, write harness-only `pipelines.yml`, clear in-memory slots, then `systemctl restart ls-simulate@N`. CLI: `recover-simulate`; auto path on sim failure restart and a background watchdog for enrolled simulate.
 
 ### Changed
 
@@ -38,6 +39,7 @@
 - Corrected controller comments that incorrectly described merged keystore apply as a single `logstash-keystore add` invocation.
 - Enrolled simulate FastAPI no longer starts Logstash via the in-process supervisor (avoids double JVM / wrong paths); health, sim queue, and recovery restarts use the Logstash HTTP API and `systemctl restart ls-simulate@N`. Legacy UI host/embedded supervisor paths are unchanged.
 - Keystore password clear is applied on check-in (`keystore_password: null` → unauthenticated migrate + env clear), not left as a no-op when the policy password is removed.
+- Simulate crash recovery no longer restart-loops the same bad slot config: recovery rewrites to a bare harness `pipelines.yml` before restarting the unit.
 
 ### Upgrade notes
 

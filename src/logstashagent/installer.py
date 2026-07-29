@@ -431,7 +431,7 @@ def materialize_simulate_instance(policy_config: dict) -> dict:
     agent_env = root / 'agent.env'
     state_dir = root / 'state'
 
-    for d in (settings, config_dir, logs, data, state_dir, settings / 'conf.d'):
+    for d in (settings, config_dir, logs, data, state_dir, settings / 'conf.d', settings / 'config'):
         d.mkdir(parents=True, exist_ok=True)
         logger.info(f"✓ Ensured directory {d}")
 
@@ -446,6 +446,25 @@ def materialize_simulate_instance(policy_config: dict) -> dict:
             target = settings / name
             target.write_text(content if content.endswith('\n') else content + '\n', encoding='utf-8')
             logger.info(f"✓ Wrote {target}")
+
+    # Seed simulation harness (simulate-start/end) + bare pipelines.yml
+    try:
+        from logstashagent import simulate_recovery
+
+        seed = simulate_recovery.seed_static_harness(settings, force=False)
+        if seed.get('ok'):
+            if not (settings / 'pipelines.yml').is_file():
+                simulate_recovery.write_bare_pipelines_yml(settings)
+                logger.info("✓ Wrote bare simulate pipelines.yml (harness only)")
+            else:
+                logger.info("✓ Simulate harness confs ready (pipelines.yml already present)")
+        else:
+            logger.warning(
+                "Could not seed full simulate harness: %s",
+                seed.get('missing_src'),
+            )
+    except Exception as e:
+        logger.warning("Simulate harness seed during materialize failed: %s", e)
 
     binary = resolve_binary_from_policy(
         logstash_source=policy_config.get('logstash_source') or 'SYSTEM',

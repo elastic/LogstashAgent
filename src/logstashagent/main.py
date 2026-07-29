@@ -18,6 +18,7 @@ _SKIP_SIMULATION_IMPORTS = (
     or 'uninstall' in sys.argv
     or 'configure' in sys.argv
     or 'setup-simulate' in sys.argv
+    or 'recover-simulate' in sys.argv
 )
 
 from fastapi import FastAPI, HTTPException, Path as FastAPIPath, Query, Request
@@ -367,20 +368,76 @@ def trigger_sim_logstash_restart(reason: str = 'Manual restart') -> bool:
     """
     Restart Logstash for sim failure recovery.
 
-    Systemctl-managed simulate uses ``controller.restart_logstash`` (ls-simulate@N).
-    Embedded / legacy host uses the in-process supervisor.
+    Systemctl-managed simulate: bare recovery (quarantine slot pipelines,
+    re-seed simulate-start/end harness, bare pipelines.yml) then
+    ``systemctl restart ls-simulate@N``.
+
+    Embedded / legacy host: in-process supervisor restart (still clears slots).
     """
     global _sim_systemctl_restart_count
     if is_systemctl_managed_simulate():
         logger.warning(
-            "Triggering systemctl restart of simulate Logstash: %s", reason
+            "Simulate recovery restart (bare pipelines + systemctl): %s", reason
         )
-        ok = bool(controller.restart_logstash())
+        from logstashagent import simulate_recovery
+
+        result = simulate_recovery.recover_simulate_logstash(
+            reason=reason,
+            restart=True,
+            agent_config=AGENT_CONFIG,
+        )
+        ok = bool(result.get('success') and result.get('restarted'))
         if ok:
             _sim_systemctl_restart_count += 1
+        elif result.get('denied'):
+            logger.error("Simulate recovery denied: %s", result.get('error'))
         return ok
+
+    # Embedded / legacy host supervisor path — clear slots before process restart
+    try:
+        if not _SKIP_SIMULATION_IMPORTS:
+            slots.evict_all_slots_and_cleanup()
+    except Exception as e:
+        logger.warning("Slot cleanup before supervisor restart failed: %s", e)
     logstash_supervisor.trigger_restart(reason)
     return True
+
+
+def _simulate_watchdog_loop():
+    """
+    Background probe for enrolled simulate: after consecutive unhealthy
+    checks, run bare recovery + systemctl restart.
+    """
+    failures = 0
+    while True:
+        try:
+            time.sleep(10)
+            if not is_systemctl_managed_simulate():
+                failures = 0
+                continue
+            health = check_sim_logstash_health()
+            if health.get('healthy'):
+                failures = 0
+                continue
+            failures += 1
+            logger.warning(
+                "Simulate watchdog: Logstash unhealthy (failures=%s via=%s)",
+                failures,
+                health.get('via'),
+            )
+            if failures >= 3:
+                logger.error(
+                    "Simulate watchdog: triggering bare recovery after %s failures",
+                    failures,
+                )
+                trigger_sim_logstash_restart(
+                    f"watchdog: unhealthy {failures} consecutive checks"
+                )
+                failures = 0
+                time.sleep(60)  # post-recovery cool-down
+        except Exception as e:
+            logger.error("Simulate watchdog error: %s", e, exc_info=True)
+            time.sleep(15)
 
 
 def _atexit_shutdown_supervisor():
@@ -422,6 +479,27 @@ async def startup_event():
             "(ls-simulate@); skip supervisor (API port %s)",
             port,
         )
+        # Ensure static harness exists under instance settings (idempotent)
+        try:
+            from logstashagent import simulate_recovery
+
+            settings = simulate_recovery.resolve_settings_path(
+                agent_config=AGENT_CONFIG
+            )
+            simulate_recovery.seed_static_harness(settings, force=False)
+            yml = settings / 'pipelines.yml'
+            if not yml.is_file():
+                simulate_recovery.write_bare_pipelines_yml(settings)
+                logger.info("Wrote initial bare pipelines.yml for simulate instance")
+        except Exception as e:
+            logger.warning("Could not seed simulate harness on startup: %s", e)
+        # Watchdog: bare recovery if Logstash stays unhealthy
+        threading.Thread(
+            target=_simulate_watchdog_loop,
+            name='simulate-watchdog',
+            daemon=True,
+        ).start()
+        logger.info("Simulate watchdog thread started")
     else:
         logger.info("FastAPI startup - initializing Logstash supervisor")
         logstash_supervisor.start_supervised_logstash(config=AGENT_CONFIG)
@@ -2079,6 +2157,9 @@ Examples:
   # Finish simulate materialization after non-root --enroll
   sudo logstash-agent setup-simulate
 
+  # Bare recovery: quarantine slot pipelines, re-seed harness, restart ls-simulate@N
+  sudo logstash-agent recover-simulate --yes
+
   # Upgrade agent to a new version
   logstash-agent upgrade --version 0.1.4
 
@@ -2154,6 +2235,27 @@ Examples:
         '--yes',
         action='store_true',
         help='Skip confirmation prompt'
+    )
+
+    # recover-simulate: bare pipeline recovery after crash / bad slot config
+    recover_sim_parser = subparsers.add_parser(
+        'recover-simulate',
+        help='Quarantine slot pipelines, re-seed simulate harness, restart ls-simulate@N'
+    )
+    recover_sim_parser.add_argument(
+        '--yes',
+        action='store_true',
+        help='Skip confirmation prompt'
+    )
+    recover_sim_parser.add_argument(
+        '--no-restart',
+        action='store_true',
+        help='Sanitize pipelines only (do not systemctl restart)'
+    )
+    recover_sim_parser.add_argument(
+        '--force',
+        action='store_true',
+        help='Bypass recovery rate limits'
     )
 
     # Upgrade command
@@ -2300,6 +2402,41 @@ if __name__ == "__main__":
             sys.exit(1)
         except Exception as e:
             logger.error(f"Unexpected setup-simulate error: {e}", exc_info=True)
+            sys.exit(1)
+
+    # Bare recovery for simulate instance (quarantine slots + harness + restart)
+    if args.command == 'recover-simulate':
+        try:
+            from logstashagent import simulate_recovery
+
+            if not getattr(args, 'yes', False):
+                print(
+                    "\nThis will quarantine dynamic slot*-filter* pipelines, "
+                    "re-seed simulate-start/end, write a bare pipelines.yml, "
+                    "and restart ls-simulate@N (unless --no-restart)."
+                )
+                answer = input("Continue? [y/N]: ").strip().lower()
+                if answer != 'y':
+                    print("recover-simulate cancelled.")
+                    sys.exit(0)
+            result = simulate_recovery.recover_simulate_logstash(
+                reason='cli recover-simulate',
+                restart=not getattr(args, 'no_restart', False),
+                force=getattr(args, 'force', False),
+                agent_config=AGENT_CONFIG,
+            )
+            if not result.get('success'):
+                logger.error("recover-simulate failed: %s", result.get('error'))
+                sys.exit(1)
+            logger.info(
+                "recover-simulate ok layout=%s restarted=%s quarantine=%s",
+                result.get('layout'),
+                result.get('restarted'),
+                (result.get('quarantine') or {}).get('quarantine_dir'),
+            )
+            sys.exit(0)
+        except Exception as e:
+            logger.error(f"Unexpected recover-simulate error: {e}", exc_info=True)
             sys.exit(1)
 
     # Check if we're in uninstall mode

@@ -121,15 +121,17 @@ class TestCheckSimLogstashHealth:
 
 
 class TestTriggerSimLogstashRestart:
-    def test_systemctl_uses_controller(self):
-        with patch.object(main, "is_systemctl_managed_simulate", return_value=True), patch.object(
-            main.controller, "restart_logstash", return_value=True
-        ) as restart, patch.object(
+    def test_systemctl_uses_bare_recovery(self):
+        with patch.object(main, "is_systemctl_managed_simulate", return_value=True), patch(
+            "logstashagent.simulate_recovery.recover_simulate_logstash",
+            return_value={"success": True, "restarted": True},
+        ) as recover, patch.object(
             main.logstash_supervisor, "trigger_restart"
         ) as trig:
             main._sim_systemctl_restart_count = 0
             assert main.trigger_sim_logstash_restart("oom") is True
-            restart.assert_called_once()
+            recover.assert_called_once()
+            assert recover.call_args.kwargs.get("restart") is True
             trig.assert_not_called()
             assert main._sim_systemctl_restart_count == 1
 
