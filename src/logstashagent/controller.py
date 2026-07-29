@@ -77,17 +77,21 @@ def _record_last_apply(source, success, failed_operations, revision=None):
 _LOGSTASH_ENV_FILE = Path('/etc/default/logstash')
 
 
-def update_logstash_env_file(password: str) -> None:
+def update_logstash_env_file(password: Optional[str]) -> None:
     """
-    Write (or update) LOGSTASH_KEYSTORE_PASS in /etc/default/logstash so that
-    the Logstash systemd service can open the password-protected keystore on startup.
+    Write, update, or clear LOGSTASH_KEYSTORE_PASS in /etc/default/logstash.
+
+    When ``password`` is a non-empty string, the variable is set so the Logstash
+    systemd service can open a password-protected keystore on startup.
+    When ``password`` is None or empty, any existing LOGSTASH_KEYSTORE_PASS line
+    is removed (unauthenticated / trailer keystores).
 
     Uses sudo tee/cat as configured in /etc/sudoers.d/logstash-agent since the agent
     runs as the logstash user and /etc/default/logstash is root-owned.
-    
+
     The file is written with mode 0o640 so that Logstash (running as the
     logstash user/group) can read it but unprivileged users cannot.
-    
+
     Raises:
         FileNotFoundError: If /etc/default/logstash doesn't exist
         OSError: If unable to read or write the file
@@ -124,9 +128,13 @@ def update_logstash_env_file(password: str) -> None:
         logger.error(f"Failed to read {_LOGSTASH_ENV_FILE}: {e}")
         raise
 
-    # Filter out any existing LOGSTASH_KEYSTORE_PASS line and add the new one
+    # Drop any existing LOGSTASH_KEYSTORE_PASS line; re-add only when setting a password
     filtered = [ln for ln in existing_lines if not ln.startswith(f'{var_name}=')]
-    filtered.append(f'{var_name}={password}')
+    if password:
+        filtered.append(f'{var_name}={password}')
+        logger.info(f"Setting {var_name} in {_LOGSTASH_ENV_FILE}")
+    else:
+        logger.info(f"Clearing {var_name} from {_LOGSTASH_ENV_FILE} (unauthenticated keystore)")
 
     content = '\n'.join(filtered) + '\n'
     
@@ -160,6 +168,194 @@ def update_logstash_env_file(password: str) -> None:
     except Exception as e:
         logger.error(f"Failed to write {_LOGSTASH_ENV_FILE}: {e}")
         raise
+
+
+def ensure_keystore(settings_path: str, password: Optional[str] = None) -> LogstashKeystore:
+    """
+    Load an existing keystore or create one in the requested password mode.
+
+    Args:
+        settings_path: Logstash settings directory (path.settings).
+        password: Explicit password for authenticated mode, or None for an
+            unauthenticated (default-password trailer) keystore.
+
+    Returns:
+        Loaded or newly created LogstashKeystore instance.
+    """
+    if settings_path:
+        settings_path = settings_path.replace('\\', '/')
+    if not settings_path.endswith('/'):
+        settings_path = settings_path + '/'
+
+    keystore_file = Path(settings_path) / 'logstash.keystore'
+    if keystore_file.exists():
+        return LogstashKeystore.load(path_settings=settings_path, password=password)
+    mode = "authenticated" if password else "unauthenticated"
+    logger.info(f"Creating {mode} keystore at {settings_path}")
+    return LogstashKeystore.create(path_settings=settings_path, password=password)
+
+
+def set_keystore_password(settings_path: str, new_password: str) -> dict:
+    """
+    Apply an authenticated keystore password, preferring secret-preserving migrate.
+
+    - Existing unauthenticated keystore: migrate_to_authenticated (keeps secrets).
+    - Existing authenticated keystore with known agent password: migrate in place.
+    - No keystore file: create authenticated empty keystore.
+    - Authenticated file that cannot be opened: wipe and recreate (secrets lost).
+
+    Updates agent state (keystore_password, keystore_password_hash) and
+    LOGSTASH_KEYSTORE_PASS in the Logstash env file.
+
+    Args:
+        settings_path: Logstash settings directory.
+        new_password: Non-empty password to apply.
+
+    Returns:
+        dict with keys: success (bool), wiped (bool), action (str).
+
+    Raises:
+        ValueError: If new_password is empty.
+    """
+    if not new_password:
+        raise ValueError("new_password must be a non-empty string")
+
+    if settings_path:
+        settings_path = settings_path.replace('\\', '/')
+    if not settings_path.endswith('/'):
+        settings_path = settings_path + '/'
+
+    keystore_file = Path(settings_path) / 'logstash.keystore'
+    state = agent_state.get_state()
+    current_password = state.get('keystore_password') or None
+    wiped = False
+    action = 'none'
+
+    try:
+        if keystore_file.exists():
+            # Prefer opening as unauthenticated (trailer) first when we have no
+            # stored password — common path when server first sets a password.
+            try:
+                if current_password:
+                    ks = LogstashKeystore.load(
+                        path_settings=settings_path, password=current_password
+                    )
+                else:
+                    ks = LogstashKeystore.load(
+                        path_settings=settings_path, password=None
+                    )
+                ks.migrate_to_authenticated(new_password)
+                action = 'migrated'
+                logger.info("Migrated keystore to authenticated password (secrets preserved)")
+            except Exception as open_err:
+                logger.warning(
+                    f"Could not migrate existing keystore ({open_err}); "
+                    "recreating authenticated keystore (secrets will be wiped)"
+                )
+                try:
+                    keystore_file.unlink(missing_ok=True)
+                except Exception as del_e:
+                    logger.error(f"Failed to delete keystore for recreate: {del_e}")
+                    return {'success': False, 'wiped': False, 'action': 'failed'}
+                LogstashKeystore.create(
+                    path_settings=settings_path, password=new_password
+                )
+                wiped = True
+                action = 'recreated'
+        else:
+            LogstashKeystore.create(path_settings=settings_path, password=new_password)
+            action = 'created'
+            logger.info("Created new authenticated keystore")
+
+        new_hash = hashlib.sha256(new_password.encode('utf-8')).hexdigest()
+        agent_state.update_state('keystore_password', new_password)
+        agent_state.update_state('keystore_password_hash', new_hash)
+
+        if wiped and state.get('snmp_keystore'):
+            agent_state.update_state('snmp_keystore', {})
+            logger.info(
+                "Cleared SNMP keystore state after password recreate; "
+                "SNMP keys will be re-provisioned on next check-in"
+            )
+
+        try:
+            update_logstash_env_file(new_password)
+        except Exception as env_err:
+            logger.warning(f"Keystore password applied but env file update failed: {env_err}")
+
+        return {'success': True, 'wiped': wiped, 'action': action}
+    except Exception as e:
+        logger.error(f"set_keystore_password failed: {e}")
+        logger.exception("set_keystore_password exception details:")
+        return {'success': False, 'wiped': wiped, 'action': 'failed'}
+
+
+def clear_keystore_password(settings_path: str) -> dict:
+    """
+    Convert an authenticated keystore to unauthenticated (embedded trailer).
+
+    Ready for LogstashUI to call later; not wired into check-in protocol yet.
+    Requires the current password in agent state so secrets can be re-encrypted.
+
+    Clears keystore_password from agent state and removes LOGSTASH_KEYSTORE_PASS
+    from the Logstash env file.
+
+    Args:
+        settings_path: Logstash settings directory.
+
+    Returns:
+        dict with keys: success (bool), action (str).
+    """
+    if settings_path:
+        settings_path = settings_path.replace('\\', '/')
+    if not settings_path.endswith('/'):
+        settings_path = settings_path + '/'
+
+    state = agent_state.get_state()
+    current_password = state.get('keystore_password') or None
+    keystore_file = Path(settings_path) / 'logstash.keystore'
+
+    try:
+        if not keystore_file.exists():
+            ensure_keystore(settings_path, password=None)
+            agent_state.update_state('keystore_password', None)
+            agent_state.update_state('keystore_password_hash', '')
+            try:
+                update_logstash_env_file(None)
+            except Exception as env_err:
+                logger.warning(f"Unauth keystore ready but env clear failed: {env_err}")
+            return {'success': True, 'action': 'created_unauth'}
+
+        if current_password:
+            ks = LogstashKeystore.load(
+                path_settings=settings_path, password=current_password
+            )
+        else:
+            # Already unauthenticated
+            ks = LogstashKeystore.load(path_settings=settings_path, password=None)
+            if ks.uses_embedded_password:
+                agent_state.update_state('keystore_password', None)
+                agent_state.update_state('keystore_password_hash', '')
+                try:
+                    update_logstash_env_file(None)
+                except Exception:
+                    pass
+                return {'success': True, 'action': 'already_unauth'}
+
+        ks.migrate_to_unauthenticated()
+        agent_state.update_state('keystore_password', None)
+        agent_state.update_state('keystore_password_hash', '')
+        try:
+            update_logstash_env_file(None)
+        except Exception as env_err:
+            logger.warning(f"Migrated to unauth but env clear failed: {env_err}")
+        logger.info("Migrated keystore to unauthenticated mode (secrets preserved)")
+        return {'success': True, 'action': 'migrated_unauth'}
+    except Exception as e:
+        logger.error(f"clear_keystore_password failed: {e}")
+        logger.exception("clear_keystore_password exception details:")
+        return {'success': False, 'action': 'failed'}
+
 
 # Module-level watcher — started once by run_controller(), consulted by check_in()
 _log_watcher: Optional[log_analyzer.LogstashLogWatcher] = None
@@ -1215,65 +1411,24 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
             if not rollout_aborted:
                 keystore_password_response = changes.get('keystore_password')
                 if keystore_password_response and keystore_password_response != False:
-                    logger.info("Keystore password change detected - recreating keystore")
+                    logger.info("Keystore password change detected")
                     try:
                         actual_password = _decrypt_from_server(api_key, keystore_password_response)
-                        new_hash = hashlib.sha256(actual_password.encode('utf-8')).hexdigest()
                         logger.info("Successfully decrypted new keystore password")
 
-                        # Delete the keystore file directly — no need to load/decrypt the old one
-                        # Note: /etc/logstash is owned by logstash:logstash (set during install)
-                        keystore_file = Path(settings_path) / 'logstash.keystore'
-                        
-                        if keystore_file.exists():
-                            try:
-                                keystore_file.unlink(missing_ok=True)
-                                logger.info("Deleted existing keystore file")
-                            except PermissionError as del_e:
-                                logger.error(f"Permission denied deleting keystore: {del_e}")
-                                logger.error(f"Directory ownership issue on {settings_path}")
-                                logger.error("This should have been fixed during installation.")
-                                logger.error("Manual fix required:")
-                                logger.error(f"  sudo chown -R logstash:logstash {settings_path}")
-                                failed_operations.append(f'keystore deletion failed (permission denied): {del_e}')
-                                rollout_aborted = True
-                            except Exception as del_e:
-                                logger.error(f"Could not delete keystore file: {del_e}")
-                                failed_operations.append(f'keystore deletion failed: {del_e}')
-                                rollout_aborted = True
+                        # Prefer migrate (unauth→auth or password rotate) to preserve secrets.
+                        result = set_keystore_password(settings_path, actual_password)
+                        if result.get('success'):
+                            state = agent_state.get_state()
+                            files_updated = True
+                            requires_restart = True
+                            logger.info(
+                                f"Keystore password applied (action={result.get('action')}, "
+                                f"wiped={result.get('wiped')})"
+                            )
                         else:
-                            logger.info("Keystore file does not exist, will create new one")
-
-                        # Only attempt creation if we didn't abort due to permission issues
-                        if not rollout_aborted:
-                            try:
-                                LogstashKeystore.create(path_settings=settings_path, password=actual_password)
-                                logger.info("Created new keystore with updated password")
-                                agent_state.update_state('keystore_password', actual_password)
-                                agent_state.update_state('keystore_password_hash', new_hash)
-                                # Rebuilding the keystore wipes ALL keys, including the
-                                # SNMP-managed keys that arrive on the separate check-in
-                                # channel (they are intentionally excluded from this
-                                # policy-channel rebuild). Clear our SNMP keystore
-                                # hash-state so the next check-in reports them missing and
-                                # the server re-provisions this agent's SNMP keys.
-                                # Without this, the physical keystore would be permanently
-                                # missing SNMP secrets until an unrelated SNMP change.
-                                if state.get('snmp_keystore'):
-                                    agent_state.update_state('snmp_keystore', {})
-                                    logger.info(
-                                        "Cleared SNMP keystore state after password rebuild; "
-                                        "SNMP keys will be re-provisioned on next check-in"
-                                    )
-                                state = agent_state.get_state()
-                                update_logstash_env_file(actual_password)
-                                files_updated = True
-                                requires_restart = True
-                            except Exception as create_error:
-                                logger.error(f"Failed to create keystore: {create_error}")
-                                logger.exception("Keystore creation exception details:")
-                                failed_operations.append(f'keystore creation failed: {create_error}')
-                                rollout_aborted = True
+                            failed_operations.append('keystore password apply failed')
+                            rollout_aborted = True
 
                     except Exception as decrypt_error:
                         # Decrypt failed — delete the keystore file so we're in a clean

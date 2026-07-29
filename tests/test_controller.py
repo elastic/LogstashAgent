@@ -835,3 +835,79 @@ class TestUpdatePipelines:
             result = controller.update_pipelines(settings, changes)
         
         assert result is False
+
+
+class TestSetKeystorePassword:
+    def test_migrates_unauth_to_auth_preserving_secrets(self, temp_dir):
+        settings = temp_dir.replace("\\", "/") + "/"
+        from logstashagent.ls_keystore_utils import LogstashKeystore
+        ks = LogstashKeystore.create(settings, password=None, exepath=None)
+        ks.add_key("keep", "secret-value")
+
+        with patch.object(controller.agent_state, "get_state", return_value={}), patch.object(
+            controller.agent_state, "update_state"
+        ) as update_state, patch.object(controller, "update_logstash_env_file") as env_upd:
+            result = controller.set_keystore_password(settings, "NewAuthPass")
+
+        assert result["success"] is True
+        assert result["wiped"] is False
+        assert result["action"] == "migrated"
+        env_upd.assert_called_once_with("NewAuthPass")
+        # Password stored in state
+        keys = [c[0][0] for c in update_state.call_args_list]
+        assert "keystore_password" in keys
+        loaded = LogstashKeystore.load(settings, password="NewAuthPass", exepath=None)
+        assert loaded.get_key("keep") == "secret-value"
+        assert loaded.uses_embedded_password is False
+
+    def test_creates_when_missing(self, temp_dir):
+        settings = temp_dir.replace("\\", "/") + "/"
+        with patch.object(controller.agent_state, "get_state", return_value={}), patch.object(
+            controller.agent_state, "update_state"
+        ), patch.object(controller, "update_logstash_env_file"):
+            result = controller.set_keystore_password(settings, "pass123")
+        assert result["success"] is True
+        assert result["action"] == "created"
+        from logstashagent.ls_keystore_utils import LogstashKeystore
+        loaded = LogstashKeystore.load(settings, password="pass123", exepath=None)
+        assert loaded.uses_embedded_password is False
+
+    def test_clear_keystore_password_api(self, temp_dir):
+        settings = temp_dir.replace("\\", "/") + "/"
+        from logstashagent.ls_keystore_utils import LogstashKeystore
+        LogstashKeystore.create(settings, password="authpass", exepath=None)
+        with patch.object(
+            controller.agent_state,
+            "get_state",
+            return_value={"keystore_password": "authpass"},
+        ), patch.object(controller.agent_state, "update_state"), patch.object(
+            controller, "update_logstash_env_file"
+        ) as env_upd:
+            result = controller.clear_keystore_password(settings)
+        assert result["success"] is True
+        assert result["action"] == "migrated_unauth"
+        env_upd.assert_called_once_with(None)
+        loaded = LogstashKeystore.load(settings, password=None, exepath=None)
+        assert loaded.uses_embedded_password is True
+
+
+class TestUpdateLogstashEnvFileClear:
+    @patch.object(controller.subprocess, "run")
+    def test_clears_password_line(self, mock_run):
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="FOO=1\nLOGSTASH_KEYSTORE_PASS=old\n", stderr=""),
+            MagicMock(returncode=0, stdout="", stderr=""),
+            MagicMock(returncode=0, stdout="", stderr=""),
+        ]
+        with patch.object(controller.Path, "exists", return_value=True):
+            # Path.exists is used on _LOGSTASH_ENV_FILE via instance — patch the file
+            with patch.object(controller, "_LOGSTASH_ENV_FILE", Path("/tmp/fake-default-logstash")):
+                Path("/tmp/fake-default-logstash").write_text("x")
+                controller.update_logstash_env_file(None)
+        # Second call is sudo tee with content without LOGSTASH_KEYSTORE_PASS
+        tee_call = mock_run.call_args_list[1]
+        assert tee_call[1].get("input") is not None or (tee_call[0] and True)
+        # input= content
+        written = mock_run.call_args_list[1].kwargs.get("input") or ""
+        assert "LOGSTASH_KEYSTORE_PASS" not in written
+        assert "FOO=1" in written
