@@ -104,3 +104,35 @@ def test_ensure_logstash_version_idempotent_extract(tmp_path):
 def test_empty_version_raises():
     with pytest.raises(ld.LogstashDownloadError):
         ld.ensure_logstash_version("")
+
+
+def test_list_installed_versions(tmp_path):
+    v = "9.4.3"
+    binary = tmp_path / v / "bin" / "logstash"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    found = ld.list_installed_versions(str(tmp_path))
+    assert len(found) == 1
+    assert found[0]["version"] == v
+    assert found[0]["binary"] == str(binary)
+    table = ld.format_versions_table(found)
+    assert v in table
+
+
+def test_prune_versions_keeps_used(tmp_path, monkeypatch):
+    for v in ("9.4.3", "8.19.0"):
+        b = tmp_path / v / "bin" / "logstash"
+        b.parent.mkdir(parents=True)
+        b.write_text("x", encoding="utf-8")
+
+    monkeypatch.setattr(
+        ld,
+        "collect_in_use_versions",
+        lambda *a, **k: {"9.4.3"},
+    )
+    result = ld.prune_versions(str(tmp_path), keep=set(), keep_used=True, dry_run=False)
+    assert "8.19.0" in result["removed"]
+    assert "9.4.3" in result["kept"]
+    assert (tmp_path / "9.4.3").is_dir()
+    assert not (tmp_path / "8.19.0").exists()

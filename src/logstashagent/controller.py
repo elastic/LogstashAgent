@@ -490,9 +490,9 @@ _log_watcher: Optional[log_analyzer.LogstashLogWatcher] = None
 
 def update_env_logstash_binary(env_file: Optional[str], binary: str) -> bool:
     """
-    Set or replace LOGSTASH_BINARY= in a simulate instance env file
-    (e.g. /opt/logstash-agent/simulate-N/env) without using sudo when the
-    agent owns the tree.
+    Set or replace LOGSTASH_BINARY= in a multi-instance env file
+    (e.g. /opt/logstash-agent/simulate-N/env or managed-N/env) without sudo
+    when the agent owns the tree.
     """
     if not env_file or not binary:
         return False
@@ -521,7 +521,7 @@ def apply_logstash_runtime(runtime: dict) -> dict:
     Apply policy Logstash binary source (SYSTEM vs VERSION download).
 
     Downloads VERSION artifacts when needed, updates agent state and the
-    simulate instance EnvironmentFile LOGSTASH_BINARY line.
+    multi-instance EnvironmentFile LOGSTASH_BINARY line (simulate + managed).
 
     Returns:
         dict: success (bool), requires_restart (bool), binary (str|None),
@@ -531,6 +531,7 @@ def apply_logstash_runtime(runtime: dict) -> dict:
         resolve_binary_from_policy,
         LogstashDownloadError,
         DEFAULT_DOWNLOAD_ROOT,
+        normalize_download_dir,
     )
 
     if not runtime or runtime is False:
@@ -545,7 +546,9 @@ def apply_logstash_runtime(runtime: dict) -> dict:
 
     source = (runtime.get('source') or 'SYSTEM').upper()
     version = (runtime.get('version') or '').strip()
-    download_dir = (runtime.get('download_dir') or DEFAULT_DOWNLOAD_ROOT).strip()
+    download_dir = normalize_download_dir(
+        (runtime.get('download_dir') or DEFAULT_DOWNLOAD_ROOT).strip()
+    )
     binary_path = runtime.get('binary_path') or '/usr/share/logstash/bin'
 
     logger.info(
@@ -585,22 +588,80 @@ def apply_logstash_runtime(runtime: dict) -> dict:
     # State binary_path is historically a directory used for existence checks
     bin_dir = str(Path(binary).parent) if Path(binary).name in ('logstash', 'logstash.bat') else binary
 
-    prev_binary = agent_state.get_state().get('logstash_binary') or agent_state.get_state().get('binary_path')
+    prev_state = agent_state.get_state() or {}
+    prev_binary = prev_state.get('logstash_binary') or ''
+    prev_source = (prev_state.get('logstash_source') or 'SYSTEM').upper()
+    prev_version = (prev_state.get('logstash_version') or '').strip()
+
     agent_state.update_state('logstash_source', source)
     agent_state.update_state('logstash_version', version)
     agent_state.update_state('logstash_download_dir', download_dir)
     agent_state.update_state('binary_path', bin_dir)
     agent_state.update_state('logstash_binary', binary)
-    if version:
+    if source == 'VERSION' and version:
         agent_state.update_state('logstash_version_resolved', version)
+    elif source == 'SYSTEM':
+        # Clear resolved pin so UI does not show a stale VERSION
+        agent_state.update_state('logstash_version_resolved', '')
 
-    state = agent_state.get_state()
+    state = agent_state.get_state() or {}
     env_file = state.get('keystore_env_file')
     mode = (state.get('mode') or '').lower()
-    if mode == 'simulate' or (env_file and str(env_file).endswith('/env')):
-        update_env_logstash_binary(env_file, binary)
+    # Multi-instance units (simulate + managed) read LOGSTASH_BINARY from */env
+    if mode in ('simulate', 'managed') or (env_file and str(env_file).endswith('/env')):
+        if env_file:
+            update_env_logstash_binary(env_file, binary)
 
-    requires_restart = (str(prev_binary) != binary) if prev_binary else True
+    # Track VERSION install in host registry (best-effort)
+    if source == 'VERSION' and version:
+        try:
+            from logstashagent import install_registry as _reg
+
+            _reg.register_logstash_version(
+                version=version,
+                binary=binary,
+                download_dir=download_dir,
+                used_by=state.get('agent_id') or state.get('deployment_id'),
+            )
+            # Also stamp current instance entry when known
+            role = mode if mode in ('managed', 'simulate') else None
+            iid = state.get('instance_id')
+            if role and iid is not None:
+                key = _reg.instance_key(role, int(iid))
+                reg = _reg.load_registry()
+                inst = (reg.get('instances') or {}).get(key)
+                if inst:
+                    inst['logstash_source'] = 'VERSION'
+                    inst['logstash_version'] = version
+                    inst['logstash_binary'] = binary
+                    reg['instances'][key] = inst
+                    _reg.save_registry(reg)
+        except Exception as e:
+            logger.debug("Could not record VERSION in install registry: %s", e)
+
+    requires_restart = (
+        str(prev_binary) != binary
+        or prev_source != source
+        or (source == 'VERSION' and prev_version != version)
+    )
+    if not prev_binary and not prev_version and source == 'SYSTEM':
+        # First apply of same default system path — still restart if unit never
+        # picked up env; prefer restart on first runtime apply for multi-instance.
+        requires_restart = mode in ('simulate', 'managed') or requires_restart
+
+    from datetime import datetime, timezone
+
+    agent_state.update_state(
+        'last_runtime_apply',
+        {
+            'source': source,
+            'version': version or None,
+            'binary': binary,
+            'requires_restart': requires_restart,
+            'at': datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
     logger.info(
         "Logstash runtime applied: binary=%s requires_restart=%s",
         binary, requires_restart,
@@ -2370,7 +2431,17 @@ def check_in():
             'binaries': binaries,
             'log_file': log_info,
             'problems': '\n'.join(problems) if problems else None,
-            'agent_version': state.get('agent_version', '0.0.0+unknown')
+            'agent_version': state.get('agent_version', '0.0.0+unknown'),
+            # VERSION lifecycle — UI surfaces resolved pin on connections / sim targets
+            'mode': state.get('mode'),
+            'logstash_source': state.get('logstash_source') or 'SYSTEM',
+            'logstash_version': state.get('logstash_version') or '',
+            'logstash_version_resolved': state.get('logstash_version_resolved')
+            or state.get('logstash_version')
+            or '',
+            'logstash_binary': state.get('logstash_binary') or '',
+            'logstash_download_dir': state.get('logstash_download_dir') or '',
+            'last_runtime_apply': state.get('last_runtime_apply'),
         }
 
         api_port = state.get('api_port', 9600)

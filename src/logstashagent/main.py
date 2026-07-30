@@ -2280,6 +2280,68 @@ Examples:
         dest='list_json',
         help='Emit JSON instead of a table'
     )
+
+    # VERSION binary lifecycle
+    list_ver_parser = subparsers.add_parser(
+        'list-versions',
+        help='List Logstash versions under the download root (VERSION source cache)'
+    )
+    list_ver_parser.add_argument(
+        '--download-dir',
+        default=None,
+        help='Override download root (default: /opt/logstash-agent/logstash-versions)'
+    )
+    list_ver_parser.add_argument(
+        '--json',
+        action='store_true',
+        dest='list_versions_json',
+        help='Emit JSON instead of a table'
+    )
+
+    ensure_ver_parser = subparsers.add_parser(
+        'ensure-version',
+        help='Download/extract a Logstash VERSION for multi-instance agents'
+    )
+    ensure_ver_parser.add_argument(
+        'version',
+        help='Logstash version to ensure (e.g. 9.4.3)'
+    )
+    ensure_ver_parser.add_argument(
+        '--download-dir',
+        default=None,
+        help='Override download root'
+    )
+    ensure_ver_parser.add_argument(
+        '--force',
+        action='store_true',
+        help='Re-download even if already present'
+    )
+
+    prune_ver_parser = subparsers.add_parser(
+        'prune-versions',
+        help='Remove unused Logstash VERSION trees from the download root'
+    )
+    prune_ver_parser.add_argument(
+        '--download-dir',
+        default=None,
+        help='Override download root'
+    )
+    prune_ver_parser.add_argument(
+        '--keep',
+        action='append',
+        default=[],
+        help='Version to keep (repeatable); always keeps in-use versions'
+    )
+    prune_ver_parser.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='Show what would be removed without deleting'
+    )
+    prune_ver_parser.add_argument(
+        '--yes',
+        action='store_true',
+        help='Skip confirmation prompt'
+    )
     
     # Configure command
     configure_parser = subparsers.add_parser(
@@ -2533,6 +2595,92 @@ if __name__ == "__main__":
             sys.exit(0)
         except Exception as e:
             logger.error(f"list-instances failed: {e}", exc_info=True)
+            sys.exit(1)
+
+    # VERSION cache management
+    if args.command == 'list-versions':
+        try:
+            from logstashagent import logstash_download as _ld
+
+            root = args.download_dir or _ld.DEFAULT_DOWNLOAD_ROOT
+            versions = _ld.list_installed_versions(root)
+            used = _ld.collect_in_use_versions(root)
+            if getattr(args, 'list_versions_json', False):
+                print(json.dumps({
+                    'download_root': root,
+                    'versions': versions,
+                    'in_use': sorted(used),
+                }, indent=2))
+            else:
+                print(f"Download root: {root}")
+                if used:
+                    print(f"In use: {', '.join(sorted(used))}")
+                print()
+                print(_ld.format_versions_table(versions))
+            sys.exit(0)
+        except Exception as e:
+            logger.error(f"list-versions failed: {e}", exc_info=True)
+            sys.exit(1)
+
+    if args.command == 'ensure-version':
+        try:
+            from logstashagent import logstash_download as _ld
+            from logstashagent import install_registry as _reg
+
+            root = args.download_dir or _ld.DEFAULT_DOWNLOAD_ROOT
+            binary = _ld.ensure_logstash_version(
+                args.version,
+                root,
+                force=bool(args.force),
+            )
+            try:
+                _reg.register_logstash_version(
+                    version=args.version,
+                    binary=str(binary),
+                    download_dir=root,
+                )
+            except Exception as reg_err:
+                logger.warning("Registry update failed (version still on disk): %s", reg_err)
+            print(f"Logstash {args.version} ready: {binary}")
+            sys.exit(0)
+        except Exception as e:
+            logger.error(f"ensure-version failed: {e}", exc_info=True)
+            sys.exit(1)
+
+    if args.command == 'prune-versions':
+        try:
+            from logstashagent import logstash_download as _ld
+
+            root = args.download_dir or _ld.DEFAULT_DOWNLOAD_ROOT
+            keep = set(args.keep or [])
+            preview = _ld.prune_versions(
+                root, keep=keep, keep_used=True, dry_run=True
+            )
+            if not preview['removed']:
+                print(f"Nothing to prune under {root}")
+                if preview['kept']:
+                    print(f"Kept: {', '.join(preview['kept'])}")
+                sys.exit(0)
+            print(f"Would remove: {', '.join(preview['removed'])}")
+            print(f"Would keep:   {', '.join(preview['kept']) or '(none)'}")
+            if args.dry_run:
+                sys.exit(0)
+            if not args.yes:
+                answer = input("Continue prune? [y/N]: ").strip().lower()
+                if answer != 'y':
+                    print("Prune cancelled.")
+                    sys.exit(0)
+            result = _ld.prune_versions(
+                root, keep=keep, keep_used=True, dry_run=False
+            )
+            print(f"Removed: {', '.join(result['removed']) or '(none)'}")
+            if result['errors']:
+                for err in result['errors']:
+                    logger.warning("prune error: %s", err)
+                sys.exit(1)
+            sys.exit(0)
+        except Exception as e:
+            logger.error(f"prune-versions failed: {e}", exc_info=True)
             sys.exit(1)
 
     # Check if we're in uninstall mode

@@ -436,6 +436,38 @@ def teardown_all_instances(
     return handled
 
 
+def register_logstash_version(
+    *,
+    version: str,
+    binary: str,
+    download_dir: str,
+    used_by: Optional[str] = None,
+    state_dir: Optional[str] = None,
+) -> dict[str, Any]:
+    """Record a downloaded Logstash VERSION tree in the install registry."""
+    version = (version or "").strip()
+    if not version:
+        raise ValueError("version required")
+    reg = load_registry(state_dir)
+    versions = reg.setdefault("logstash_versions", {})
+    if not isinstance(versions, dict):
+        versions = {}
+        reg["logstash_versions"] = versions
+    prev = versions.get(version) or {}
+    entry = {
+        "version": version,
+        "binary": binary,
+        "download_dir": download_dir,
+        "installed_at": prev.get("installed_at") or _utc_now(),
+        "last_used_at": _utc_now(),
+        "used_by": used_by or prev.get("used_by"),
+    }
+    versions[version] = entry
+    save_registry(reg, state_dir)
+    logger.info("Registered Logstash VERSION %s at %s", version, binary)
+    return entry
+
+
 def remove_shared_unit_files(reg: Optional[dict] = None) -> None:
     """Remove package-level systemd unit files recorded in the registry."""
     from logstashagent.installer import INSTALL_PATHS

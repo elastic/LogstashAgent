@@ -25,7 +25,10 @@ def test_apply_logstash_runtime_version_downloads_and_updates_env(tmp_path):
     }), patch.object(agent_state, "update_state") as upd, patch(
         "logstashagent.logstash_download.resolve_binary_from_policy",
         return_value=str(binary),
-    ) as resolve:
+    ) as resolve, patch(
+        "logstashagent.install_registry.register_logstash_version",
+        return_value={},
+    ):
         result = controller.apply_logstash_runtime({
             "source": "VERSION",
             "version": "9.4.3",
@@ -43,6 +46,44 @@ def test_apply_logstash_runtime_version_downloads_and_updates_env(tmp_path):
     assert "logstash_source" in keys
     assert "logstash_version" in keys
     assert "logstash_binary" in keys
+
+
+def test_apply_logstash_runtime_managed_updates_env(tmp_path):
+    env_file = tmp_path / "managed-1" / "env"
+    env_file.parent.mkdir(parents=True)
+    env_file.write_text("LOGSTASH_BINARY=/old\n", encoding="utf-8")
+    binary = tmp_path / "bin" / "logstash"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("x", encoding="utf-8")
+
+    state = {
+        "mode": "managed",
+        "instance_id": 1,
+        "keystore_env_file": str(env_file),
+        "logstash_binary": "/old",
+        "logstash_source": "SYSTEM",
+        "agent_id": "a1",
+    }
+    with patch.object(agent_state, "get_state", return_value=state), patch.object(
+        agent_state, "update_state"
+    ), patch(
+        "logstashagent.logstash_download.resolve_binary_from_policy",
+        return_value=str(binary),
+    ), patch(
+        "logstashagent.install_registry.register_logstash_version",
+        return_value={},
+    ), patch(
+        "logstashagent.install_registry.load_registry",
+        return_value={"instances": {}},
+    ):
+        result = controller.apply_logstash_runtime({
+            "source": "VERSION",
+            "version": "8.19.0",
+            "download_dir": str(tmp_path / "versions"),
+            "binary_path": "/usr/share/logstash/bin",
+        })
+    assert result["success"] is True
+    assert f"LOGSTASH_BINARY={binary}" in env_file.read_text()
 
 
 def test_apply_logstash_runtime_system_no_download():

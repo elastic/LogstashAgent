@@ -238,3 +238,190 @@ def resolve_binary_from_policy(
         # Still return intended path; runtime will fail clearly if missing
         logger.warning("System Logstash binary not found at %s", candidate)
     return str(candidate)
+
+
+def list_installed_versions(
+    download_root: str | None = None,
+) -> list[dict]:
+    """
+    Scan download_root for extracted Logstash versions.
+
+    Returns list of dicts: version, binary, install_dir, size_bytes (optional).
+    """
+    root = Path(normalize_download_dir(download_root or DEFAULT_DOWNLOAD_ROOT))
+    if not root.is_dir():
+        return []
+
+    found: list[dict] = []
+    try:
+        names = sorted(os.listdir(root))
+    except OSError as e:
+        logger.warning("Cannot list %s: %s", root, e)
+        return []
+
+    for name in names:
+        # Skip temp / non-version dirs
+        if name.startswith(".") or name.startswith("ls-download-"):
+            continue
+        vdir = root / name
+        if not vdir.is_dir():
+            continue
+        try:
+            binary = resolve_logstash_binary(name, str(root))
+        except LogstashDownloadError:
+            # Nested layout may use directory name != version; try probe
+            nested = list(vdir.glob("logstash-*/bin/logstash"))
+            if nested and nested[0].is_file():
+                binary = nested[0]
+            else:
+                continue
+        size = None
+        try:
+            # Rough tree size (may be slow on huge trees; cap depth walk)
+            total = 0
+            for dirpath, _dirnames, filenames in os.walk(vdir):
+                for fn in filenames:
+                    try:
+                        total += (Path(dirpath) / fn).stat().st_size
+                    except OSError:
+                        pass
+            size = total
+        except OSError:
+            pass
+        found.append(
+            {
+                "version": name,
+                "binary": str(binary),
+                "install_dir": str(vdir),
+                "size_bytes": size,
+            }
+        )
+    return found
+
+
+def collect_in_use_versions(
+    download_root: str | None = None,
+    *,
+    extra_versions: set[str] | None = None,
+) -> set[str]:
+    """
+    Versions that should not be pruned: agent state, install registry, extras.
+    """
+    used: set[str] = set(extra_versions or ())
+    try:
+        from logstashagent import agent_state as _as
+
+        st = _as.get_state() or {}
+        if (st.get("logstash_source") or "").upper() == "VERSION":
+            v = (st.get("logstash_version_resolved") or st.get("logstash_version") or "").strip()
+            if v:
+                used.add(v)
+    except Exception:
+        pass
+    try:
+        from logstashagent import install_registry as _reg
+
+        reg = _reg.load_registry()
+        for ver, meta in (reg.get("logstash_versions") or {}).items():
+            if ver:
+                used.add(str(ver))
+        for inst in (reg.get("instances") or {}).values():
+            if not isinstance(inst, dict):
+                continue
+            if (inst.get("logstash_source") or "").upper() == "VERSION":
+                v = (inst.get("logstash_version") or "").strip()
+                if v:
+                    used.add(v)
+    except Exception:
+        pass
+    # Also mark any version still referenced by env files under managed-/simulate-
+    try:
+        from logstashagent.installer import INSTALL_PATHS
+
+        opt = Path(INSTALL_PATHS.get("simulate_root") or "/opt/logstash-agent")
+        if opt.is_dir():
+            for env_path in opt.glob("*/env"):
+                try:
+                    for line in env_path.read_text(encoding="utf-8").splitlines():
+                        if line.startswith("LOGSTASH_BINARY="):
+                            b = line.split("=", 1)[1].strip()
+                            # .../logstash-versions/<ver>/...
+                            parts = Path(b).parts
+                            if "logstash-versions" in parts:
+                                i = parts.index("logstash-versions")
+                                if i + 1 < len(parts):
+                                    used.add(parts[i + 1])
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    return used
+
+
+def prune_versions(
+    download_root: str | None = None,
+    *,
+    keep: set[str] | None = None,
+    keep_used: bool = True,
+    dry_run: bool = False,
+) -> dict:
+    """
+    Remove extracted version trees not in ``keep`` (and not in-use if keep_used).
+
+    Returns dict: removed (list), kept (list), errors (list).
+    """
+    root = Path(normalize_download_dir(download_root or DEFAULT_DOWNLOAD_ROOT))
+    keep_set = set(keep or ())
+    if keep_used:
+        keep_set |= collect_in_use_versions(str(root))
+
+    installed = list_installed_versions(str(root))
+    removed: list[str] = []
+    kept: list[str] = []
+    errors: list[str] = []
+
+    for entry in installed:
+        ver = entry["version"]
+        if ver in keep_set:
+            kept.append(ver)
+            continue
+        path = Path(entry["install_dir"])
+        # Safety: must live under download root
+        try:
+            path.resolve().relative_to(root.resolve())
+        except (ValueError, OSError):
+            errors.append(f"refuse prune outside root: {path}")
+            continue
+        if dry_run:
+            removed.append(ver)
+            continue
+        try:
+            shutil.rmtree(path)
+            removed.append(ver)
+            logger.info("Pruned Logstash version tree %s", path)
+        except OSError as e:
+            errors.append(f"{ver}: {e}")
+            logger.warning("Failed to prune %s: %s", path, e)
+
+    return {"removed": removed, "kept": kept, "errors": errors, "download_root": str(root)}
+
+
+def format_versions_table(versions: list[dict]) -> str:
+    if not versions:
+        return "(no Logstash versions installed under download root)"
+    lines = [
+        f"{'VERSION':<16} {'SIZE':>12}  BINARY",
+        "-" * 72,
+    ]
+    for v in versions:
+        size = v.get("size_bytes")
+        if size is None:
+            size_s = "?"
+        elif size >= 1024**3:
+            size_s = f"{size / 1024**3:.1f} GiB"
+        elif size >= 1024**2:
+            size_s = f"{size / 1024**2:.0f} MiB"
+        else:
+            size_s = f"{size} B"
+        lines.append(f"{v.get('version', ''):<16} {size_s:>12}  {v.get('binary', '')}")
+    return "\n".join(lines)
