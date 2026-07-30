@@ -1185,12 +1185,14 @@ def perform_configure() -> None:
             )
 
         configure_logstash()
+        # Enable distro logstash only — never start/restart on configure (live-system safe)
+        enable_package_logstash_only()
 
         logger.info("\n" + "="*60)
         logger.info("CONFIGURE COMPLETED SUCCESSFULLY!")
         logger.info("="*60)
-        logger.info("\nNext steps:")
-        logger.info("  Restart the agent service to apply the updated service account:")
+        logger.info("\nDistro logstash enabled only (not started).")
+        logger.info("Restart the agent so it can manage Logstash when policy requires:")
         logger.info("    sudo systemctl restart logstash-agent")
         logger.info("="*60)
 
