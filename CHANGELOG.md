@@ -26,6 +26,7 @@
 - Agent server CSR SANs include hostname, FQDN, non-loopback local IPs, and `LOGSTASH_AGENT_TLS_SANS`; re-issue when SANs drift.
 - PyInstaller bundle includes **`lsagent-simulate@.service`** and **`ls-simulate@.service`** under `logstashagent/systemd/` for install.
 - **sudo-rs compatible sudoers** (Ubuntu 26+): install `/opt/logstash-agent/bin/logstash-agent-ctl` to run validated `systemctl` actions (no `ls-simulate@*` wildcards in sudoers). Restarts go through this helper.
+- **Install is a full deploy:** enables and starts the agent unit (`logstash-agent` or `lsagent-simulate@N`). Distro **`logstash` is enable-only** (never started/restarted at install) so live systems are not bounced; the agent restarts Logstash when policy requires.
 
 ### Changed
 

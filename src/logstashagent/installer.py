@@ -618,21 +618,88 @@ def materialize_simulate_instance(policy_config: dict) -> dict:
     }
 
 
+def _systemctl_cmd(*args: str, check: bool = False) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ['systemctl', *args],
+        check=check,
+        capture_output=True,
+        text=True,
+    )
+
+
+def enable_package_logstash_only() -> None:
+    """
+    Enable distro ``logstash`` unit without starting/restarting it.
+
+    Live hosts may already be serving traffic; the agent restarts Logstash
+    later when policy apply requires it.
+    """
+    try:
+        r = _systemctl_cmd('enable', 'logstash')
+        if r.returncode == 0:
+            logger.info(
+                "✓ Enabled distro logstash unit (not started — agent will restart when needed)"
+            )
+        else:
+            logger.warning(
+                "Could not enable logstash unit (may be missing): %s",
+                (r.stderr or r.stdout or "").strip(),
+            )
+    except FileNotFoundError:
+        logger.warning("systemctl not available — skip enable of logstash")
+
+
+def enable_and_start_default_agent() -> None:
+    """Enable and start logstash-agent.service (Packaged/Default install)."""
+    unit = 'logstash-agent'
+    try:
+        _systemctl_cmd('daemon-reload')
+        r = _systemctl_cmd('enable', '--now', unit)
+        if r.returncode == 0:
+            logger.info("✓ Enabled and started %s", unit)
+        else:
+            # enable --now may fail on some systems if unit just written; try split
+            _systemctl_cmd('enable', unit)
+            r2 = _systemctl_cmd('start', unit)
+            if r2.returncode == 0:
+                logger.info("✓ Enabled and started %s", unit)
+            else:
+                logger.warning(
+                    "Could not start %s: %s",
+                    unit,
+                    (r2.stderr or r.stderr or "").strip(),
+                )
+    except FileNotFoundError:
+        logger.warning("systemctl not available — skip enable/start of %s", unit)
+
+
 def enable_simulate_services(instance_id: int) -> None:
-    """Enable (and optionally leave stopped) simulate agent unit for instance N."""
+    """
+    Enable simulate units and start the agent instance.
+
+    Logstash unit is enabled only (not started) so the controller can apply
+    config and restart via logstash-agent-ctl when ready — same live-safety
+    idea as Packaged, even for new sim trees.
+    """
     agent_unit = f"lsagent-simulate@{instance_id}"
     ls_unit = f"ls-simulate@{instance_id}"
     try:
-        subprocess.run(
-            ['systemctl', 'enable', agent_unit],
-            check=False, capture_output=True, text=True,
-        )
-        # Do not auto-start Logstash until agent applies config / first restart
-        subprocess.run(
-            ['systemctl', 'enable', ls_unit],
-            check=False, capture_output=True, text=True,
-        )
-        logger.info(f"✓ Enabled {agent_unit} and {ls_unit}")
+        _systemctl_cmd('daemon-reload')
+        _systemctl_cmd('enable', ls_unit)
+        r = _systemctl_cmd('enable', '--now', agent_unit)
+        if r.returncode != 0:
+            _systemctl_cmd('enable', agent_unit)
+            r2 = _systemctl_cmd('start', agent_unit)
+            if r2.returncode != 0:
+                logger.warning(
+                    "Could not start %s: %s",
+                    agent_unit,
+                    (r2.stderr or r.stderr or "").strip(),
+                )
+            else:
+                logger.info("✓ Enabled %s; enabled and started %s", ls_unit, agent_unit)
+        else:
+            logger.info("✓ Enabled %s; enabled and started %s", ls_unit, agent_unit)
     except FileNotFoundError:
         logger.warning("systemctl not available — skip enable of simulate units")
 
@@ -1279,6 +1346,16 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
                 os.chown(os.path.join(root, f), uid, gid)
         logger.info(f"✓ Verified ownership on {INSTALL_PATHS['state_dir']}")
 
+        # Step 11: Enable/start services (full deploy — no extra cut-paste for enable/start)
+        logger.info("\nStep 11: Enabling and starting services...")
+        if is_simulate:
+            # enable_simulate_services already ran inside setup_simulate_from_policy
+            pass
+        else:
+            enable_and_start_default_agent()
+            if logstash_present:
+                enable_package_logstash_only()
+
         # Installation complete
         logger.info("\n" + "="*60)
         logger.info("INSTALLATION COMPLETED SUCCESSFULLY!")
@@ -1286,16 +1363,17 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
 
         if is_simulate:
             instance_id = policy_config.get('instance_id')
-            logger.info("\nSimulate agent installed.")
-            logger.info("\nNext steps:")
-            logger.info(f"  1. Start the simulate agent:")
-            logger.info(f"     sudo systemctl start lsagent-simulate@{instance_id}")
-            logger.info(f"\n  2. Check status:")
-            logger.info(f"     sudo systemctl status lsagent-simulate@{instance_id}")
-            logger.info(f"\n  3. View logs:")
-            logger.info(f"     sudo journalctl -u lsagent-simulate@{instance_id} -f")
-            logger.info(f"\n  Logstash instance unit: ls-simulate@{instance_id}")
-            logger.info(f"  Paths under: /opt/logstash-agent/simulate-{instance_id}/")
+            agent_unit = f"lsagent-simulate@{instance_id}"
+            ls_unit = f"ls-simulate@{instance_id}"
+            logger.info("\nSimulate agent installed and started.")
+            logger.info(f"  Agent unit:    {agent_unit} (enabled + started)")
+            logger.info(f"  Logstash unit: {ls_unit} (enabled; agent restarts when ready)")
+            logger.info(f"  Paths under:   /opt/logstash-agent/simulate-{instance_id}/")
+            logger.info("\nDay-2 operations:")
+            logger.info(f"  sudo systemctl status {agent_unit}")
+            logger.info(f"  sudo systemctl stop {agent_unit}")
+            logger.info(f"  sudo systemctl start {agent_unit}")
+            logger.info(f"  sudo journalctl -u {agent_unit} -f")
             logger.info("="*60)
         else:
             if not logstash_present:
@@ -1311,20 +1389,22 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
                 logger.warning("  configuration that could not be set up without Logstash.")
                 logger.warning("!" * 60)
 
-            logger.info("\nNext steps:")
+            logger.info("\nAgent service logstash-agent enabled and started.")
+            if logstash_present:
+                logger.info(
+                    "Distro logstash unit enabled only (not started/restarted — "
+                    "safe for live systems; agent will restart Logstash when policy requires)."
+                )
             if not logstash_present:
-                logger.info("  0. Install Logstash, update /etc/logstash-agent/logstash-agent.yml")
-                logger.info("     with the correct paths, then run:")
-                logger.info("       sudo logstash-agent configure")
-                logger.info("")
-            logger.info("  1. Enable the service:")
-            logger.info("     sudo systemctl enable logstash-agent")
-            logger.info("\n  2. Start the service:")
-            logger.info("     sudo systemctl start logstash-agent")
-            logger.info("\n  3. Check status:")
-            logger.info("     sudo systemctl status logstash-agent")
-            logger.info("\n  4. View logs:")
-            logger.info("     sudo journalctl -u logstash-agent -f")
+                logger.info("\nAfter installing Logstash:")
+                logger.info("  1. Update paths in /etc/logstash-agent/logstash-agent.yml if needed")
+                logger.info("  2. sudo logstash-agent configure")
+                logger.info("  3. sudo systemctl restart logstash-agent")
+            logger.info("\nDay-2 operations:")
+            logger.info("  sudo systemctl status logstash-agent")
+            logger.info("  sudo systemctl stop logstash-agent")
+            logger.info("  sudo systemctl start logstash-agent")
+            logger.info("  sudo journalctl -u logstash-agent -f")
             logger.info("="*60)
         
     except InstallError as e:
