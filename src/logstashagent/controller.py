@@ -1209,18 +1209,20 @@ def _logstash_unit_name() -> str:
     """
     Systemd unit for this agent role.
 
-    - default: ``logstash``
+    - packaged/default: ``logstash``
     - simulate: ``ls-simulate@N`` from state (or derived from instance_id)
+    - managed: ``logstash-managed@N`` from state (or derived from instance_id)
     """
     state = agent_state.get_state()
     unit = state.get('logstash_unit')
     if unit:
         return unit
     mode = (state.get('mode') or 'default').lower()
-    if mode == 'simulate':
-        instance_id = state.get('instance_id')
-        if instance_id is not None:
-            return f'ls-simulate@{instance_id}'
+    instance_id = state.get('instance_id')
+    if mode == 'managed' and instance_id is not None:
+        return f'logstash-managed@{instance_id}'
+    if mode == 'simulate' and instance_id is not None:
+        return f'ls-simulate@{instance_id}'
     return 'logstash'
 
 
@@ -1229,7 +1231,8 @@ def restart_logstash():
     Restart the Logstash service for this agent role.
     Uses sudo as configured in /etc/sudoers.d/logstash-agent
 
-    Default agents restart ``logstash``; simulate agents restart ``ls-simulate@N``.
+    Packaged agents restart ``logstash``; simulate uses ``ls-simulate@N``;
+    managed uses ``logstash-managed@N``.
 
     Returns:
         bool: True if successful, False otherwise

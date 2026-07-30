@@ -23,7 +23,32 @@ def test_systemctl_ctl_script_validates_units(tmp_path, monkeypatch):
     assert "systemctl" in text
     assert "ls-simulate" in text
     assert "lsagent-simulate" in text
+    assert "logstash-managed" in text
+    assert "logstash-agent" in text
     assert "grep -Eq" in text
+    # Extract allowlist regex and validate accepted / rejected units
+    m = re.search(r"grep -Eq '([^']+)'", text)
+    assert m, "ctl script missing unit allowlist grep"
+    unit_re = re.compile(m.group(1))
+    for ok in (
+        "logstash",
+        "logstash-agent",
+        "logstash-agent@1",
+        "logstash-agent@42",
+        "logstash-managed@1",
+        "ls-simulate@3",
+        "lsagent-simulate@9",
+    ):
+        assert unit_re.fullmatch(ok), f"should allow {ok}"
+    for bad in (
+        "logstash@1",
+        "logstash-agent@managed-1",
+        "logstash-agent@*",
+        "sshd",
+        "ls-simulate@1x",
+        "logstash-managed@",
+    ):
+        assert not unit_re.fullmatch(bad), f"should reject {bad}"
 
 
 def test_sudoers_content_has_no_arg_wildcards(tmp_path, monkeypatch):

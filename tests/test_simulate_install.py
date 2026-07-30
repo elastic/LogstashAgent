@@ -133,5 +133,5 @@ def test_sudoers_includes_simulate_units():
     assert "content" in written
     # sudo-rs forbids argument wildcards; units go through logstash-agent-ctl
     assert "logstash-agent-ctl" in written["content"]
-    assert "ls-simulate@N" in written["content"] or "ls-simulate@" in written["content"]
+    assert "logstash-managed" in written["content"] or "ls-simulate" in written["content"]
     assert "@*" not in written["content"]

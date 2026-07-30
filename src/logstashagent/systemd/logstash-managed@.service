@@ -1,0 +1,31 @@
+[Unit]
+Description=Logstash managed instance %i (owned by LogstashAgent)
+After=network.target
+Documentation=https://github.com/elastic/LogstashAgent
+
+[Service]
+Type=simple
+# Instance paths: /opt/logstash-agent/managed-%i/
+EnvironmentFile=-/opt/logstash-agent/managed-%i/env
+# LOGSTASH_BINARY and path flags come from EnvironmentFile
+# Example env:
+#   LOGSTASH_BINARY=/usr/share/logstash/bin/logstash
+#   LOGSTASH_PATH_SETTINGS=/opt/logstash-agent/managed-%i/settings
+#   LOGSTASH_PATH_CONFIG=/opt/logstash-agent/managed-%i/config
+#   LOGSTASH_PATH_LOGS=/opt/logstash-agent/managed-%i/logs
+#   LOGSTASH_PATH_DATA=/opt/logstash-agent/managed-%i/data
+#   LOGSTASH_KEYSTORE_PASS=...
+ExecStart=/bin/bash -c 'exec "${LOGSTASH_BINARY}" \
+  --path.settings="${LOGSTASH_PATH_SETTINGS}" \
+  --path.config="${LOGSTASH_PATH_CONFIG}" \
+  --path.logs="${LOGSTASH_PATH_LOGS}" \
+  --path.data="${LOGSTASH_PATH_DATA}"'
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+# User=logstash
+# Group=logstash
+
+[Install]
+WantedBy=multi-user.target

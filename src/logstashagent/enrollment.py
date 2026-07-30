@@ -314,7 +314,11 @@ def perform_enrollment(encoded_token: str, logstash_ui_url: str, agent_id: str):
             role = 'managed' if _pt == 'MANAGED' else 'simulate'
             logger.info(f"Mode: {role} instance_id={policy_config.get('instance_id')}")
             if setup_result and setup_result.get('status') == 'complete':
-                unit = policy_config.get('agent_unit') or f"lsagent-simulate@{policy_config.get('instance_id')}"
+                iid = policy_config.get('instance_id')
+                if _pt == 'MANAGED':
+                    unit = policy_config.get('agent_unit') or f"logstash-agent@{iid}"
+                else:
+                    unit = policy_config.get('agent_unit') or f"lsagent-simulate@{iid}"
                 logger.info(f"Setup complete. Start with: sudo systemctl start {unit}")
             else:
                 logger.warning("=" * 60)

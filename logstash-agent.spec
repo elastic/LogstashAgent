@@ -9,14 +9,20 @@ except NameError:
 
 _systemd = _root / "src" / "logstashagent" / "systemd"
 _unit_datas = []
-for _name in ("lsagent-simulate@.service", "ls-simulate@.service"):
+for _name in (
+    "lsagent-simulate@.service",
+    "ls-simulate@.service",
+    "logstash-agent@.service",
+    "logstash-managed@.service",
+):
     _p = _systemd / _name
     if _p.is_file():
         # Land next to installer.py: _internal/logstashagent/systemd/
         _unit_datas.append((str(_p), "logstashagent/systemd"))
-if not _unit_datas:
+if len(_unit_datas) < 4:
     raise SystemExit(
-        f"logstash-agent.spec: missing systemd unit templates under {_systemd}"
+        f"logstash-agent.spec: expected 4 systemd unit templates under {_systemd}, "
+        f"found {len(_unit_datas)}"
     )
 
 

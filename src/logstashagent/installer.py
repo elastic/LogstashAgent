@@ -35,6 +35,9 @@ INSTALL_PATHS = {
     'simulate_root': '/opt/logstash-agent',
     'lsagent_simulate_unit': '/etc/systemd/system/lsagent-simulate@.service',
     'ls_simulate_unit': '/etc/systemd/system/ls-simulate@.service',
+    # Managed multi-instance (agent-owned Logstash trees)
+    'logstash_agent_template_unit': '/etc/systemd/system/logstash-agent@.service',
+    'logstash_managed_unit': '/etc/systemd/system/logstash-managed@.service',
 }
 
 # Legacy root from early simulate work — never recreate; rewrite inbound policy paths
@@ -72,8 +75,11 @@ case "$ACTION" in
     exit 2
     ;;
 esac
-# Allow fixed units and template instances with numeric instance ids only
-if ! echo "$UNIT" | grep -Eq '^(logstash|logstash-agent|(ls-simulate|lsagent-simulate)@[0-9]+)$'; then
+# Allow fixed units and template instances with numeric instance ids only.
+# Packaged: logstash, logstash-agent
+# Simulate: ls-simulate@N, lsagent-simulate@N
+# Managed:  logstash-managed@N, logstash-agent@N
+if ! echo "$UNIT" | grep -Eq '^(logstash|logstash-agent|((ls-simulate|lsagent-simulate|logstash-agent|logstash-managed)@[0-9]+))$'; then
   echo "logstash-agent-ctl: disallowed unit: $UNIT" >&2
   exit 2
 fi
@@ -105,7 +111,8 @@ def install_systemctl_ctl() -> str:
 
 def _systemd_template_dir() -> Path:
     """
-    Directory with lsagent-simulate@.service / ls-simulate@.service templates.
+    Directory with multi-instance systemd unit templates
+    (simulate + managed).
 
     Dev: package source tree. PyInstaller COLLECT: _internal/logstashagent/systemd/
     """
@@ -501,13 +508,26 @@ def _read_unit_template(name: str) -> str:
     return path.read_text(encoding='utf-8')
 
 
-def install_simulate_unit_templates() -> None:
-    """Install lsagent-simulate@.service and ls-simulate@.service templates."""
-    logger.info("Installing simulate systemd unit templates...")
-    for template_name, dest_key in (
-        ('lsagent-simulate@.service', 'lsagent_simulate_unit'),
-        ('ls-simulate@.service', 'ls_simulate_unit'),
-    ):
+# (template filename, INSTALL_PATHS dest key)
+_MULTI_INSTANCE_UNIT_TEMPLATES = (
+    # Simulate
+    ('lsagent-simulate@.service', 'lsagent_simulate_unit'),
+    ('ls-simulate@.service', 'ls_simulate_unit'),
+    # Managed
+    ('logstash-agent@.service', 'logstash_agent_template_unit'),
+    ('logstash-managed@.service', 'logstash_managed_unit'),
+)
+
+
+def install_multi_instance_unit_templates() -> None:
+    """
+    Install all multi-instance systemd unit templates (simulate + managed).
+
+    Safe to call on every multi-instance install; overwrites templates in place
+    and runs daemon-reload once.
+    """
+    logger.info("Installing multi-instance systemd unit templates...")
+    for template_name, dest_key in _MULTI_INSTANCE_UNIT_TEMPLATES:
         content = _read_unit_template(template_name)
         # Inject User=logstash when available
         try:
@@ -533,6 +553,11 @@ def install_simulate_unit_templates() -> None:
         logger.info("✓ Reloaded systemd daemon")
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         logger.warning(f"daemon-reload failed (non-fatal): {e}")
+
+
+def install_simulate_unit_templates() -> None:
+    """Backward-compatible alias for install_multi_instance_unit_templates()."""
+    install_multi_instance_unit_templates()
 
 
 def materialize_simulate_instance(policy_config: dict) -> dict:
@@ -615,24 +640,36 @@ def materialize_simulate_instance(policy_config: dict) -> dict:
             target.write_text(content if content.endswith('\n') else content + '\n', encoding='utf-8')
             logger.info(f"✓ Wrote {target}")
 
-    # Seed simulation harness (simulate-start/end) + bare pipelines.yml
-    try:
-        from logstashagent import simulate_recovery
+    # Simulate-only: seed simulation harness (simulate-start/end) + bare pipelines.yml
+    # Managed trees get a minimal placeholder pipelines.yml until the agent deploys policy.
+    if pt == 'SIMULATE':
+        try:
+            from logstashagent import simulate_recovery
 
-        seed = simulate_recovery.seed_static_harness(settings, force=False)
-        if seed.get('ok'):
-            if not (settings / 'pipelines.yml').is_file():
-                simulate_recovery.write_bare_pipelines_yml(settings)
-                logger.info("✓ Wrote bare simulate pipelines.yml (harness only)")
+            seed = simulate_recovery.seed_static_harness(settings, force=False)
+            if seed.get('ok'):
+                if not (settings / 'pipelines.yml').is_file():
+                    simulate_recovery.write_bare_pipelines_yml(settings)
+                    logger.info("✓ Wrote bare simulate pipelines.yml (harness only)")
+                else:
+                    logger.info("✓ Simulate harness confs ready (pipelines.yml already present)")
             else:
-                logger.info("✓ Simulate harness confs ready (pipelines.yml already present)")
-        else:
-            logger.warning(
-                "Could not seed full simulate harness: %s",
-                seed.get('missing_src'),
+                logger.warning(
+                    "Could not seed full simulate harness: %s",
+                    seed.get('missing_src'),
+                )
+        except Exception as e:
+            logger.warning("Simulate harness seed during materialize failed: %s", e)
+    else:
+        pipelines_yml = settings / 'pipelines.yml'
+        if not pipelines_yml.is_file():
+            pipelines_yml.write_text(
+                "# Managed by LogstashAgent — pipelines deployed on check-in\n"
+                "- pipeline.id: .agent-placeholder\n"
+                "  path.config: \"/dev/null\"\n",
+                encoding='utf-8',
             )
-    except Exception as e:
-        logger.warning("Simulate harness seed during materialize failed: %s", e)
+            logger.info("✓ Wrote placeholder pipelines.yml for managed instance")
 
     binary = resolve_binary_from_policy(
         logstash_source=policy_config.get('logstash_source') or 'SYSTEM',
@@ -642,10 +679,20 @@ def materialize_simulate_instance(policy_config: dict) -> dict:
         binary_path=policy_config.get('binary_path') or '/usr/share/logstash/bin',
     )
 
-    agent_port = policy_config.get('agent_api_port', 9500 + instance_id)
-    ls_port = policy_config.get('logstash_api_port', 9560 + instance_id)
+    if pt == 'MANAGED':
+        agent_port = policy_config.get('agent_api_port', 9600 + instance_id)
+        ls_port = policy_config.get('logstash_api_port', 9700 + instance_id)
+        agent_mode = 'managed'
+        agent_unit = policy_config.get('agent_unit') or f'logstash-agent@{instance_id}'
+        logstash_unit = policy_config.get('logstash_unit') or f'logstash-managed@{instance_id}'
+    else:
+        agent_port = policy_config.get('agent_api_port', 9500 + instance_id)
+        ls_port = policy_config.get('logstash_api_port', 9560 + instance_id)
+        agent_mode = 'simulate'
+        agent_unit = policy_config.get('agent_unit') or f'lsagent-simulate@{instance_id}'
+        logstash_unit = policy_config.get('logstash_unit') or f'ls-simulate@{instance_id}'
 
-    # EnvironmentFile for ls-simulate@N
+    # EnvironmentFile for logstash-managed@N / ls-simulate@N
     env_lines = [
         f"LOGSTASH_BINARY={binary}",
         f"LOGSTASH_PATH_SETTINGS={settings}",
@@ -665,9 +712,12 @@ def materialize_simulate_instance(policy_config: dict) -> dict:
 
     agent_env_lines = [
         f"INSTANCE_ID={instance_id}",
+        f"AGENT_MODE={agent_mode}",
         f"AGENT_API_PORT={agent_port}",
         f"LOGSTASH_API_PORT={ls_port}",
         f"LOGSTASH_SETTINGS={settings}",
+        f"AGENT_UNIT={agent_unit}",
+        f"LOGSTASH_UNIT={logstash_unit}",
     ]
     agent_env.write_text('\n'.join(agent_env_lines) + '\n', encoding='utf-8')
     os.chmod(agent_env, 0o640)
@@ -690,7 +740,7 @@ def materialize_simulate_instance(policy_config: dict) -> dict:
                     os.chown(path, uid, gid)
         logger.info(f"✓ Set ownership on {root}")
     except Exception as e:
-        logger.warning(f"Could not set ownership on simulate tree: {e}")
+        logger.warning(f"Could not set ownership on instance tree: {e}")
 
     return {
         'root': str(root),
@@ -704,6 +754,10 @@ def materialize_simulate_instance(policy_config: dict) -> dict:
         'instance_id': instance_id,
         'agent_api_port': agent_port,
         'logstash_api_port': ls_port,
+        'agent_unit': agent_unit,
+        'logstash_unit': logstash_unit,
+        'policy_type': pt,
+        'mode': agent_mode,
     }
 
 
@@ -762,16 +816,55 @@ def enable_and_start_default_agent() -> None:
         logger.warning("systemctl not available — skip enable/start of %s", unit)
 
 
-def enable_simulate_services(instance_id: int) -> None:
+def resolve_multi_instance_units(
+    instance_id: int,
+    policy_type: str | None = None,
+    *,
+    agent_unit: str | None = None,
+    logstash_unit: str | None = None,
+) -> tuple[str, str]:
     """
-    Enable simulate units and start the agent instance.
+    Resolve agent + Logstash systemd unit names for a multi-instance role.
+
+    Managed:  logstash-agent@N + logstash-managed@N
+    Simulate: lsagent-simulate@N + ls-simulate@N
+    """
+    pt = (policy_type or 'SIMULATE').upper()
+    if pt == 'DEFAULT':
+        pt = 'PACKAGED'
+    if agent_unit and logstash_unit:
+        return agent_unit, logstash_unit
+    if pt == 'MANAGED':
+        return (
+            agent_unit or f'logstash-agent@{instance_id}',
+            logstash_unit or f'logstash-managed@{instance_id}',
+        )
+    return (
+        agent_unit or f'lsagent-simulate@{instance_id}',
+        logstash_unit or f'ls-simulate@{instance_id}',
+    )
+
+
+def enable_multi_instance_services(
+    instance_id: int,
+    *,
+    agent_unit: str | None = None,
+    logstash_unit: str | None = None,
+    policy_type: str | None = None,
+) -> None:
+    """
+    Enable multi-instance units and start the agent instance.
 
     Logstash unit is enabled only (not started) so the controller can apply
     config and restart via logstash-agent-ctl when ready — same live-safety
-    idea as Packaged, even for new sim trees.
+    idea as Packaged, even for new instance trees.
     """
-    agent_unit = f"lsagent-simulate@{instance_id}"
-    ls_unit = f"ls-simulate@{instance_id}"
+    agent_unit, ls_unit = resolve_multi_instance_units(
+        instance_id,
+        policy_type,
+        agent_unit=agent_unit,
+        logstash_unit=logstash_unit,
+    )
     try:
         _systemctl_cmd('daemon-reload')
         _systemctl_cmd('enable', ls_unit)
@@ -790,14 +883,27 @@ def enable_simulate_services(instance_id: int) -> None:
         else:
             logger.info("✓ Enabled %s; enabled and started %s", ls_unit, agent_unit)
     except FileNotFoundError:
-        logger.warning("systemctl not available — skip enable of simulate units")
+        logger.warning("systemctl not available — skip enable of multi-instance units")
+
+
+def enable_simulate_services(instance_id: int) -> None:
+    """Backward-compatible simulate-only enable (numeric N)."""
+    enable_multi_instance_services(instance_id, policy_type='SIMULATE')
 
 
 def setup_simulate_from_policy(policy_config: dict) -> dict:
-    """Full simulate post-enroll setup: templates, tree, enable units."""
-    install_simulate_unit_templates()
+    """Full multi-instance post-enroll setup: templates, tree, enable units."""
+    install_multi_instance_unit_templates()
     result = materialize_simulate_instance(policy_config)
-    enable_simulate_services(result['instance_id'])
+    pt = (policy_config.get('policy_type') or result.get('policy_type') or 'SIMULATE').upper()
+    if pt == 'DEFAULT':
+        pt = 'PACKAGED'
+    enable_multi_instance_services(
+        result['instance_id'],
+        agent_unit=policy_config.get('agent_unit') or result.get('agent_unit'),
+        logstash_unit=policy_config.get('logstash_unit') or result.get('logstash_unit'),
+        policy_type=pt,
+    )
     return result
 
 
@@ -1061,9 +1167,15 @@ def perform_setup_simulate(yes: bool = False) -> dict:
             else f"simulate-{policy_config['instance_id']}"
         )
     )
+    agent_unit, ls_unit = resolve_multi_instance_units(
+        int(policy_config['instance_id']),
+        pt,
+        agent_unit=policy_config.get('agent_unit'),
+        logstash_unit=policy_config.get('logstash_unit'),
+    )
     if not yes:
         print(f"\nThis will materialize /opt/logstash-agent/{Path(str(prefix)).name}/")
-        print("and install/enable lsagent-simulate@ and ls-simulate@ units.")
+        print(f"and install/enable {agent_unit} and {ls_unit}.")
         answer = input("Continue? [y/N]: ").strip().lower()
         if answer != 'y':
             raise InstallError("setup-simulate cancelled")
@@ -1083,18 +1195,16 @@ def perform_setup_simulate(yes: bool = False) -> dict:
         logger.warning("configure_logstash after setup-simulate: %s", e)
 
     _agent_state.update_state('simulate_setup_pending', False)
+    # Persist resolved unit names for controller restarts
+    _agent_state.update_state('agent_unit', agent_unit)
+    _agent_state.update_state('logstash_unit', ls_unit)
 
     logger.info("=" * 60)
-    logger.info("SIMULATE SETUP COMPLETE")
+    logger.info("%s SETUP COMPLETE", pt)
     logger.info("=" * 60)
-    logger.info(
-        "Start: sudo systemctl start lsagent-simulate@%s",
-        policy_config['instance_id'],
-    )
-    logger.info(
-        "Status: sudo systemctl status lsagent-simulate@%s",
-        policy_config['instance_id'],
-    )
+    logger.info("Start:  sudo systemctl start %s", agent_unit)
+    logger.info("Status: sudo systemctl status %s", agent_unit)
+    logger.info("Logstash unit (enable-only at setup): %s", ls_unit)
     return result
 
 
@@ -1211,7 +1321,8 @@ def configure_logstash() -> None:
 # This file is managed by logstash-agent installation
 # Compatible with GNU sudo and sudo-rs (no wildcards in command arguments)
 {requiretty_line}
-# Validated systemctl wrapper (logstash, logstash-agent, ls-simulate@N, lsagent-simulate@N)
+# Validated systemctl wrapper (logstash, logstash-agent, logstash-agent@N,
+# logstash-managed@N, ls-simulate@N, lsagent-simulate@N)
 logstash ALL=(ALL) NOPASSWD: {ctl}
 
 # Allow LogstashAgent upgrade / privileged subcommands (fixed path; no arg wildcards)
@@ -1407,13 +1518,16 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
         logger.info("\nStep 7: Installing systemd service(s)...")
         if is_multi:
             setup_simulate_from_policy(policy_config)
-            # Shared agent binary is still installed; packaged unit is optional
-            # for coexistence with a production agent on the same host — do not
-            # enable logstash-agent.service for pure multi-instance installs.
-            logger.info(
-                "✓ Multi-instance units installed (lsagent-simulate@ / ls-simulate@; "
-                "managed reuses these until logstash-agent@ / logstash-managed@ ship)"
-            )
+            # Shared agent binary is still installed; packaged logstash-agent.service
+            # is optional for coexistence — do not enable it for pure multi-instance.
+            if policy_type == 'MANAGED':
+                logger.info(
+                    "✓ Managed units installed (logstash-agent@N / logstash-managed@N)"
+                )
+            else:
+                logger.info(
+                    "✓ Simulate units installed (lsagent-simulate@N / ls-simulate@N)"
+                )
         else:
             install_systemd_service()
 
@@ -1481,13 +1595,11 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
 
         if is_multi:
             instance_id = policy_config.get('instance_id')
-            agent_unit = (
-                policy_config.get('agent_unit')
-                or f"lsagent-simulate@{instance_id}"
-            )
-            ls_unit = (
-                policy_config.get('logstash_unit')
-                or f"ls-simulate@{instance_id}"
+            agent_unit, ls_unit = resolve_multi_instance_units(
+                int(instance_id) if instance_id is not None else 0,
+                policy_type,
+                agent_unit=policy_config.get('agent_unit'),
+                logstash_unit=policy_config.get('logstash_unit'),
             )
             path_root = (
                 policy_config.get('path_root')
@@ -1507,6 +1619,7 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
             logger.info(f"  sudo systemctl stop {agent_unit}")
             logger.info(f"  sudo systemctl start {agent_unit}")
             logger.info(f"  sudo journalctl -u {agent_unit} -f")
+            logger.info(f"  # or via ctl: sudo logstash-agent-ctl status {agent_unit}")
             logger.info("="*60)
         else:
             if not logstash_present:

@@ -271,16 +271,17 @@ def log_resolved_agent_mode(mode: str, *, legacy: str | None = None, source: str
 
 def is_systemctl_managed_simulate() -> bool:
     """
-    True when this process is an enrolled/numbered simulate agent whose Logstash
-    is managed by systemd (``ls-simulate@N``), not by LogstashSupervisor.
+    True when this process is an enrolled multi-instance agent whose Logstash
+    is managed by systemd (``ls-simulate@N`` or ``logstash-managed@N``), not
+    by LogstashSupervisor.
 
     Distinguishes from legacy UI "host mode" which maps to mode=simulate via
-    normalize_agent_mode but has no instance_id / ls-simulate unit and still
-    uses supervisor Popen.
+    normalize_agent_mode but has no instance_id / unit and still uses supervisor
+    Popen.
     """
     state = agent_state.get_state() or {}
     unit = (state.get('logstash_unit') or '') or ''
-    if str(unit).startswith('ls-simulate@'):
+    if str(unit).startswith('ls-simulate@') or str(unit).startswith('logstash-managed@'):
         return True
 
     mode = (state.get('mode') or (AGENT_CONFIG or {}).get('mode') or '').lower()
@@ -300,6 +301,10 @@ def is_systemctl_managed_simulate() -> bool:
     return False
 
 
+# Alias preferred name (simulate + managed)
+is_systemctl_managed_logstash = is_systemctl_managed_simulate
+
+
 def sim_logstash_api_port() -> int:
     """HTTP API port for the Logstash instance this agent manages."""
     state = agent_state.get_state() or {}
@@ -312,9 +317,13 @@ def sim_logstash_api_port() -> int:
     instance_id = state.get('instance_id')
     if instance_id is None:
         instance_id = (AGENT_CONFIG or {}).get('instance_id')
+    mode = (state.get('mode') or (AGENT_CONFIG or {}).get('mode') or '').lower()
     if instance_id is not None:
         try:
-            return 9560 + int(instance_id)
+            n = int(instance_id)
+            if mode == 'managed':
+                return 9700 + n
+            return 9560 + n
         except (TypeError, ValueError):
             pass
     return int((AGENT_CONFIG or {}).get('logstash_api_port') or 9560)
@@ -2591,12 +2600,22 @@ if __name__ == "__main__":
     if getattr(args, 'instance', None) is not None:
         AGENT_CONFIG['instance_id'] = args.instance
         agent_state.update_state('instance_id', args.instance)
+        cli_mode = (getattr(args, 'mode', None) or agent_state.get_state().get('mode') or '').lower()
         if not agent_state.get_state().get('logstash_unit'):
-            agent_state.update_state('logstash_unit', f'ls-simulate@{args.instance}')
+            if cli_mode == 'managed':
+                agent_state.update_state('logstash_unit', f'logstash-managed@{args.instance}')
+                if not agent_state.get_state().get('agent_unit'):
+                    agent_state.update_state('agent_unit', f'logstash-agent@{args.instance}')
+            else:
+                agent_state.update_state('logstash_unit', f'ls-simulate@{args.instance}')
+                if not agent_state.get_state().get('agent_unit'):
+                    agent_state.update_state('agent_unit', f'lsagent-simulate@{args.instance}')
         if not agent_state.get_state().get('agent_api_port'):
-            agent_state.update_state('agent_api_port', 9500 + int(args.instance))
+            base = 9600 if cli_mode == 'managed' else 9500
+            agent_state.update_state('agent_api_port', base + int(args.instance))
         if not agent_state.get_state().get('logstash_api_port'):
-            agent_state.update_state('logstash_api_port', 9560 + int(args.instance))
+            base = 9700 if cli_mode == 'managed' else 9560
+            agent_state.update_state('logstash_api_port', base + int(args.instance))
 
     # Resolve effective mode: CLI > state > config (with legacy mapping)
     state_preview = agent_state.get_state()
