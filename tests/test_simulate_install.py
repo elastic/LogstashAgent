@@ -31,14 +31,15 @@ SIM_POLICY = {
 }
 
 
-def test_write_config_default_mode(tmp_path):
+def test_write_config_packaged_mode(tmp_path):
     with patch.dict(installer.INSTALL_PATHS, {"config_dir": str(tmp_path)}), patch.object(
         installer, "get_logstash_uid_gid", return_value=(0, 0)
     ), patch.object(installer.os, "chown"), patch.object(installer.os, "chmod"):
         installer.write_config_file("http://ui.example")
     content = (tmp_path / "logstash-agent.yml").read_text()
-    assert "mode: default" in content
+    assert "mode: packaged" in content
     assert "mode: agent" not in content
+    assert "mode: default" not in content
 
 
 def test_write_config_simulate_mode(tmp_path):
@@ -130,5 +131,7 @@ def test_sudoers_includes_simulate_units():
         installer.configure_logstash()
 
     assert "content" in written
-    assert "ls-simulate@*" in written["content"]
-    assert "lsagent-simulate@*" in written["content"]
+    # sudo-rs forbids argument wildcards; units go through logstash-agent-ctl
+    assert "logstash-agent-ctl" in written["content"]
+    assert "ls-simulate@N" in written["content"] or "ls-simulate@" in written["content"]
+    assert "@*" not in written["content"]

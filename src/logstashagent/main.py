@@ -210,13 +210,15 @@ def load_agent_config() -> dict:
 
 def normalize_agent_mode(config: dict) -> dict:
     """
-    Normalize legacy mode/simulation_mode into mode: default|simulate|embedded.
+    Normalize legacy mode/simulation_mode into mode:
+      packaged | managed | simulate | embedded
+    (legacy aliases: default → packaged; agent|host → packaged)
 
     Mapping:
-      agent|host                         -> default
-      simulation + embedded (or missing) -> embedded
-      simulation + host                  -> simulate
-      default|simulate|embedded          -> unchanged
+      packaged|managed|simulate|embedded|default  -> first-class (default kept as alias)
+      agent|host                                  -> packaged
+      simulation + embedded (or missing)          -> embedded
+      simulation + host                           -> simulate
 
     When a legacy value is rewritten, sets config['_mode_legacy'] to a short
     description of the original value (for startup logging).
@@ -229,12 +231,12 @@ def normalize_agent_mode(config: dict) -> dict:
     mode = str(config.get('mode', '') or '').lower()
     sim_mode = str(config.get('simulation_mode', '') or '').lower()
 
-    if mode in ('default', 'simulate', 'embedded'):
+    if mode in ('packaged', 'managed', 'simulate', 'embedded', 'default'):
         config['mode'] = mode
         return config
     if mode in ('agent', 'host'):
         config['_mode_legacy'] = mode
-        config['mode'] = 'default'
+        config['mode'] = 'packaged'
         return config
     if mode == 'simulation' or mode == '':
         if sim_mode == 'host':
@@ -286,11 +288,13 @@ def is_systemctl_managed_simulate() -> bool:
     if instance_id is None:
         instance_id = (AGENT_CONFIG or {}).get('instance_id')
 
-    if mode == 'simulate' and instance_id is not None:
+    if mode in ('simulate', 'managed') and instance_id is not None:
         return True
 
     policy_type = (state.get('policy_type') or '').upper()
-    if state.get('enrolled') and policy_type == 'SIMULATE' and instance_id is not None:
+    if policy_type == 'DEFAULT':
+        policy_type = 'PACKAGED'
+    if state.get('enrolled') and policy_type in ('SIMULATE', 'MANAGED') and instance_id is not None:
         return True
 
     return False
@@ -2614,15 +2618,17 @@ if __name__ == "__main__":
     )
     log_resolved_agent_mode(agent_mode, legacy=mode_legacy, source=mode_source)
 
-    # Check if we're in run mode (controller for enrolled default/simulate agents)
+    # Check if we're in run mode (controller for enrolled packaged/managed/simulate agents)
     if args.run:
         # Persist the Logstash API port from config/state so check_in uses the right port.
-        # default package Logstash: 9600; simulate: 9560+N; embedded: 9560
+        # packaged: 9600; simulate: 9560+N; managed: 9700+N; embedded: 9560
         state = agent_state.get_state()
         if state.get('logstash_api_port'):
             logstash_api_port = state.get('logstash_api_port')
         elif agent_mode == 'simulate' and state.get('instance_id') is not None:
             logstash_api_port = 9560 + int(state['instance_id'])
+        elif agent_mode == 'managed' and state.get('instance_id') is not None:
+            logstash_api_port = 9700 + int(state['instance_id'])
         elif agent_mode == 'embedded':
             logstash_api_port = AGENT_CONFIG.get('logstash_api_port', 9560)
         else:
@@ -2633,18 +2639,23 @@ if __name__ == "__main__":
             agent_state.update_state('mode', agent_mode)
         logger.info(f"Logstash API port set to {logstash_api_port} (mode={agent_mode})")
 
-        if agent_mode == 'simulate':
-            # Simulate agents need both controller reconciliation and FastAPI sim API.
-            # Run controller in a background thread; uvicorn serves sim routes on agent port.
+        if agent_mode in ('simulate', 'managed'):
+            # Multi-instance agents need controller reconciliation + FastAPI agent API.
+            # Run controller in a background thread; uvicorn serves routes on agent port.
             import threading
-            t = threading.Thread(target=controller.run_controller, name='simulate-controller', daemon=True)
+            t = threading.Thread(
+                target=controller.run_controller,
+                name=f'{agent_mode}-controller',
+                daemon=True,
+            )
             t.start()
+            default_base = 9600 if agent_mode == 'managed' else 9500
             agent_port = (
                 state.get('agent_api_port')
                 or AGENT_CONFIG.get('port')
-                or (9500 + int(state['instance_id']) if state.get('instance_id') is not None else 9500)
+                or (default_base + int(state['instance_id']) if state.get('instance_id') is not None else default_base)
             )
-            logger.info(f"Starting simulate FastAPI on port {agent_port}")
+            logger.info(f"Starting {agent_mode} FastAPI on port {agent_port}")
             try:
                 from logstashagent import tls_server
 
@@ -2654,9 +2665,9 @@ if __name__ == "__main__":
                 logger.warning("Agent server TLS setup failed: %s", e)
                 ssl_kw = {}
             if ssl_kw:
-                logger.info("Simulate FastAPI serving HTTPS (product-CA cert)")
+                logger.info("%s FastAPI serving HTTPS (product-CA cert)", agent_mode.capitalize())
             else:
-                logger.warning("Simulate FastAPI serving HTTP (no agent server cert yet)")
+                logger.warning("%s FastAPI serving HTTP (no agent server cert yet)", agent_mode.capitalize())
             uvicorn.run(app, host="0.0.0.0", port=int(agent_port), **ssl_kw)
             sys.exit(0)
 
@@ -2664,10 +2675,10 @@ if __name__ == "__main__":
         sys.exit(0)
     
     # Non-run entry: FastAPI for embedded (and legacy simulation) only
-    if agent_mode == 'default':
-        logger.info("mode=default requires --run after enrollment (controller only)")
+    if agent_mode in ('default', 'packaged'):
+        logger.info("mode=%s requires --run after enrollment (controller only)", agent_mode)
         sys.exit(1)
-    if agent_mode not in ('embedded', 'simulate', 'simulation'):
+    if agent_mode not in ('embedded', 'simulate', 'managed', 'simulation'):
         logger.info(f"Unrecognized mode {agent_mode}; starting embedded-style FastAPI")
         # fall through to FastAPI
     

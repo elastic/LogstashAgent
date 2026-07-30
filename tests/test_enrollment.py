@@ -175,8 +175,9 @@ class TestSaveEnrollmentConfig:
         assert ("logs_path", "/var/log") in calls
         assert ("binary_path", None) in calls
         assert ("revision_number", 0) in calls
-        assert ("policy_type", "DEFAULT") in calls
-        assert ("mode", "default") in calls
+        # Missing policy_type defaults to PACKAGED / mode packaged
+        assert ("policy_type", "PACKAGED") in calls
+        assert ("mode", "packaged") in calls
         assert ("policy_config", policy) in calls
 
     def test_simulate_saves_policy_blob_and_pending_flag(self):

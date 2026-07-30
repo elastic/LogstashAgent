@@ -199,15 +199,20 @@ def save_enrollment_config(api_key: str, logstash_ui_url: str, policy_id: int, c
         if policy_config.get('config_path') is not None:
             agent_state.update_state('config_path', policy_config.get('config_path'))
 
-        # Agent role / simulate instance fields (policy_type: DEFAULT|SIMULATE|EMBEDDED)
-        policy_type = (policy_config.get('policy_type') or 'DEFAULT').upper()
+        # Agent role fields (policy_type: PACKAGED|MANAGED|SIMULATE|EMBEDDED; DEFAULT→packaged)
+        policy_type = (policy_config.get('policy_type') or 'PACKAGED').upper()
+        if policy_type == 'DEFAULT':
+            policy_type = 'PACKAGED'
         agent_state.update_state('policy_type', policy_type)
         if policy_type == 'SIMULATE':
             agent_state.update_state('mode', 'simulate')
+        elif policy_type == 'MANAGED':
+            agent_state.update_state('mode', 'managed')
         elif policy_type == 'EMBEDDED':
             agent_state.update_state('mode', 'embedded')
         else:
-            agent_state.update_state('mode', 'default')
+            # PACKAGED (and any unknown production type)
+            agent_state.update_state('mode', 'packaged')
 
         if policy_config.get('instance_id') is not None:
             agent_state.update_state('instance_id', policy_config.get('instance_id'))
@@ -221,6 +226,8 @@ def save_enrollment_config(api_key: str, logstash_ui_url: str, policy_id: int, c
             agent_state.update_state('logstash_unit', policy_config.get('logstash_unit'))
         if policy_config.get('agent_unit'):
             agent_state.update_state('agent_unit', policy_config.get('agent_unit'))
+        if policy_config.get('path_root'):
+            agent_state.update_state('path_root', policy_config.get('path_root'))
         if policy_config.get('logstash_source'):
             agent_state.update_state('logstash_source', policy_config.get('logstash_source'))
         if policy_config.get('logstash_version') is not None:
@@ -232,7 +239,8 @@ def save_enrollment_config(api_key: str, logstash_ui_url: str, policy_id: int, c
         # Full policy_config for deferred root setup (non-root --enroll)
         if policy_config:
             agent_state.update_state('policy_config', policy_config)
-            if policy_type == 'SIMULATE':
+            # Multi-instance roles need host materialize (SIMULATE; MANAGED reuses setup for now)
+            if policy_type in ('SIMULATE', 'MANAGED'):
                 agent_state.update_state('simulate_setup_pending', True)
         
         # Set initial revision number to 0 (agent has no configuration yet)
@@ -279,11 +287,15 @@ def perform_enrollment(encoded_token: str, logstash_ui_url: str, agent_id: str):
             policy_config=policy_config
         )
 
-        # SIMULATE: materialize dirs/units (root, passwordless sudo, or deferred)
+        # Multi-instance (SIMULATE / MANAGED): materialize dirs/units
         setup_result = None
-        if (policy_config.get('policy_type') or '').upper() == 'SIMULATE':
+        _pt = (policy_config.get('policy_type') or 'PACKAGED').upper()
+        if _pt == 'DEFAULT':
+            _pt = 'PACKAGED'
+        if _pt in ('SIMULATE', 'MANAGED'):
             from logstashagent import installer as _installer
-            logger.info("Setting up simulate instance (dirs, units, binary)...")
+            role = 'managed' if _pt == 'MANAGED' else 'simulate'
+            logger.info("Setting up %s instance (dirs, units, binary)...", role)
             setup_result = _installer.ensure_simulate_setup(policy_config)
             result['simulate_setup'] = setup_result
             if setup_result.get('status') == 'complete':
@@ -298,16 +310,15 @@ def perform_enrollment(encoded_token: str, logstash_ui_url: str, agent_id: str):
         logger.info(f"Connection ID: {result['connection_id']}")
         logger.info(f"Policy ID: {result['policy_id']}")
         logger.info(f"API Key: {result['api_key'][:10]}...")
-        if (policy_config.get('policy_type') or '').upper() == 'SIMULATE':
-            logger.info(f"Mode: simulate instance_id={policy_config.get('instance_id')}")
+        if _pt in ('SIMULATE', 'MANAGED'):
+            role = 'managed' if _pt == 'MANAGED' else 'simulate'
+            logger.info(f"Mode: {role} instance_id={policy_config.get('instance_id')}")
             if setup_result and setup_result.get('status') == 'complete':
-                logger.info(
-                    f"Simulate setup complete. Start with: "
-                    f"sudo systemctl start lsagent-simulate@{policy_config.get('instance_id')}"
-                )
+                unit = policy_config.get('agent_unit') or f"lsagent-simulate@{policy_config.get('instance_id')}"
+                logger.info(f"Setup complete. Start with: sudo systemctl start {unit}")
             else:
                 logger.warning("=" * 60)
-                logger.warning("SIMULATE SETUP INCOMPLETE (enrollment is still valid)")
+                logger.warning("%s SETUP INCOMPLETE (enrollment is still valid)", role.upper())
                 for line in (setup_result or {}).get('messages') or []:
                     logger.warning("  %s", line)
                 logger.warning(

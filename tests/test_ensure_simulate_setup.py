@@ -161,16 +161,16 @@ def test_perform_setup_simulate_success():
     upd.assert_any_call('simulate_setup_pending', False)
 
 
-def test_perform_setup_simulate_rejects_default_mode():
+def test_perform_setup_simulate_rejects_packaged_mode():
     with patch.object(installer, 'verify_root'), patch.object(
         installer, 'verify_platform'
     ), patch(
         'logstashagent.agent_state.get_state',
         return_value={
             'enrolled': True,
-            'mode': 'default',
-            'policy_config': {'policy_type': 'DEFAULT'},
+            'mode': 'packaged',
+            'policy_config': {'policy_type': 'PACKAGED'},
         },
     ):
-        with pytest.raises(installer.InstallError, match='not a simulate'):
+        with pytest.raises(installer.InstallError, match='not a multi-instance'):
             installer.perform_setup_simulate(yes=True)

@@ -373,16 +373,22 @@ def create_symlink():
 
 
 def write_config_file(logstash_ui_url: str, policy_config: Optional[dict] = None):
-    """Write the initial agent config file (default or simulate)."""
+    """Write the initial agent config file (packaged / managed / simulate)."""
     logger.info("Writing configuration file...")
     policy_config = policy_config or {}
-    policy_type = (policy_config.get('policy_type') or 'DEFAULT').upper()
-    is_simulate = policy_type == 'SIMULATE'
+    policy_type = (policy_config.get('policy_type') or 'PACKAGED').upper()
+    if policy_type == 'DEFAULT':
+        policy_type = 'PACKAGED'
+    is_multi = policy_type in ('SIMULATE', 'MANAGED')
 
     logstash_present = os.path.isdir('/usr/share/logstash') and os.path.isdir('/etc/logstash')
 
-    if is_simulate:
+    if is_multi:
         instance_id = policy_config.get('instance_id', 1)
+        mode_name = 'managed' if policy_type == 'MANAGED' else 'simulate'
+        default_prefix = (
+            f"managed-{instance_id}" if policy_type == 'MANAGED' else f"simulate-{instance_id}"
+        )
         binary = normalize_opt_path(
             policy_config.get('binary_path', '/usr/share/logstash/bin')
         ) or '/usr/share/logstash/bin'
@@ -390,23 +396,27 @@ def write_config_file(logstash_ui_url: str, policy_config: Optional[dict] = None
             binary = str(Path(binary) / 'logstash')
         settings = normalize_opt_path(
             policy_config.get(
-                'settings_path', f"/opt/logstash-agent/simulate-{instance_id}/settings"
+                'settings_path', f"/opt/logstash-agent/{default_prefix}/settings"
             )
         )
         logs = normalize_opt_path(
             policy_config.get(
-                'logs_path', f"/opt/logstash-agent/simulate-{instance_id}/logs"
+                'logs_path', f"/opt/logstash-agent/{default_prefix}/logs"
             )
         )
-        agent_port = policy_config.get('agent_api_port', 9500 + int(instance_id))
-        ls_port = policy_config.get('logstash_api_port', 9560 + int(instance_id))
+        if policy_type == 'MANAGED':
+            agent_port = policy_config.get('agent_api_port', 9600 + int(instance_id))
+            ls_port = policy_config.get('logstash_api_port', 9700 + int(instance_id))
+        else:
+            agent_port = policy_config.get('agent_api_port', 9500 + int(instance_id))
+            ls_port = policy_config.get('logstash_api_port', 9560 + int(instance_id))
         download_dir = normalize_opt_path(
             policy_config.get('logstash_download_dir')
             or f"{INSTALL_PATHS['simulate_root']}/logstash-versions"
         )
         config_content = f"""# LogstashAgent Configuration
-# Generated during installation (SIMULATE instance)
-mode: simulate
+# Generated during installation ({policy_type} instance)
+mode: {mode_name}
 instance_id: {instance_id}
 
 logstash_binary: {binary}
@@ -418,7 +428,7 @@ logstash_source: {policy_config.get('logstash_source') or 'SYSTEM'}
 logstash_version: "{policy_config.get('logstash_version') or ''}"
 logstash_download_dir: {download_dir}
 
-# FastAPI sim API (simulate agents)
+# FastAPI agent API (multi-instance roles)
 host: 0.0.0.0
 port: {agent_port}
 
@@ -432,21 +442,33 @@ logstash_ui_url: {logstash_ui_url}
                 "# Update the three paths below to match your Logstash installation\n"
                 "# before starting the logstash-agent service.\n"
             )
+        settings = normalize_opt_path(
+            policy_config.get('settings_path') or '/etc/logstash'
+        ) or '/etc/logstash'
+        logs = normalize_opt_path(
+            policy_config.get('logs_path') or '/var/log/logstash'
+        ) or '/var/log/logstash'
+        binary = normalize_opt_path(
+            policy_config.get('binary_path') or '/usr/share/logstash/bin'
+        ) or '/usr/share/logstash/bin'
+        if binary and not str(binary).endswith('logstash') and not str(binary).endswith('logstash.bat'):
+            binary = str(Path(binary) / 'logstash')
+        ls_port = policy_config.get('logstash_api_port') or 9600
         config_content = f"""# LogstashAgent Configuration
-# Generated during installation
+# Generated during installation (PACKAGED / distro Logstash)
 {path_comment}
-mode: default
+mode: packaged
 
 # Paths to this Logstash installation
-logstash_binary: /usr/share/logstash/bin/logstash
-logstash_settings: /etc/logstash
-logstash_log_path: /var/log/logstash
+logstash_binary: {binary}
+logstash_settings: {settings}
+logstash_log_path: {logs}
 
-# Port that Logstash's monitoring API listens on (default: 9600 for native installs)
-# Embedded Docker uses 9560; simulate instances use 9560+N
-logstash_api_port: 9600
+# Port that Logstash's monitoring API listens on (default: 9600 for package installs)
+# Embedded Docker uses 9560; simulate instances use 9560+N; managed use 9700+N
+logstash_api_port: {ls_port}
 
-# Agent API server (not used in default controller mode)
+# Agent API server (not used in packaged controller mode)
 host: 127.0.0.1
 port: 9600
 
@@ -533,10 +555,21 @@ def materialize_simulate_instance(policy_config: dict) -> dict:
 
     instance_id = policy_config.get('instance_id')
     if instance_id is None:
-        raise InstallError("SIMULATE policy_config missing instance_id")
+        raise InstallError("Multi-instance policy_config missing instance_id")
 
     instance_id = int(instance_id)
-    root = Path(INSTALL_PATHS['simulate_root']) / f"simulate-{instance_id}"
+    pt = (policy_config.get('policy_type') or 'SIMULATE').upper()
+    if pt == 'DEFAULT':
+        pt = 'PACKAGED'
+    # Prefer explicit path_root / deployment_id (managed-N or simulate-N)
+    if policy_config.get('path_root'):
+        root = Path(normalize_opt_path(policy_config['path_root']))
+    elif policy_config.get('deployment_id'):
+        root = Path(INSTALL_PATHS['simulate_root']) / str(policy_config['deployment_id'])
+    elif pt == 'MANAGED':
+        root = Path(INSTALL_PATHS['simulate_root']) / f"managed-{instance_id}"
+    else:
+        root = Path(INSTALL_PATHS['simulate_root']) / f"simulate-{instance_id}"
     # Prefer code-derived root so a bad settings_path under /opt/LogstashAgent cannot win
     settings = root / 'settings'
     if policy_config.get('settings_path'):
@@ -898,21 +931,28 @@ def ensure_simulate_setup(policy_config: dict) -> dict:
         dict with status: complete | partial | pending, messages: list[str]
     """
     policy_config = policy_config or {}
-    if (policy_config.get('policy_type') or '').upper() != 'SIMULATE':
-        return {'status': 'complete', 'messages': ['Not a SIMULATE policy'], 'via': 'n/a'}
+    pt = (policy_config.get('policy_type') or '').upper()
+    if pt == 'DEFAULT':
+        pt = 'PACKAGED'
+    if pt not in ('SIMULATE', 'MANAGED'):
+        return {'status': 'complete', 'messages': [f'Not a multi-instance policy ({pt or "none"})'], 'via': 'n/a'}
 
     instance_id = policy_config.get('instance_id')
     messages = []
+    prefix = (
+        policy_config.get('deployment_id')
+        or (f'managed-{instance_id}' if pt == 'MANAGED' else f'simulate-{instance_id}')
+    )
 
     # 1. Root
     try:
         if os.geteuid() == 0:
-            logger.info("Running as root — full simulate setup")
+            logger.info("Running as root — full multi-instance setup (%s)", pt)
             result = setup_simulate_from_policy(policy_config)
             return {
                 'status': 'complete',
                 'via': 'root',
-                'messages': [f"Materialized simulate-{instance_id} and installed units"],
+                'messages': [f"Materialized {prefix} and installed units"],
                 'result': result,
             }
     except Exception as e:
@@ -995,19 +1035,34 @@ def perform_setup_simulate(yes: bool = False) -> dict:
         )
 
     policy_config = policy_config_from_state(state)
-    if (policy_config.get('policy_type') or '').upper() != 'SIMULATE' and state.get('mode') != 'simulate':
+    pt = (policy_config.get('policy_type') or '').upper()
+    if pt == 'DEFAULT':
+        pt = 'PACKAGED'
+    mode = (state.get('mode') or '').lower()
+    if pt not in ('SIMULATE', 'MANAGED') and mode not in ('simulate', 'managed'):
         raise InstallError(
-            "Agent is not a simulate enrollment (mode/policy_type is not SIMULATE). "
+            "Agent is not a multi-instance enrollment (SIMULATE/MANAGED). "
             f"mode={state.get('mode')} policy_type={policy_config.get('policy_type')}"
         )
-    policy_config['policy_type'] = 'SIMULATE'
+    if pt not in ('SIMULATE', 'MANAGED'):
+        pt = 'MANAGED' if mode == 'managed' else 'SIMULATE'
+    policy_config['policy_type'] = pt
     if policy_config.get('instance_id') is None:
         raise InstallError(
-            "Missing instance_id in agent state. Re-enroll with a Simulate policy token."
+            "Missing instance_id in agent state. Re-enroll with a Simulate or Managed policy token."
         )
 
+    prefix = (
+        policy_config.get('deployment_id')
+        or policy_config.get('path_root')
+        or (
+            f"managed-{policy_config['instance_id']}"
+            if pt == 'MANAGED'
+            else f"simulate-{policy_config['instance_id']}"
+        )
+    )
     if not yes:
-        print(f"\nThis will materialize /opt/logstash-agent/simulate-{policy_config['instance_id']}/")
+        print(f"\nThis will materialize /opt/logstash-agent/{Path(str(prefix)).name}/")
         print("and install/enable lsagent-simulate@ and ls-simulate@ units.")
         answer = input("Continue? [y/N]: ").strip().lower()
         if answer != 'y':
@@ -1339,8 +1394,10 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
         policy_config = {}
         if isinstance(enroll_result, dict):
             policy_config = enroll_result.get('policy_config') or {}
-        policy_type = (policy_config.get('policy_type') or 'DEFAULT').upper()
-        is_simulate = policy_type == 'SIMULATE'
+        policy_type = (policy_config.get('policy_type') or 'PACKAGED').upper()
+        if policy_type == 'DEFAULT':
+            policy_type = 'PACKAGED'
+        is_multi = policy_type in ('SIMULATE', 'MANAGED')
 
         # Step 6: Write config file (mode-aware)
         logger.info("\nStep 6: Writing configuration...")
@@ -1348,12 +1405,15 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
 
         # Step 7: Install systemd units
         logger.info("\nStep 7: Installing systemd service(s)...")
-        if is_simulate:
+        if is_multi:
             setup_simulate_from_policy(policy_config)
-            # Shared agent binary is still installed; default unit is optional
+            # Shared agent binary is still installed; packaged unit is optional
             # for coexistence with a production agent on the same host — do not
-            # enable logstash-agent.service for pure simulate installs.
-            logger.info("✓ Simulate units installed (lsagent-simulate@ / ls-simulate@)")
+            # enable logstash-agent.service for pure multi-instance installs.
+            logger.info(
+                "✓ Multi-instance units installed (lsagent-simulate@ / ls-simulate@; "
+                "managed reuses these until logstash-agent@ / logstash-managed@ ship)"
+            )
         else:
             install_systemd_service()
 
@@ -1383,9 +1443,9 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
                 logger.warning(f"Could not clean up log file: {e}")
 
         # Step 9: Configure Logstash permissions for agent management
-        if is_simulate:
-            # Still write sudoers (simulate units + optional package logstash)
-            logger.info("\nStep 9: Configuring permissions (simulate + sudoers)...")
+        if is_multi:
+            # Still write sudoers (multi-instance units + optional package logstash)
+            logger.info("\nStep 9: Configuring permissions (multi-instance + sudoers)...")
             configure_logstash()
         elif logstash_present:
             logger.info("\nStep 9: Configuring Logstash permissions...")
@@ -1406,7 +1466,7 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
 
         # Step 11: Enable/start services (full deploy — no extra cut-paste for enable/start)
         logger.info("\nStep 11: Enabling and starting services...")
-        if is_simulate:
+        if is_multi:
             # enable_simulate_services already ran inside setup_simulate_from_policy
             pass
         else:
@@ -1419,14 +1479,29 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
         logger.info("INSTALLATION COMPLETED SUCCESSFULLY!")
         logger.info("="*60)
 
-        if is_simulate:
+        if is_multi:
             instance_id = policy_config.get('instance_id')
-            agent_unit = f"lsagent-simulate@{instance_id}"
-            ls_unit = f"ls-simulate@{instance_id}"
-            logger.info("\nSimulate agent installed and started.")
+            agent_unit = (
+                policy_config.get('agent_unit')
+                or f"lsagent-simulate@{instance_id}"
+            )
+            ls_unit = (
+                policy_config.get('logstash_unit')
+                or f"ls-simulate@{instance_id}"
+            )
+            path_root = (
+                policy_config.get('path_root')
+                or (
+                    f"/opt/logstash-agent/managed-{instance_id}"
+                    if policy_type == 'MANAGED'
+                    else f"/opt/logstash-agent/simulate-{instance_id}"
+                )
+            )
+            role = 'Managed' if policy_type == 'MANAGED' else 'Simulate'
+            logger.info(f"\n{role} agent installed and started.")
             logger.info(f"  Agent unit:    {agent_unit} (enabled + started)")
             logger.info(f"  Logstash unit: {ls_unit} (enabled; agent restarts when ready)")
-            logger.info(f"  Paths under:   /opt/logstash-agent/simulate-{instance_id}/")
+            logger.info(f"  Paths under:   {path_root}/")
             logger.info("\nDay-2 operations:")
             logger.info(f"  sudo systemctl status {agent_unit}")
             logger.info(f"  sudo systemctl stop {agent_unit}")

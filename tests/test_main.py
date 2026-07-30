@@ -383,18 +383,18 @@ class TestMainEdgeCases:
         assert response.json() == {}
 
 class TestNormalizeAgentMode:
-    def test_legacy_agent_maps_to_default(self):
+    def test_legacy_agent_maps_to_packaged(self):
         from logstashagent.main import normalize_agent_mode
 
         n = normalize_agent_mode({"mode": "agent"})
-        assert n["mode"] == "default"
+        assert n["mode"] == "packaged"
         assert n["_mode_legacy"] == "agent"
 
-    def test_legacy_host_maps_to_default(self):
+    def test_legacy_host_maps_to_packaged(self):
         from logstashagent.main import normalize_agent_mode
 
         n = normalize_agent_mode({"mode": "host"})
-        assert n["mode"] == "default"
+        assert n["mode"] == "packaged"
         assert n["_mode_legacy"] == "host"
 
     def test_modern_default_no_legacy(self):
@@ -403,6 +403,12 @@ class TestNormalizeAgentMode:
         n = normalize_agent_mode({"mode": "default"})
         assert n["mode"] == "default"
         assert "_mode_legacy" not in n or n.get("_mode_legacy") is None
+
+    def test_packaged_and_managed_first_class(self):
+        from logstashagent.main import normalize_agent_mode
+
+        assert normalize_agent_mode({"mode": "packaged"})["mode"] == "packaged"
+        assert normalize_agent_mode({"mode": "managed"})["mode"] == "managed"
 
     def test_simulation_host_maps_to_simulate(self):
         from logstashagent.main import normalize_agent_mode
@@ -416,9 +422,9 @@ class TestNormalizeAgentMode:
         from logstashagent.main import log_resolved_agent_mode
 
         with caplog.at_level(logging.INFO):
-            log_resolved_agent_mode("default", legacy="agent", source="config")
+            log_resolved_agent_mode("packaged", legacy="agent", source="config")
         assert any(
-            "mode=default (legacy 'agent' mapped)" in r.message for r in caplog.records
+            "mode=packaged (legacy 'agent' mapped)" in r.message for r in caplog.records
         )
 
     def test_list_pipelines_with_data(self, client, mock_dirs):
