@@ -23,6 +23,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 DEFAULT_DOWNLOAD_ROOT = "/opt/logstash-agent/logstash-versions"
+_LEGACY_DOWNLOAD_ROOT = "/opt/LogstashAgent/logstash-versions"
 ARTIFACTS_BASE = "https://artifacts.elastic.co/downloads/logstash"
 
 
@@ -198,6 +199,14 @@ def ensure_logstash_version(
     return binary
 
 
+def normalize_download_dir(path: str | None) -> str:
+    """Force downloads under /opt/logstash-agent (rewrite legacy /opt/LogstashAgent)."""
+    p = (path or DEFAULT_DOWNLOAD_ROOT).strip() or DEFAULT_DOWNLOAD_ROOT
+    if p.startswith("/opt/LogstashAgent"):
+        return "/opt/logstash-agent" + p[len("/opt/LogstashAgent") :]
+    return p
+
+
 def resolve_binary_from_policy(
     *,
     logstash_source: str = "SYSTEM",
@@ -215,7 +224,7 @@ def resolve_binary_from_policy(
     if source == "VERSION":
         binary = ensure_logstash_version(
             logstash_version,
-            logstash_download_dir or DEFAULT_DOWNLOAD_ROOT,
+            normalize_download_dir(logstash_download_dir),
         )
         return str(binary)
 

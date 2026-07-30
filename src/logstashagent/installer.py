@@ -37,6 +37,21 @@ INSTALL_PATHS = {
     'ls_simulate_unit': '/etc/systemd/system/ls-simulate@.service',
 }
 
+# Legacy root from early simulate work — never recreate; rewrite inbound policy paths
+_LEGACY_OPT_ROOT = '/opt/LogstashAgent'
+
+
+def normalize_opt_path(path) -> str:
+    """Rewrite /opt/LogstashAgent → /opt/logstash-agent on policy/enroll paths."""
+    if path is None:
+        return ''
+    p = str(path)
+    if not p:
+        return ''
+    if p.startswith(_LEGACY_OPT_ROOT):
+        return INSTALL_PATHS['simulate_root'] + p[len(_LEGACY_OPT_ROOT):]
+    return p.replace(_LEGACY_OPT_ROOT, INSTALL_PATHS['simulate_root'])
+
 # Shell helper invoked via sudo; validates unit names so sudoers need no arg wildcards
 # (sudo-rs / Ubuntu 26+ rejects patterns like systemctl restart ls-simulate@*).
 _SYSTEMCTL_CTL_SCRIPT = r'''#!/bin/sh
@@ -368,17 +383,27 @@ def write_config_file(logstash_ui_url: str, policy_config: Optional[dict] = None
 
     if is_simulate:
         instance_id = policy_config.get('instance_id', 1)
-        binary = policy_config.get('binary_path', '/usr/share/logstash/bin')
+        binary = normalize_opt_path(
+            policy_config.get('binary_path', '/usr/share/logstash/bin')
+        ) or '/usr/share/logstash/bin'
         if binary and not str(binary).endswith('logstash') and not str(binary).endswith('logstash.bat'):
             binary = str(Path(binary) / 'logstash')
-        settings = policy_config.get(
-            'settings_path', f"/opt/logstash-agent/simulate-{instance_id}/settings"
+        settings = normalize_opt_path(
+            policy_config.get(
+                'settings_path', f"/opt/logstash-agent/simulate-{instance_id}/settings"
+            )
         )
-        logs = policy_config.get(
-            'logs_path', f"/opt/logstash-agent/simulate-{instance_id}/logs"
+        logs = normalize_opt_path(
+            policy_config.get(
+                'logs_path', f"/opt/logstash-agent/simulate-{instance_id}/logs"
+            )
         )
         agent_port = policy_config.get('agent_api_port', 9500 + int(instance_id))
         ls_port = policy_config.get('logstash_api_port', 9560 + int(instance_id))
+        download_dir = normalize_opt_path(
+            policy_config.get('logstash_download_dir')
+            or f"{INSTALL_PATHS['simulate_root']}/logstash-versions"
+        )
         config_content = f"""# LogstashAgent Configuration
 # Generated during installation (SIMULATE instance)
 mode: simulate
@@ -391,7 +416,7 @@ logstash_log_path: {logs}
 logstash_api_port: {ls_port}
 logstash_source: {policy_config.get('logstash_source') or 'SYSTEM'}
 logstash_version: "{policy_config.get('logstash_version') or ''}"
-logstash_download_dir: {policy_config.get('logstash_download_dir') or '/opt/logstash-agent/logstash-versions'}
+logstash_download_dir: {download_dir}
 
 # FastAPI sim API (simulate agents)
 host: 0.0.0.0
@@ -493,8 +518,18 @@ def materialize_simulate_instance(policy_config: dict) -> dict:
     Create /opt/logstash-agent/simulate-N tree, env files, seed configs.
 
     Returns dict with resolved binary path and paths used.
+    Always uses INSTALL_PATHS['simulate_root'] (/opt/logstash-agent); rewrites
+    legacy /opt/LogstashAgent prefixes from older enroll payloads.
     """
     from logstashagent.logstash_download import resolve_binary_from_policy
+
+    # Normalize inbound paths (stale UI DB / old enrollments)
+    for key in (
+        'settings_path', 'config_path', 'logs_path', 'data_path',
+        'keystore_env_file', 'logstash_download_dir', 'binary_path',
+    ):
+        if key in policy_config and policy_config[key]:
+            policy_config[key] = normalize_opt_path(policy_config[key])
 
     instance_id = policy_config.get('instance_id')
     if instance_id is None:
@@ -502,11 +537,32 @@ def materialize_simulate_instance(policy_config: dict) -> dict:
 
     instance_id = int(instance_id)
     root = Path(INSTALL_PATHS['simulate_root']) / f"simulate-{instance_id}"
-    settings = Path(policy_config.get('settings_path') or root / 'settings')
-    config_dir = Path(policy_config.get('config_path') or root / 'config')
-    logs = Path(policy_config.get('logs_path') or root / 'logs')
-    data = Path(policy_config.get('data_path') or root / 'data')
-    env_file = Path(policy_config.get('keystore_env_file') or root / 'env')
+    # Prefer code-derived root so a bad settings_path under /opt/LogstashAgent cannot win
+    settings = root / 'settings'
+    if policy_config.get('settings_path'):
+        sp = Path(normalize_opt_path(policy_config['settings_path']))
+        if str(sp).startswith(str(root)):
+            settings = sp
+    config_dir = root / 'config'
+    if policy_config.get('config_path'):
+        cp = Path(normalize_opt_path(policy_config['config_path']))
+        if str(cp).startswith(str(root)):
+            config_dir = cp
+    logs = root / 'logs'
+    if policy_config.get('logs_path'):
+        lp = Path(normalize_opt_path(policy_config['logs_path']))
+        if str(lp).startswith(str(root)):
+            logs = lp
+    data = root / 'data'
+    if policy_config.get('data_path'):
+        dp = Path(normalize_opt_path(policy_config['data_path']))
+        if str(dp).startswith(str(root)):
+            data = dp
+    env_file = root / 'env'
+    if policy_config.get('keystore_env_file'):
+        ep = Path(normalize_opt_path(policy_config['keystore_env_file']))
+        if str(ep).startswith(str(root)):
+            env_file = ep
     agent_env = root / 'agent.env'
     state_dir = root / 'state'
 
