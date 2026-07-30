@@ -68,38 +68,121 @@ def ensure_private_key() -> Path:
     return path
 
 
-def _default_sans() -> list[str]:
+def _default_sans() -> tuple[list[str], list]:
+    """Return (dns_names, ip_addresses) for agent server CSR."""
+    import ipaddress
+
     names = ["localhost", "logstashagent"]
+    ips: list = [
+        ipaddress.IPv4Address("127.0.0.1"),
+        ipaddress.IPv6Address("::1"),
+    ]
+
+    def add_dns(n: str) -> None:
+        n = (n or "").strip()
+        if n and n not in names:
+            names.append(n)
+
+    def add_ip(raw: str) -> None:
+        raw = (raw or "").strip()
+        if not raw:
+            return
+        try:
+            ip = ipaddress.ip_address(raw)
+        except ValueError:
+            add_dns(raw)
+            return
+        if ip not in ips:
+            ips.append(ip)
+
     try:
         hn = socket.gethostname()
-        if hn and hn not in names:
-            names.append(hn)
+        add_dns(hn)
     except Exception:
         pass
     try:
         fqdn = socket.getfqdn()
-        if fqdn and fqdn not in names:
-            names.append(fqdn)
+        add_dns(fqdn)
     except Exception:
         pass
+
     extra = (os.environ.get("LOGSTASH_AGENT_TLS_SANS") or "").strip()
     if extra:
-        for part in extra.split(","):
+        for part in extra.replace(";", ",").split(","):
             p = part.strip()
-            if p and p not in names:
-                names.append(p)
-    return names
+            if not p:
+                continue
+            try:
+                ipaddress.ip_address(p)
+                add_ip(p)
+            except ValueError:
+                add_dns(p)
+
+    # Non-loopback local IPv4s (native host or container)
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            add_ip(s.getsockname()[0])
+        finally:
+            s.close()
+    except Exception:
+        pass
+    try:
+        hn = socket.gethostname()
+        for info in socket.getaddrinfo(hn, None):
+            add_ip(info[4][0])
+    except Exception:
+        pass
+
+    return names, ips
+
+
+def desired_san_keyset() -> set[str]:
+    dns_names, ips = _default_sans()
+    keys = {f"dns:{n.lower()}" for n in dns_names}
+    for ip in ips:
+        keys.add(f"ip:{ip.compressed}")
+    return keys
+
+
+def leaf_san_keyset_from_file() -> set[str]:
+    if not cert_path().is_file():
+        return set()
+    try:
+        leaf = x509.load_pem_x509_certificate(cert_path().read_bytes())
+    except Exception:
+        return set()
+    keys: set[str] = set()
+    try:
+        ext = leaf.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+        for name in ext.value:
+            if isinstance(name, x509.DNSName):
+                keys.add(f"dns:{name.value.lower()}")
+            elif isinstance(name, x509.IPAddress):
+                keys.add(f"ip:{name.value.compressed}")
+    except x509.ExtensionNotFound:
+        pass
+    return keys
 
 
 def build_csr_pem(sans: Optional[list[str]] = None) -> bytes:
     ensure_private_key()
     key = serialization.load_pem_private_key(key_path().read_bytes(), password=None)
-    dns_names = sans or _default_sans()
     import ipaddress
 
+    if sans is not None:
+        dns_names = list(sans)
+        ips = [
+            ipaddress.IPv4Address("127.0.0.1"),
+            ipaddress.IPv6Address("::1"),
+        ]
+    else:
+        dns_names, ips = _default_sans()
+
     san_list = [x509.DNSName(n) for n in dns_names]
-    san_list.append(x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")))
-    san_list.append(x509.IPAddress(ipaddress.IPv6Address("::1")))
+    for ip in ips:
+        san_list.append(x509.IPAddress(ip))
 
     cn = dns_names[0]
     csr = (
@@ -138,7 +221,7 @@ def has_server_cert() -> bool:
 
 
 def cert_needs_reissue(*, renew_within_days: int = 30) -> bool:
-    """True if missing, unreadable, expired/soon-expiring, or not signed by pinned product CA."""
+    """True if missing, unreadable, expired/soon-expiring, SAN drift, or wrong issuer."""
     if not has_server_cert():
         return True
     try:
@@ -166,6 +249,13 @@ def cert_needs_reissue(*, renew_within_days: int = 30) -> bool:
                 return True
     except Exception:
         pass
+    # Re-issue when hostname/IPs changed (missing desired SANs)
+    desired = desired_san_keyset()
+    actual = leaf_san_keyset_from_file()
+    missing = desired - actual
+    if missing:
+        logger.info("Agent cert missing SANs %s; will re-issue", sorted(missing)[:20])
+        return True
     return False
 
 

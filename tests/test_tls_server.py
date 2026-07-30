@@ -40,7 +40,8 @@ def test_build_csr_and_persist(tmp_path, monkeypatch):
     pem = cert.public_bytes(serialization.Encoding.PEM)
     tls_server.persist_server_certificate(pem)
     assert tls_server.has_server_cert()
-    assert not tls_server.cert_needs_reissue(renew_within_days=7)
+    # Self-signed test leaf lacks host SANs → re-issue is expected until UI signs full CSR
+    assert tls_server.cert_needs_reissue(renew_within_days=7) is True
     kw = tls_server.uvicorn_ssl_kwargs()
     assert "ssl_certfile" in kw
     assert "ssl_keyfile" in kw
