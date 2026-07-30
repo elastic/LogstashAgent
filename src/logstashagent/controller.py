@@ -1238,15 +1238,11 @@ def restart_logstash():
     try:
         logger.info(f"Restarting Logstash service ({unit})...")
 
-        # Try systemctl first (most common on Linux)
-        # Use sudo since agent runs as logstash user
+        # Prefer validated helper (sudo-rs compatible); falls back to sudo systemctl
         try:
-            result = subprocess.run(
-                ['sudo', 'systemctl', 'restart', unit],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
+            from logstashagent.installer import systemctl_via_sudo
+
+            result = systemctl_via_sudo('restart', unit, timeout=30)
 
             if result.returncode == 0:
                 logger.info(f"Logstash service restarted successfully via systemctl ({unit})")

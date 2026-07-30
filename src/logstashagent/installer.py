@@ -25,6 +25,8 @@ INSTALL_PATHS = {
     'binary_dir': '/opt/logstash-agent/bin',
     'binary': '/opt/logstash-agent/bin/logstash-agent',
     'symlink': '/usr/local/bin/logstash-agent',
+    # Validated systemctl wrapper (sudo-rs compatible — no wildcards in sudoers args)
+    'systemctl_ctl': '/opt/logstash-agent/bin/logstash-agent-ctl',
     'config_dir': '/etc/logstash-agent',
     'state_dir': '/var/lib/logstash-agent',
     'log_dir': '/var/log/logstash-agent',
@@ -34,6 +36,57 @@ INSTALL_PATHS = {
     'lsagent_simulate_unit': '/etc/systemd/system/lsagent-simulate@.service',
     'ls_simulate_unit': '/etc/systemd/system/ls-simulate@.service',
 }
+
+# Shell helper invoked via sudo; validates unit names so sudoers need no arg wildcards
+# (sudo-rs / Ubuntu 26+ rejects patterns like systemctl restart ls-simulate@*).
+_SYSTEMCTL_CTL_SCRIPT = r'''#!/bin/sh
+#Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+# Managed by logstash-agent install — do not edit by hand.
+# Usage: logstash-agent-ctl <start|stop|restart|status|is-active|enable|disable> <unit>
+set -eu
+ACTION="${1:-}"
+UNIT="${2:-}"
+if [ -z "$ACTION" ] || [ -z "$UNIT" ]; then
+  echo "usage: logstash-agent-ctl <action> <unit>" >&2
+  exit 2
+fi
+case "$ACTION" in
+  start|stop|restart|status|is-active|enable|disable) ;;
+  *)
+    echo "logstash-agent-ctl: disallowed action: $ACTION" >&2
+    exit 2
+    ;;
+esac
+# Allow fixed units and template instances with numeric instance ids only
+if ! echo "$UNIT" | grep -Eq '^(logstash|logstash-agent|(ls-simulate|lsagent-simulate)@[0-9]+)$'; then
+  echo "logstash-agent-ctl: disallowed unit: $UNIT" >&2
+  exit 2
+fi
+SYSTEMCTL="$(command -v systemctl 2>/dev/null || true)"
+if [ -z "$SYSTEMCTL" ]; then
+  if [ -x /usr/bin/systemctl ]; then
+    SYSTEMCTL=/usr/bin/systemctl
+  else
+    echo "logstash-agent-ctl: systemctl not found" >&2
+    exit 127
+  fi
+fi
+exec "$SYSTEMCTL" "$ACTION" "$UNIT"
+'''
+
+
+def install_systemctl_ctl() -> str:
+    """
+    Install the validated systemctl wrapper used by sudoers (path returned).
+    Safe for both GNU sudo and sudo-rs (no wildcards in sudoers command args).
+    """
+    path = INSTALL_PATHS['systemctl_ctl']
+    os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(_SYSTEMCTL_CTL_SCRIPT)
+    os.chmod(path, 0o755)
+    logger.info("✓ Installed systemctl helper: %s", path)
+    return path
 
 def _systemd_template_dir() -> Path:
     """
@@ -954,44 +1007,37 @@ def configure_logstash() -> None:
     else:
         logger.warning(f"Logstash data directory not found at {logstash_data_dir}")
 
+    # Validated systemctl helper + sudoers (sudo-rs forbids wildcards in args)
+    try:
+        install_systemctl_ctl()
+    except Exception as e:
+        logger.warning("Could not install systemctl helper: %s", e)
+
     # Write /etc/sudoers.d/logstash-agent
     sudoers_file = '/etc/sudoers.d/logstash-agent'
     using_sudo_rs = is_sudo_rs()
     if using_sudo_rs:
-        logger.info("sudo-rs detected — omitting 'Defaults:logstash !requiretty' (not supported)")
+        logger.info(
+            "sudo-rs detected — omitting 'Defaults:logstash !requiretty' and "
+            "using logstash-agent-ctl (no command-argument wildcards)"
+        )
         requiretty_line = ""
     else:
         requiretty_line = "Defaults:logstash !requiretty\n"
 
+    ctl = INSTALL_PATHS['systemctl_ctl']
+    agent_bin = INSTALL_PATHS['binary']
+    # Note: no @* wildcards — sudo-rs (Ubuntu 26+) rejects them. Simulate units
+    # go through logstash-agent-ctl which validates unit names itself.
     sudoers_content = f"""# LogstashAgent - Allow logstash user to manage Logstash service
 # This file is managed by logstash-agent installation
+# Compatible with GNU sudo and sudo-rs (no wildcards in command arguments)
 {requiretty_line}
-# Allow Logstash service management (default / production)
-logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart logstash
-logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop logstash
-logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl start logstash
-logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl status logstash
+# Validated systemctl wrapper (logstash, logstash-agent, ls-simulate@N, lsagent-simulate@N)
+logstash ALL=(ALL) NOPASSWD: {ctl}
 
-# Allow simulate Logstash / agent template units (ls-simulate@N, lsagent-simulate@N)
-logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart ls-simulate@*
-logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop ls-simulate@*
-logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl start ls-simulate@*
-logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl status ls-simulate@*
-logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart lsagent-simulate@*
-logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop lsagent-simulate@*
-logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl start lsagent-simulate@*
-logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl status lsagent-simulate@*
-logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl is-active ls-simulate@*
-logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl is-active lsagent-simulate@*
-
-# Allow LogstashAgent service management (needed for upgrades)
-logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop logstash-agent
-logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl start logstash-agent
-logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart logstash-agent
-logstash ALL=(ALL) NOPASSWD: /usr/bin/systemctl is-active logstash-agent
-
-# Allow LogstashAgent upgrade command (runs as root to replace binary)
-logstash ALL=(ALL) NOPASSWD: /opt/logstash-agent/bin/logstash-agent upgrade *
+# Allow LogstashAgent upgrade / privileged subcommands (fixed path; no arg wildcards)
+logstash ALL=(ALL) NOPASSWD: {agent_bin}
 
 # Allow modification of Logstash environment file (for keystore password)
 logstash ALL=(ALL) NOPASSWD: /usr/bin/cat /etc/default/logstash
@@ -1012,7 +1058,8 @@ logstash ALL=(ALL) NOPASSWD: /usr/bin/chmod 640 /etc/default/logstash
         if result.returncode == 0:
             logger.info("✓ Sudoers configuration validated successfully")
         else:
-            logger.warning(f"Sudoers validation warning: {result.stderr.decode()}")
+            err = (result.stderr or result.stdout or b"").decode(errors="replace")
+            logger.warning(f"Sudoers validation warning: {err}")
     except Exception as e:
         logger.warning(f"Could not create sudoers configuration: {e}")
         logger.warning("Agent may not be able to restart Logstash service")
@@ -1582,6 +1629,9 @@ def is_sudo_rs() -> bool:
     sudo-rs (Ubuntu 26+) does not support the 'Defaults:user !requiretty'
     directive — using it causes visudo validation to fail.  sudo-rs also does
     not require a TTY by default, so the directive is unnecessary there.
+
+    sudo-rs also rejects wildcards in *command arguments* (e.g.
+    ``systemctl restart ls-simulate@*``), which is why we use logstash-agent-ctl.
     """
     try:
         result = subprocess.run(
@@ -1593,6 +1643,30 @@ def is_sudo_rs() -> bool:
         return 'sudo-rs' in result.stdout or 'sudo-rs' in result.stderr
     except Exception:
         return False
+
+
+def systemctl_via_sudo(action: str, unit: str, *, timeout: int = 30) -> subprocess.CompletedProcess:
+    """
+    Run systemctl as root via the validated helper (preferred) or plain sudo.
+
+    Prefer ``sudo logstash-agent-ctl <action> <unit>`` so sudoers never need
+    wildcards (required for sudo-rs). Falls back to ``sudo systemctl`` for
+    older installs that only have the legacy drop-in.
+    """
+    ctl = INSTALL_PATHS['systemctl_ctl']
+    if os.path.isfile(ctl) and os.access(ctl, os.X_OK):
+        return subprocess.run(
+            ['sudo', ctl, action, unit],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    return subprocess.run(
+        ['sudo', 'systemctl', action, unit],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
 
 
 def verify_service_running() -> bool:

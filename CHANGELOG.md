@@ -25,6 +25,7 @@
 - Added **agent server TLS** (`tls_server.py`): local key + CSR, product-CA leaf from enroll/check-in/`IssueServerCert`, uvicorn HTTPS on the agent API port; re-issue on check-in without re-enroll; compose secret `LOGSTASHUI_AGENT_CSR_SECRET` for embedded bootstrap.
 - Agent server CSR SANs include hostname, FQDN, non-loopback local IPs, and `LOGSTASH_AGENT_TLS_SANS`; re-issue when SANs drift.
 - PyInstaller bundle includes **`lsagent-simulate@.service`** and **`ls-simulate@.service`** under `logstashagent/systemd/` for install.
+- **sudo-rs compatible sudoers** (Ubuntu 26+): install `/opt/logstash-agent/bin/logstash-agent-ctl` to run validated `systemctl` actions (no `ls-simulate@*` wildcards in sudoers). Restarts go through this helper.
 
 ### Changed
 
