@@ -380,8 +380,21 @@ def create_symlink():
     logger.info(f"✓ Created symlink {symlink_path} -> {INSTALL_PATHS['binary']}")
 
 
-def write_config_file(logstash_ui_url: str, policy_config: Optional[dict] = None):
-    """Write the initial agent config file (packaged / managed / simulate)."""
+def write_config_file(
+    logstash_ui_url: str,
+    policy_config: Optional[dict] = None,
+    *,
+    config_path: Optional[str] = None,
+) -> str:
+    """
+    Write the initial agent config file (packaged / managed / simulate).
+
+    Packaged → ``/etc/logstash-agent/logstash-agent.yml`` (shared host default).
+    Multi-instance → ``{path_root}/logstash-agent.yml`` so it does not clobber
+    packaged config when roles coexist on one host.
+
+    Returns the path written.
+    """
     logger.info("Writing configuration file...")
     policy_config = policy_config or {}
     policy_type = (policy_config.get('policy_type') or 'PACKAGED').upper()
@@ -397,6 +410,10 @@ def write_config_file(logstash_ui_url: str, policy_config: Optional[dict] = None
         default_prefix = (
             f"managed-{instance_id}" if policy_type == 'MANAGED' else f"simulate-{instance_id}"
         )
+        path_root = normalize_opt_path(
+            policy_config.get('path_root')
+            or f"{INSTALL_PATHS['simulate_root']}/{default_prefix}"
+        )
         binary = normalize_opt_path(
             policy_config.get('binary_path', '/usr/share/logstash/bin')
         ) or '/usr/share/logstash/bin'
@@ -404,12 +421,12 @@ def write_config_file(logstash_ui_url: str, policy_config: Optional[dict] = None
             binary = str(Path(binary) / 'logstash')
         settings = normalize_opt_path(
             policy_config.get(
-                'settings_path', f"/opt/logstash-agent/{default_prefix}/settings"
+                'settings_path', f"{path_root}/settings"
             )
         )
         logs = normalize_opt_path(
             policy_config.get(
-                'logs_path', f"/opt/logstash-agent/{default_prefix}/logs"
+                'logs_path', f"{path_root}/logs"
             )
         )
         if policy_type == 'MANAGED':
@@ -422,8 +439,10 @@ def write_config_file(logstash_ui_url: str, policy_config: Optional[dict] = None
             policy_config.get('logstash_download_dir')
             or f"{INSTALL_PATHS['simulate_root']}/logstash-versions"
         )
+        state_dir = f"{path_root}/state"
         config_content = f"""# LogstashAgent Configuration
-# Generated during installation ({policy_type} instance)
+# Generated during installation ({policy_type} instance — host-coexistence safe)
+# Instance config lives under {path_root}/ so packaged /etc config is untouched.
 mode: {mode_name}
 instance_id: {instance_id}
 
@@ -441,7 +460,12 @@ host: 0.0.0.0
 port: {agent_port}
 
 logstash_ui_url: {logstash_ui_url}
+
+# Per-instance state (also set via LOGSTASH_AGENT_STATE_DIR in agent.env)
+# state_dir: {state_dir}
 """
+        if not config_path:
+            config_path = os.path.join(path_root, 'logstash-agent.yml')
     else:
         path_comment = ""
         if not logstash_present:
@@ -464,6 +488,7 @@ logstash_ui_url: {logstash_ui_url}
         ls_port = policy_config.get('logstash_api_port') or 9600
         config_content = f"""# LogstashAgent Configuration
 # Generated during installation (PACKAGED / distro Logstash)
+# Multi-instance roles use their own yml under /opt/logstash-agent/{{managed,simulate}}-N/
 {path_comment}
 mode: packaged
 
@@ -483,9 +508,10 @@ port: 9600
 # LogstashUI connection
 logstash_ui_url: {logstash_ui_url}
 """
+        if not config_path:
+            config_path = os.path.join(INSTALL_PATHS['config_dir'], 'logstash-agent.yml')
 
-    config_path = os.path.join(INSTALL_PATHS['config_dir'], 'logstash-agent.yml')
-
+    os.makedirs(os.path.dirname(config_path), mode=0o755, exist_ok=True)
     with open(config_path, 'w') as f:
         f.write(config_content)
 
@@ -497,6 +523,7 @@ logstash_ui_url: {logstash_ui_url}
     os.chmod(config_path, 0o640)
 
     logger.info(f"✓ Created configuration file {config_path}")
+    return config_path
 
 
 def _read_unit_template(name: str) -> str:
@@ -711,6 +738,9 @@ def materialize_simulate_instance(policy_config: dict) -> dict:
     os.chmod(env_file, 0o640)
     logger.info(f"✓ Wrote {env_file}")
 
+    # Per-instance state + config so packaged /var/lib and /etc are not shared
+    state_dir_path = str(state_dir)
+    agent_config_path = str(root / 'logstash-agent.yml')
     agent_env_lines = [
         f"INSTANCE_ID={instance_id}",
         f"AGENT_MODE={agent_mode}",
@@ -719,10 +749,13 @@ def materialize_simulate_instance(policy_config: dict) -> dict:
         f"LOGSTASH_SETTINGS={settings}",
         f"AGENT_UNIT={agent_unit}",
         f"LOGSTASH_UNIT={logstash_unit}",
+        # Host coexistence: isolate state/config from packaged agent
+        f"LOGSTASH_AGENT_STATE_DIR={state_dir_path}",
+        f"LOGSTASH_AGENT_CONFIG={agent_config_path}",
     ]
     agent_env.write_text('\n'.join(agent_env_lines) + '\n', encoding='utf-8')
     os.chmod(agent_env, 0o640)
-    logger.info(f"✓ Wrote {agent_env}")
+    logger.info(f"✓ Wrote {agent_env} (isolated state/config for coexistence)")
 
     # Ownership
     try:
@@ -752,6 +785,8 @@ def materialize_simulate_instance(policy_config: dict) -> dict:
         'data_path': str(data),
         'env_file': str(env_file),
         'agent_env': str(agent_env),
+        'agent_config_path': agent_config_path,
+        'state_dir': state_dir_path,
         'instance_id': instance_id,
         'agent_api_port': agent_port,
         'logstash_api_port': ls_port,
@@ -1524,7 +1559,27 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
         logger.info("\nStep 4: Creating symlink...")
         create_symlink()
         
-        # Step 5: Enroll first so we know default vs simulate policy
+        # Host coexistence: if a packaged agent is already registered, protect its
+        # state.json before multi-instance enroll writes temporary enrollment state
+        # into /var/lib/logstash-agent.
+        from logstashagent import install_registry as _reg
+        from logstashagent import agent_state as _as
+
+        packaged_state_path = Path(INSTALL_PATHS['state_dir']) / 'state.json'
+        packaged_state_backup: Optional[bytes] = None
+        try:
+            existing_reg = _reg.load_registry()
+            has_packaged = 'packaged' in (existing_reg.get('instances') or {})
+            if has_packaged and packaged_state_path.is_file():
+                packaged_state_backup = packaged_state_path.read_bytes()
+                logger.info(
+                    "Protected existing packaged agent state (host coexistence)"
+                )
+        except Exception as e:
+            logger.debug("Could not snapshot packaged state: %s", e)
+            has_packaged = False
+
+        # Step 5: Enroll first so we know packaged vs multi-instance policy
         logger.info("\nStep 5: Enrolling with LogstashUI...")
         enroll_result = enrollment_func(
             encoded_token=enroll_token,
@@ -1540,26 +1595,75 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
             policy_type = 'PACKAGED'
         is_multi = policy_type in ('SIMULATE', 'MANAGED')
 
-        # Step 6: Write config file (mode-aware)
+        # Step 6: Write config file (mode-aware; multi → instance tree, not /etc)
         logger.info("\nStep 6: Writing configuration...")
-        write_config_file(logstash_ui_url, policy_config=policy_config)
+        written_config = write_config_file(logstash_ui_url, policy_config=policy_config)
 
         # Step 7: Install systemd units
+        # Always install multi-instance templates so a later managed/simulate
+        # enroll can coexist with an existing packaged agent without re-install.
         logger.info("\nStep 7: Installing systemd service(s)...")
+        try:
+            install_multi_instance_unit_templates()
+        except Exception as e:
+            logger.warning("Multi-instance unit templates install: %s", e)
+
         if is_multi:
             setup_simulate_from_policy(policy_config)
-            # Shared agent binary is still installed; packaged logstash-agent.service
-            # is optional for coexistence — do not enable it for pure multi-instance.
+            # Relocate enrollment state into instance tree; restore packaged state
+            path_root = (
+                policy_config.get('path_root')
+                or (
+                    f"{INSTALL_PATHS['simulate_root']}/managed-{policy_config.get('instance_id')}"
+                    if policy_type == 'MANAGED'
+                    else f"{INSTALL_PATHS['simulate_root']}/simulate-{policy_config.get('instance_id')}"
+                )
+            )
+            inst_state = Path(normalize_opt_path(path_root)) / 'state'
+            try:
+                # Enrollment wrote into packaged STATE_DIR; move secrets to instance
+                _as.configure_state_dir(INSTALL_PATHS['state_dir'])
+                _as.relocate_state_to(inst_state, leave_source=True)
+                if packaged_state_backup is not None:
+                    packaged_state_path.write_bytes(packaged_state_backup)
+                    logger.info(
+                        "Restored packaged agent state after multi-instance enroll"
+                    )
+                elif packaged_state_path.is_file() and not has_packaged:
+                    # No prior packaged role — remove transient enroll copy so
+                    # only the instance tree holds enrollment secrets
+                    try:
+                        packaged_state_path.unlink()
+                    except OSError:
+                        pass
+                _as.configure_state_dir(inst_state)
+                # Re-write config under instance root with final paths
+                write_config_file(
+                    logstash_ui_url,
+                    policy_config={
+                        **policy_config,
+                        'path_root': normalize_opt_path(path_root),
+                    },
+                    config_path=str(Path(normalize_opt_path(path_root)) / 'logstash-agent.yml'),
+                )
+            except Exception as e:
+                logger.warning("State relocate for multi-instance: %s", e)
+
+            # Do not enable packaged logstash-agent.service for pure multi-instance
             if policy_type == 'MANAGED':
                 logger.info(
-                    "✓ Managed units installed (logstash-agent@N / logstash-managed@N)"
+                    "✓ Managed units installed (logstash-agent@N / logstash-managed@N); "
+                    "packaged logstash-agent.service left unchanged for coexistence"
                 )
             else:
                 logger.info(
-                    "✓ Simulate units installed (lsagent-simulate@N / ls-simulate@N)"
+                    "✓ Simulate units installed (lsagent-simulate@N / ls-simulate@N); "
+                    "packaged logstash-agent.service left unchanged for coexistence"
                 )
         else:
             install_systemd_service()
+            # If we somehow backed up packaged state and then re-enrolled packaged,
+            # the new state is correct at packaged path (no restore).
 
         # Step 8: Set ownership on state files and clean up log files
         logger.info("\nStep 8: Setting ownership on state files...")
@@ -1699,13 +1803,33 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
             logger.info(f"  Agent unit:    {agent_unit} (enabled + started)")
             logger.info(f"  Logstash unit: {ls_unit} (enabled; agent restarts when ready)")
             logger.info(f"  Paths under:   {path_root}/")
-            logger.info("\nDay-2 operations:")
+            logger.info(f"  State:         {path_root}/state/  (isolated from packaged)")
+            logger.info(f"  Config:        {path_root}/logstash-agent.yml")
+            logger.info("\nDay-2 operations (this instance only):")
             logger.info(f"  sudo systemctl status {agent_unit}")
             logger.info(f"  sudo systemctl stop {agent_unit}")
             logger.info(f"  sudo systemctl start {agent_unit}")
             logger.info(f"  sudo journalctl -u {agent_unit} -f")
             logger.info(f"  # or via ctl: sudo logstash-agent-ctl status {agent_unit}")
-            logger.info("  # list installs: logstash-agent list-instances")
+            logger.info("  # host map:    logstash-agent list-instances")
+            logger.info("  # drop only:   sudo logstash-agent uninstall --instance %s",
+                        f"{'managed' if policy_type == 'MANAGED' else 'simulate'}-{instance_id}")
+            try:
+                others = [
+                    e for e in _reg.list_instances(include_discovered=True)
+                    if e.get('id') != f"{'managed' if policy_type == 'MANAGED' else 'simulate'}-{instance_id}"
+                ]
+                if others:
+                    logger.info("\nOther roles on this host (untouched):")
+                    for e in others:
+                        logger.info(
+                            "  - %s  unit=%s  path=%s",
+                            e.get('id'),
+                            e.get('agent_unit'),
+                            e.get('path_root') or '(packaged)',
+                        )
+            except Exception:
+                pass
             logger.info("="*60)
         else:
             if not logstash_present:
@@ -1722,6 +1846,8 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
                 logger.warning("!" * 60)
 
             logger.info("\nAgent service logstash-agent enabled and started.")
+            logger.info("  State:  /var/lib/logstash-agent/")
+            logger.info("  Config: /etc/logstash-agent/logstash-agent.yml")
             if logstash_present:
                 logger.info(
                     "Distro logstash unit enabled only (not started/restarted — "
@@ -1732,11 +1858,32 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
                 logger.info("  1. Update paths in /etc/logstash-agent/logstash-agent.yml if needed")
                 logger.info("  2. sudo logstash-agent configure")
                 logger.info("  3. sudo systemctl restart logstash-agent")
-            logger.info("\nDay-2 operations:")
+            logger.info("\nDay-2 operations (packaged agent only):")
             logger.info("  sudo systemctl status logstash-agent")
             logger.info("  sudo systemctl stop logstash-agent")
             logger.info("  sudo systemctl start logstash-agent")
             logger.info("  sudo journalctl -u logstash-agent -f")
+            logger.info("  # host map: logstash-agent list-instances")
+            logger.info(
+                "  # Multi-instance templates are also installed; enroll a Managed "
+                "or Simulate policy later without re-installing the binary."
+            )
+            try:
+                multi = [
+                    e for e in _reg.list_instances(include_discovered=True)
+                    if (e.get('role') or '') in ('managed', 'simulate')
+                ]
+                if multi:
+                    logger.info("\nMulti-instance roles already on this host:")
+                    for e in multi:
+                        logger.info(
+                            "  - %s  unit=%s  path=%s",
+                            e.get('id'),
+                            e.get('agent_unit'),
+                            e.get('path_root'),
+                        )
+            except Exception:
+                pass
             logger.info("="*60)
         
     except InstallError as e:

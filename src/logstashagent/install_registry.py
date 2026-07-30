@@ -324,6 +324,10 @@ def format_instances_table(instances: list[dict[str, Any]]) -> str:
             f"{(e.get('logstash_unit') or ''):<22} "
             f"{e.get('path_root') or '-'}"
         )
+    lines.append("")
+    lines.append("Day-2: sudo systemctl status <AGENT UNIT>   # or logstash-agent-ctl status …")
+    lines.append("State: packaged → /var/lib/logstash-agent ; multi → {path}/state")
+    lines.append("Config: packaged → /etc/logstash-agent/logstash-agent.yml ; multi → {path}/logstash-agent.yml")
     return "\n".join(lines)
 
 

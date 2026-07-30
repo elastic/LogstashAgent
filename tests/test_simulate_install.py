@@ -43,16 +43,20 @@ def test_write_config_packaged_mode(tmp_path):
 
 
 def test_write_config_simulate_mode(tmp_path):
-    with patch.dict(installer.INSTALL_PATHS, {"config_dir": str(tmp_path)}), patch.object(
+    """Multi-instance config is written under path_root (not /etc) for coexistence."""
+    root = tmp_path / "simulate-2"
+    root.mkdir()
+    with patch.dict(installer.INSTALL_PATHS, {"simulate_root": str(tmp_path)}), patch.object(
         installer, "get_logstash_uid_gid", return_value=(0, 0)
     ), patch.object(installer.os, "chown"), patch.object(installer.os, "chmod"):
-        installer.write_config_file(
+        path = installer.write_config_file(
             "http://ui.example",
             policy_config={
                 "policy_type": "SIMULATE",
                 "instance_id": 2,
-                "settings_path": "/opt/logstash-agent/simulate-2/settings",
-                "logs_path": "/opt/logstash-agent/simulate-2/logs",
+                "path_root": str(root),
+                "settings_path": str(root / "settings"),
+                "logs_path": str(root / "logs"),
                 "binary_path": "/usr/share/logstash/bin",
                 "agent_api_port": 9502,
                 "logstash_api_port": 9562,
@@ -60,7 +64,8 @@ def test_write_config_simulate_mode(tmp_path):
                 "logstash_version": "9.4.3",
             },
         )
-    content = (tmp_path / "logstash-agent.yml").read_text()
+    assert path == str(root / "logstash-agent.yml")
+    content = Path(path).read_text()
     assert "mode: simulate" in content
     assert "instance_id: 2" in content
     assert "port: 9502" in content

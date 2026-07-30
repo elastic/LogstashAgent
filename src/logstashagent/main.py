@@ -112,35 +112,61 @@ def _get_version():
 
 AGENT_VERSION = _get_version()
 
+# Resolve per-instance state early (LOGSTASH_AGENT_STATE_DIR / --mode --instance)
+# so Packaged and managed-N/simulate-N do not share agent_id on one host.
+agent_state.refresh_state_paths()
+
 # Initialize agent state (generates agent_id on first run)
 AGENT_ID = agent_state.get_or_create_agent_id()
 
 # Save version to agent state
 agent_state.update_state('agent_version', AGENT_VERSION)
 logger.info(f"LogstashAgent version: {AGENT_VERSION}")
+logger.info(f"Agent state dir: {agent_state.STATE_DIR}")
 
 # Load agent configuration
 # Check for config in current directory first (native mode)
 def get_config_path() -> str:
-    """Get the path to logstashagent.yml - only used for native/host mode"""
-    local_path = os.path.join(os.path.dirname(__file__), "config/logstashagent.yml")
-    return local_path
+    """
+    Resolve logstash-agent.yml for this process.
+
+    Priority: LOGSTASH_AGENT_CONFIG env → multi-instance path from --mode/--instance
+    → packaged /etc path → local dev config.
+    """
+    env_cfg = (os.environ.get('LOGSTASH_AGENT_CONFIG') or '').strip()
+    if env_cfg:
+        return env_cfg
+    mode, instance = agent_state._peek_mode_and_instance_from_argv()
+    if mode in ('managed', 'simulate') and instance is not None:
+        try:
+            return str(agent_state.instance_config_path(mode, instance))
+        except ValueError:
+            pass
+    packaged = "/etc/logstash-agent/logstash-agent.yml"
+    if os.path.exists(packaged):
+        return packaged
+    return os.path.join(os.path.dirname(__file__), "config/logstashagent.yml")
 
 CONFIG_PATH = get_config_path()
 
 def load_agent_config() -> dict:
     """Load logstashagent.yml configuration, with fallback to logstashui.yml or logstashui.example.yml if mounted"""
-    # First, check for installed agent config
-    installed_config = "/etc/logstash-agent/logstash-agent.yml"
-    if os.path.exists(installed_config):
+    # Prefer process-specific config (instance or packaged), then legacy paths
+    for candidate in (
+        get_config_path(),
+        os.environ.get('LOGSTASH_AGENT_CONFIG') or '',
+        "/etc/logstash-agent/logstash-agent.yml",
+    ):
+        if not candidate or not os.path.exists(candidate):
+            continue
         try:
-            with open(installed_config, 'r') as f:
-                config = yaml.safe_load(f)
-                logger.info(f"Loaded agent config from {installed_config}")
+            with open(candidate, 'r') as f:
+                config = yaml.safe_load(f) or {}
+                logger.info(f"Loaded agent config from {candidate}")
                 return config
         except Exception as e:
-            logger.warning(f"Failed to load config from {installed_config}: {e}")
-    
+            logger.warning(f"Failed to load config from {candidate}: {e}")
+
     # Next, try to load from mounted logstashui.yml (preferred), then logstashui.example.yml
     # Check /app first (docker-compose mounts), then /etc (legacy)
     config_paths = [
