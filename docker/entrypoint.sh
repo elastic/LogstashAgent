@@ -9,10 +9,9 @@ echo "=========================================="
 echo "  Starting LogstashAgent"
 echo "=========================================="
 
-# LOGSTASH_URL is set via Dockerfile ENV (default: http://127.0.0.1:8080)
-# Can be overridden via docker-compose or docker run -e
-# Logstash will use ${LOGSTASH_URL:default} syntax in config files for environment variable substitution
-echo "LOGSTASH_URL: $LOGSTASH_URL"
+# LOGSTASH_URL / LOGSTASH_UI_URL set via compose or Dockerfile ENV
+echo "LOGSTASH_URL: ${LOGSTASH_URL:-unset}"
+echo "LOGSTASH_UI_URL: ${LOGSTASH_UI_URL:-unset}"
 
 # Ensure log directory exists and has proper permissions
 echo "Setting up log directory..."
@@ -27,16 +26,17 @@ else
 fi
 
 # logstashagent will start and supervise Logstash via Python
-echo "Starting FastAPI sidecar (which will supervise Logstash)..."
+echo "Starting agent FastAPI (HTTPS when product-CA cert is issued)..."
 echo "=========================================="
 echo "  LogstashAgent starting..."
-echo "  - Logstash will be supervised by FastAPI"
-echo "  - Logstash API: http://localhost:9560 (embedded simulation node)"
+echo "  - Logstash supervised by agent (embedded)"
+echo "  - Logstash API: http://localhost:9560"
 echo "  - Simulation HTTP Input: http://localhost:9449"
-echo "  - FastAPI Sidecar: http://localhost:9500"
+echo "  - Agent API: https://localhost:9500 (TLS when cert ready)"
 echo "=========================================="
 
 cd /app
-# Listen on 0.0.0.0 so nginx can access via Docker network
-# Use proper module path with PYTHONPATH set
-exec python3 -m uvicorn logstashagent.main:app --host 0.0.0.0 --port 9500
+# Use package main so server cert issue + uvicorn SSL kwargs apply
+# (bare uvicorn logstashagent.main:app would stay HTTP-only)
+export PYTHONPATH="${PYTHONPATH:-/app/src}"
+exec python3 -m logstashagent.main --mode embedded
