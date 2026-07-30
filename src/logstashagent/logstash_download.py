@@ -22,7 +22,7 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DOWNLOAD_ROOT = "/opt/LogstashAgent/logstash-versions"
+DEFAULT_DOWNLOAD_ROOT = "/opt/logstash-agent/logstash-versions"
 ARTIFACTS_BASE = "https://artifacts.elastic.co/downloads/logstash"
 
 

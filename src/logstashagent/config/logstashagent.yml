@@ -33,4 +33,4 @@ port: 9500
 # instance_id: 1
 # agent_api_port: 9501
 # logstash_api_port: 9561
-# keystore_env_file: /opt/LogstashAgent/simulate-1/env
+# keystore_env_file: /opt/logstash-agent/simulate-1/env

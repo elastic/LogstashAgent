@@ -15,7 +15,7 @@ It enrolls with LogstashUI, persists local agent state, checks in for policy and
 | Mode | Role |
 |------|------|
 | `default` | Production agent (enrolled). Manages package Logstash via `systemctl`. |
-| `simulate` | Simulation agent instance **N** (enrolled). Isolated under `/opt/LogstashAgent/simulate-N/`; units `lsagent-simulate@N` / `ls-simulate@N`. |
+| `simulate` | Simulation agent instance **N** (enrolled). Isolated under `/opt/logstash-agent/simulate-N/`; units `lsagent-simulate@N` / `ls-simulate@N`. |
 | `embedded` | Docker/local sim without enrollment (FastAPI + supervisor). |
 
 Legacy `mode: agent|host` and `simulation`/`simulation_mode` are mapped at startup (see logs: `mode=default (legacy '…' mapped)`).
@@ -29,7 +29,7 @@ Legacy `mode: agent|host` and `simulation`/`simulation_mode` are mapped at start
 
 - Install + enroll (root): `sudo logstash-agent install --enroll=<TOKEN> --logstash-ui-url=<URL>`
 - Non-root enroll (token only): `logstash-agent --enroll=<TOKEN> --logstash-ui-url=<URL>` — enrollment always succeeds; for **Simulate** policies the agent tries passwordless sudo, then a partial tree write, otherwise leaves `simulate_setup_pending` and prints `sudo logstash-agent setup-simulate`
-- Finish simulate host setup: `sudo logstash-agent setup-simulate` (materialize `/opt/LogstashAgent/simulate-N/`, install units)
+- Finish simulate host setup: `sudo logstash-agent setup-simulate` (materialize `/opt/logstash-agent/simulate-N/`, install units)
 - Controller: `logstash-agent --run` (or systemd `logstash-agent` / `lsagent-simulate@N`)
 - Agent state includes enrollment identity, policy assignment, and revision tracking.
 

@@ -5,12 +5,12 @@ Documentation=https://github.com/elastic/LogstashAgent
 
 [Service]
 Type=simple
-EnvironmentFile=-/opt/LogstashAgent/simulate-%i/agent.env
+EnvironmentFile=-/opt/logstash-agent/simulate-%i/agent.env
 # Runs controller + FastAPI for this simulate instance
 ExecStart=/opt/logstash-agent/bin/logstash-agent --run --mode simulate --instance %i
 Restart=always
 RestartSec=10
-WorkingDirectory=/opt/LogstashAgent/simulate-%i
+WorkingDirectory=/opt/logstash-agent/simulate-%i
 StandardOutput=journal
 StandardError=journal
 # Prefer logstash user when present (installer rewrites User= as needed)

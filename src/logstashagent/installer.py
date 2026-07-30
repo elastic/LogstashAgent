@@ -30,13 +30,36 @@ INSTALL_PATHS = {
     'log_dir': '/var/log/logstash-agent',
     'cache_dir': '/var/cache/logstash-agent',
     'systemd_service': '/etc/systemd/system/logstash-agent.service',
-    'simulate_root': '/opt/LogstashAgent',
+    'simulate_root': '/opt/logstash-agent',
     'lsagent_simulate_unit': '/etc/systemd/system/lsagent-simulate@.service',
     'ls_simulate_unit': '/etc/systemd/system/ls-simulate@.service',
 }
 
-# Packaged unit templates ship beside this module under systemd/
-_SYSTEMD_TEMPLATE_DIR = Path(__file__).resolve().parent / 'systemd'
+def _systemd_template_dir() -> Path:
+    """
+    Directory with lsagent-simulate@.service / ls-simulate@.service templates.
+
+    Dev: package source tree. PyInstaller COLLECT: _internal/logstashagent/systemd/
+    """
+    beside = Path(__file__).resolve().parent / 'systemd'
+    if beside.is_dir() and any(beside.glob('*.service')):
+        return beside
+    # Frozen / alternate layouts
+    candidates = []
+    meipass = getattr(sys, '_MEIPASS', None)
+    if meipass:
+        candidates.append(Path(meipass) / 'logstashagent' / 'systemd')
+    exe = Path(sys.executable).resolve()
+    candidates.extend([
+        exe.parent / '_internal' / 'logstashagent' / 'systemd',
+        exe.parent.parent / '_internal' / 'logstashagent' / 'systemd',
+        exe.parent / 'logstashagent' / 'systemd',
+    ])
+    for c in candidates:
+        if c.is_dir() and any(c.glob('*.service')):
+            return c
+    return beside
+
 
 def _build_systemd_service() -> str:
     """
@@ -296,10 +319,10 @@ def write_config_file(logstash_ui_url: str, policy_config: Optional[dict] = None
         if binary and not str(binary).endswith('logstash') and not str(binary).endswith('logstash.bat'):
             binary = str(Path(binary) / 'logstash')
         settings = policy_config.get(
-            'settings_path', f"/opt/LogstashAgent/simulate-{instance_id}/settings"
+            'settings_path', f"/opt/logstash-agent/simulate-{instance_id}/settings"
         )
         logs = policy_config.get(
-            'logs_path', f"/opt/LogstashAgent/simulate-{instance_id}/logs"
+            'logs_path', f"/opt/logstash-agent/simulate-{instance_id}/logs"
         )
         agent_port = policy_config.get('agent_api_port', 9500 + int(instance_id))
         ls_port = policy_config.get('logstash_api_port', 9560 + int(instance_id))
@@ -315,7 +338,7 @@ logstash_log_path: {logs}
 logstash_api_port: {ls_port}
 logstash_source: {policy_config.get('logstash_source') or 'SYSTEM'}
 logstash_version: "{policy_config.get('logstash_version') or ''}"
-logstash_download_dir: {policy_config.get('logstash_download_dir') or '/opt/LogstashAgent/logstash-versions'}
+logstash_download_dir: {policy_config.get('logstash_download_dir') or '/opt/logstash-agent/logstash-versions'}
 
 # FastAPI sim API (simulate agents)
 host: 0.0.0.0
@@ -369,9 +392,12 @@ logstash_ui_url: {logstash_ui_url}
 
 
 def _read_unit_template(name: str) -> str:
-    path = _SYSTEMD_TEMPLATE_DIR / name
+    path = _systemd_template_dir() / name
     if not path.is_file():
-        raise InstallError(f"Missing systemd unit template: {path}")
+        raise InstallError(
+            f"Missing systemd unit template: {path} "
+            f"(searched under {_systemd_template_dir()})"
+        )
     return path.read_text(encoding='utf-8')
 
 
@@ -411,7 +437,7 @@ def install_simulate_unit_templates() -> None:
 
 def materialize_simulate_instance(policy_config: dict) -> dict:
     """
-    Create /opt/LogstashAgent/simulate-N tree, env files, seed configs.
+    Create /opt/logstash-agent/simulate-N tree, env files, seed configs.
 
     Returns dict with resolved binary path and paths used.
     """
@@ -805,7 +831,7 @@ def perform_setup_simulate(yes: bool = False) -> dict:
         )
 
     if not yes:
-        print(f"\nThis will materialize /opt/LogstashAgent/simulate-{policy_config['instance_id']}/")
+        print(f"\nThis will materialize /opt/logstash-agent/simulate-{policy_config['instance_id']}/")
         print("and install/enable lsagent-simulate@ and ls-simulate@ units.")
         answer = input("Continue? [y/N]: ").strip().lower()
         if answer != 'y':
@@ -1222,7 +1248,7 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
             logger.info(f"\n  3. View logs:")
             logger.info(f"     sudo journalctl -u lsagent-simulate@{instance_id} -f")
             logger.info(f"\n  Logstash instance unit: ls-simulate@{instance_id}")
-            logger.info(f"  Paths under: /opt/LogstashAgent/simulate-{instance_id}/")
+            logger.info(f"  Paths under: /opt/logstash-agent/simulate-{instance_id}/")
             logger.info("="*60)
         else:
             if not logstash_present:

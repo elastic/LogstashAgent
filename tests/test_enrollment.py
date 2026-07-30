@@ -183,8 +183,8 @@ class TestSaveEnrollmentConfig:
         policy = {
             "policy_type": "SIMULATE",
             "instance_id": 2,
-            "settings_path": "/opt/LogstashAgent/simulate-2/settings",
-            "logs_path": "/opt/LogstashAgent/simulate-2/logs",
+            "settings_path": "/opt/logstash-agent/simulate-2/settings",
+            "logs_path": "/opt/logstash-agent/simulate-2/logs",
         }
 
         with patch.object(enrollment.agent_state, "update_state") as upd:
@@ -250,8 +250,8 @@ class TestPerformEnrollment:
         policy_config = {
             "policy_type": "SIMULATE",
             "instance_id": 3,
-            "settings_path": "/opt/LogstashAgent/simulate-3/settings",
-            "logs_path": "/opt/LogstashAgent/simulate-3/logs",
+            "settings_path": "/opt/logstash-agent/simulate-3/settings",
+            "logs_path": "/opt/logstash-agent/simulate-3/logs",
         }
         enroll_result = {
             "success": True,
@@ -288,8 +288,8 @@ class TestPerformEnrollment:
         policy_config = {
             "policy_type": "SIMULATE",
             "instance_id": 5,
-            "settings_path": "/opt/LogstashAgent/simulate-5/settings",
-            "logs_path": "/opt/LogstashAgent/simulate-5/logs",
+            "settings_path": "/opt/logstash-agent/simulate-5/settings",
+            "logs_path": "/opt/logstash-agent/simulate-5/logs",
         }
         enroll_result = {
             "success": True,

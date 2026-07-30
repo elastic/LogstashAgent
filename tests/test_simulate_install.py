@@ -50,8 +50,8 @@ def test_write_config_simulate_mode(tmp_path):
             policy_config={
                 "policy_type": "SIMULATE",
                 "instance_id": 2,
-                "settings_path": "/opt/LogstashAgent/simulate-2/settings",
-                "logs_path": "/opt/LogstashAgent/simulate-2/logs",
+                "settings_path": "/opt/logstash-agent/simulate-2/settings",
+                "logs_path": "/opt/logstash-agent/simulate-2/logs",
                 "binary_path": "/usr/share/logstash/bin",
                 "agent_api_port": 9502,
                 "logstash_api_port": 9562,

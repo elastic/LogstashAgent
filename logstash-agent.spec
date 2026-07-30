@@ -1,11 +1,30 @@
 # -*- mode: python ; coding: utf-8 -*-
+from pathlib import Path
+
+# PyInstaller defines SPECPATH as the directory containing this .spec
+try:
+    _root = Path(SPECPATH)
+except NameError:
+    _root = Path(".").resolve()
+
+_systemd = _root / "src" / "logstashagent" / "systemd"
+_unit_datas = []
+for _name in ("lsagent-simulate@.service", "ls-simulate@.service"):
+    _p = _systemd / _name
+    if _p.is_file():
+        # Land next to installer.py: _internal/logstashagent/systemd/
+        _unit_datas.append((str(_p), "logstashagent/systemd"))
+if not _unit_datas:
+    raise SystemExit(
+        f"logstash-agent.spec: missing systemd unit templates under {_systemd}"
+    )
 
 
 a = Analysis(
     ['src/logstashagent/main.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=_unit_datas,
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

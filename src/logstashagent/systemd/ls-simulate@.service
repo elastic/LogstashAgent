@@ -5,14 +5,14 @@ Documentation=https://github.com/elastic/LogstashAgent
 
 [Service]
 Type=simple
-EnvironmentFile=-/opt/LogstashAgent/simulate-%i/env
+EnvironmentFile=-/opt/logstash-agent/simulate-%i/env
 # LOGSTASH_BINARY and path flags come from EnvironmentFile
 # Example env:
 #   LOGSTASH_BINARY=/usr/share/logstash/bin/logstash
-#   LOGSTASH_PATH_SETTINGS=/opt/LogstashAgent/simulate-%i/settings
-#   LOGSTASH_PATH_CONFIG=/opt/LogstashAgent/simulate-%i/config
-#   LOGSTASH_PATH_LOGS=/opt/LogstashAgent/simulate-%i/logs
-#   LOGSTASH_PATH_DATA=/opt/LogstashAgent/simulate-%i/data
+#   LOGSTASH_PATH_SETTINGS=/opt/logstash-agent/simulate-%i/settings
+#   LOGSTASH_PATH_CONFIG=/opt/logstash-agent/simulate-%i/config
+#   LOGSTASH_PATH_LOGS=/opt/logstash-agent/simulate-%i/logs
+#   LOGSTASH_PATH_DATA=/opt/logstash-agent/simulate-%i/data
 #   LOGSTASH_KEYSTORE_PASS=...
 ExecStart=/bin/bash -c 'exec "${LOGSTASH_BINARY}" \
   --path.settings="${LOGSTASH_PATH_SETTINGS}" \

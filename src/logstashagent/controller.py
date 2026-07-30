@@ -104,7 +104,7 @@ def update_logstash_env_file(
 
     ``env_file`` overrides the path (policy ``keystore_env_file``). For package
     Logstash the default is ``/etc/default/logstash`` (sudo cat/tee). For simulate
-    instances the path is typically ``/opt/LogstashAgent/simulate-N/env`` and is
+    instances the path is typically ``/opt/logstash-agent/simulate-N/env`` and is
     written directly when the agent owns the tree.
 
     Raises:
@@ -491,7 +491,7 @@ _log_watcher: Optional[log_analyzer.LogstashLogWatcher] = None
 def update_env_logstash_binary(env_file: Optional[str], binary: str) -> bool:
     """
     Set or replace LOGSTASH_BINARY= in a simulate instance env file
-    (e.g. /opt/LogstashAgent/simulate-N/env) without using sudo when the
+    (e.g. /opt/logstash-agent/simulate-N/env) without using sudo when the
     agent owns the tree.
     """
     if not env_file or not binary:

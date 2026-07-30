@@ -3,7 +3,7 @@
 ### Added
 
 - Added first-class agent **roles/modes**: `default` (production), `simulate` (enrolled simulation instances), and `embedded` (Docker-local sim).
-- Added simulate instance layout under `/opt/LogstashAgent/simulate-N/` with isolated `--path.settings|config|logs|data`.
+- Added simulate instance layout under `/opt/logstash-agent/simulate-N/` with isolated `--path.settings|config|logs|data`.
 - Added systemd templates `lsagent-simulate@.service` and `ls-simulate@.service` for numbered simulate instances.
 - Added enrollment `policy_config` fields for simulate: `instance_id`, ports (`9500+N` / `9560+N`), path bundle, units, `logstash_source` / version download dir.
 - Added `logstash_download.py` to fetch pinned Logstash versions from Elastic artifacts when policy `logstash_source=VERSION`.
@@ -24,6 +24,7 @@
 - Added **UI CA bootstrap loop** for embedded agents: retry-fetch well-known CA with verify=False until UI is up (TOFU or optional `LOGSTASHUI_CA_FINGERPRINT`), then full trust; `/_logstash/tls-status` and health `tls` block for online/secure indicators.
 - Added **agent server TLS** (`tls_server.py`): local key + CSR, product-CA leaf from enroll/check-in/`IssueServerCert`, uvicorn HTTPS on the agent API port; re-issue on check-in without re-enroll; compose secret `LOGSTASHUI_AGENT_CSR_SECRET` for embedded bootstrap.
 - Agent server CSR SANs include hostname, FQDN, non-loopback local IPs, and `LOGSTASH_AGENT_TLS_SANS`; re-issue when SANs drift.
+- PyInstaller bundle includes **`lsagent-simulate@.service`** and **`ls-simulate@.service`** under `logstashagent/systemd/` for install.
 
 ### Changed
 
@@ -33,6 +34,7 @@
 - **LogstashSupervisor is embedded-only process ownership** (`Popen` + monitor). Enrolled simulate uses systemctl + bare recovery/watchdog. Legacy `simulation_mode: host` only seeds layout / optional `run_as_logstash_user`; `setup_host_mode` is a deprecated alias for `ensure_sim_layout`.
 - Install config now writes `mode: default` or `mode: simulate` (no longer `mode: agent`).
 - Simulate agents restart Logstash via `systemctl restart ls-simulate@N` instead of the package `logstash` unit.
+- Simulate layout root is **`/opt/logstash-agent/simulate-N/`** (was `/opt/LogstashAgent/simulate-N/`).
 - `update_logstash_env_file` accepts a policy/instance `keystore_env_file` path (simulate uses instance env, not only `/etc/default/logstash`).
 - Embedded / simulate-style Logstash HTTP API default is **9560** (was often 9650 in docker).
 - Synced vendored `ls_keystore_utils` with ls-keystore-utils dockertests (v0.4.0), including `keystore_write.py` and `resolve.py`.

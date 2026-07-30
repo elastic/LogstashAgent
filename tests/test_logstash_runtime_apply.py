@@ -75,7 +75,7 @@ def test_apply_logstash_runtime_download_failure():
         result = controller.apply_logstash_runtime({
             "source": "VERSION",
             "version": "9.4.3",
-            "download_dir": "/opt/LogstashAgent/logstash-versions",
+            "download_dir": "/opt/logstash-agent/logstash-versions",
             "binary_path": "/usr/share/logstash/bin",
         })
     assert result["success"] is False
