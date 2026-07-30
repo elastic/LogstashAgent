@@ -19,7 +19,9 @@ import sys
 
 # For install/upgrade/uninstall commands, always use production path
 # even if directory doesn't exist yet (it will be created during install)
-if len(sys.argv) > 1 and sys.argv[1] in ('install', 'upgrade', 'uninstall'):
+if len(sys.argv) > 1 and sys.argv[1] in (
+    'install', 'upgrade', 'uninstall', 'list-instances', 'configure', 'setup-simulate'
+):
     STATE_DIR = Path('/var/lib/logstash-agent')
 elif os.path.exists('/var/lib/logstash-agent'):
     STATE_DIR = Path('/var/lib/logstash-agent')

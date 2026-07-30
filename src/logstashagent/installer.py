@@ -3,6 +3,7 @@
 #you may not use this file except in compliance with the Elastic License.
 
 import os
+import re
 import sys
 import shutil
 import subprocess
@@ -898,12 +899,41 @@ def setup_simulate_from_policy(policy_config: dict) -> dict:
     pt = (policy_config.get('policy_type') or result.get('policy_type') or 'SIMULATE').upper()
     if pt == 'DEFAULT':
         pt = 'PACKAGED'
+    agent_unit = policy_config.get('agent_unit') or result.get('agent_unit')
+    logstash_unit = policy_config.get('logstash_unit') or result.get('logstash_unit')
     enable_multi_instance_services(
         result['instance_id'],
-        agent_unit=policy_config.get('agent_unit') or result.get('agent_unit'),
-        logstash_unit=policy_config.get('logstash_unit') or result.get('logstash_unit'),
+        agent_unit=agent_unit,
+        logstash_unit=logstash_unit,
         policy_type=pt,
     )
+    # Track in host install registry
+    try:
+        from logstashagent import install_registry as _reg
+        from logstashagent import agent_state as _as
+
+        role = 'managed' if pt == 'MANAGED' else 'simulate'
+        state = _as.get_state() or {}
+        _reg.register_package(
+            agent_version=str(state.get('agent_version') or ''),
+            agent_id=state.get('agent_id'),
+        )
+        _reg.register_instance(
+            role=role,
+            instance_id=result['instance_id'],
+            agent_unit=agent_unit or '',
+            logstash_unit=logstash_unit or '',
+            path_root=result.get('root') or policy_config.get('path_root'),
+            agent_api_port=result.get('agent_api_port'),
+            logstash_api_port=result.get('logstash_api_port'),
+            policy_type=pt,
+            agent_id=state.get('agent_id'),
+            connection_id=state.get('connection_id'),
+            policy_id=state.get('policy_id'),
+            deployment_id=policy_config.get('deployment_id') or result.get('root'),
+        )
+    except Exception as e:
+        logger.warning("Could not update install registry: %s", e)
     return result
 
 
@@ -1588,6 +1618,61 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
             if logstash_present:
                 enable_package_logstash_only()
 
+        # Record package + instance in install registry
+        try:
+            from logstashagent import install_registry as _reg
+            from logstashagent import agent_state as _as
+
+            state = _as.get_state() or {}
+            ver = str(state.get('agent_version') or '')
+            _reg.register_package(agent_version=ver, agent_id=agent_id or state.get('agent_id'))
+            if is_multi:
+                instance_id = policy_config.get('instance_id')
+                agent_unit, ls_unit = resolve_multi_instance_units(
+                    int(instance_id) if instance_id is not None else 0,
+                    policy_type,
+                    agent_unit=policy_config.get('agent_unit'),
+                    logstash_unit=policy_config.get('logstash_unit'),
+                )
+                path_root = (
+                    policy_config.get('path_root')
+                    or (
+                        f"/opt/logstash-agent/managed-{instance_id}"
+                        if policy_type == 'MANAGED'
+                        else f"/opt/logstash-agent/simulate-{instance_id}"
+                    )
+                )
+                _reg.register_instance(
+                    role='managed' if policy_type == 'MANAGED' else 'simulate',
+                    instance_id=int(instance_id) if instance_id is not None else None,
+                    agent_unit=agent_unit,
+                    logstash_unit=ls_unit,
+                    path_root=path_root,
+                    agent_api_port=policy_config.get('agent_api_port'),
+                    logstash_api_port=policy_config.get('logstash_api_port'),
+                    policy_type=policy_type,
+                    agent_id=agent_id or state.get('agent_id'),
+                    connection_id=state.get('connection_id'),
+                    policy_id=state.get('policy_id'),
+                    deployment_id=policy_config.get('deployment_id'),
+                )
+            else:
+                _reg.register_instance(
+                    role='packaged',
+                    agent_unit='logstash-agent',
+                    logstash_unit='logstash',
+                    path_root=None,
+                    agent_api_port=None,
+                    logstash_api_port=policy_config.get('logstash_api_port') or 9600,
+                    policy_type='PACKAGED',
+                    agent_id=agent_id or state.get('agent_id'),
+                    connection_id=state.get('connection_id'),
+                    policy_id=state.get('policy_id'),
+                    deployment_id='package',
+                )
+        except Exception as e:
+            logger.warning("Could not write install registry: %s", e)
+
         # Installation complete
         logger.info("\n" + "="*60)
         logger.info("INSTALLATION COMPLETED SUCCESSFULLY!")
@@ -1620,6 +1705,7 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
             logger.info(f"  sudo systemctl start {agent_unit}")
             logger.info(f"  sudo journalctl -u {agent_unit} -f")
             logger.info(f"  # or via ctl: sudo logstash-agent-ctl status {agent_unit}")
+            logger.info("  # list installs: logstash-agent list-instances")
             logger.info("="*60)
         else:
             if not logstash_present:
@@ -1661,13 +1747,22 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
         raise InstallError(f"Installation failed: {e}")
 
 
-def perform_uninstallation(purge: bool = False) -> None:
+def perform_uninstallation(
+    purge: bool = False,
+    *,
+    instance: Optional[str] = None,
+) -> None:
     """
-    Perform the complete uninstallation process.
-    
+    Perform uninstallation using the host install registry.
+
     Args:
-        purge: If True, also remove state and log directories
+        purge: If True, also remove state/log/cache and multi-instance path trees
+        instance: If set (e.g. ``managed-1``, ``simulate-2``, ``packaged``),
+            tear down only that instance and leave the package installed.
+            When omitted, full package uninstall is performed.
     """
+    from logstashagent import install_registry as _reg
+
     logger.info("="*60)
     logger.info("LOGSTASH AGENT UNINSTALLATION")
     logger.info("="*60)
@@ -1677,49 +1772,112 @@ def perform_uninstallation(purge: bool = False) -> None:
         logger.info("\nStep 1: Verifying prerequisites...")
         verify_root()
         verify_platform()
-        
-        # Step 2: Stop and disable service
-        logger.info("\nStep 2: Stopping and disabling service...")
+
+        reg = _reg.load_registry()
+        all_instances = _reg.list_instances(include_discovered=True)
+
+        # ---- Single-instance teardown (package remains) ----
+        if instance:
+            key = instance.strip().lower()
+            entry = next((e for e in all_instances if (e.get('id') or '').lower() == key), None)
+            if not entry:
+                # Allow role aliases
+                if key in ('default', 'package'):
+                    key = 'packaged'
+                    entry = next((e for e in all_instances if e.get('id') == 'packaged'), None)
+            if not entry:
+                raise InstallError(
+                    f"Instance '{instance}' not found in install registry. "
+                    f"Run: logstash-agent list-instances"
+                )
+            logger.info("\nStep 2: Tearing down instance %s only...", entry.get('id'))
+            _reg.teardown_instance(entry, purge_paths=purge, unregister=True)
+            try:
+                subprocess.run(
+                    ['systemctl', 'daemon-reload'],
+                    check=False, capture_output=True, text=True,
+                )
+            except Exception:
+                pass
+            logger.info("\n" + "="*60)
+            logger.info("INSTANCE UNINSTALL COMPLETE: %s", entry.get('id'))
+            if purge:
+                logger.info("Instance path tree removed (--purge).")
+            else:
+                logger.info(
+                    "Units stopped/disabled. Use --purge with --instance to also "
+                    "delete the instance path tree."
+                )
+            logger.info("Package install left in place.")
+            logger.info("="*60)
+            return
+
+        # ---- Full package uninstall ----
+        logger.info("\nStep 2: Stopping registered multi-instance agents...")
+        multi = [
+            e for e in all_instances
+            if (e.get('role') or '').lower() in ('managed', 'simulate')
+        ]
+        packaged = [
+            e for e in all_instances
+            if (e.get('role') or '').lower() in ('packaged', 'default', '')
+            or e.get('id') == 'packaged'
+        ]
+        if multi:
+            for entry in multi:
+                logger.info("  - %s (%s)", entry.get('id'), entry.get('agent_unit'))
+                _reg.teardown_instance(
+                    entry,
+                    purge_paths=purge,
+                    unregister=True,
+                )
+        else:
+            logger.info("  (no managed/simulate instances registered or discovered)")
+
+        logger.info("\nStep 3: Stopping packaged agent unit...")
+        if packaged:
+            for entry in packaged:
+                _reg.teardown_instance(entry, purge_paths=False, unregister=True)
+        else:
+            # Fallback if registry empty
+            if os.path.exists(INSTALL_PATHS['systemd_service']):
+                try:
+                    subprocess.run(
+                        ['systemctl', 'stop', 'logstash-agent'],
+                        check=False, capture_output=True,
+                    )
+                    subprocess.run(
+                        ['systemctl', 'disable', 'logstash-agent'],
+                        check=False, capture_output=True,
+                    )
+                    logger.info("✓ Stopped/disabled logstash-agent service")
+                except Exception as e:
+                    logger.warning(f"Failed to stop/disable service: {e}")
+            else:
+                logger.info("Packaged service unit not found, skipping")
+
+        # Step 4: Remove all shared systemd unit files (templates + packaged)
+        logger.info("\nStep 4: Removing systemd unit files...")
+        _reg.remove_shared_unit_files(reg)
+        # Also remove packaged unit if still present
         if os.path.exists(INSTALL_PATHS['systemd_service']):
             try:
-                # Stop the service
-                subprocess.run(['systemctl', 'stop', 'logstash-agent'], 
-                             check=False, capture_output=True)
-                logger.info("✓ Stopped logstash-agent service")
-                
-                # Disable the service
-                subprocess.run(['systemctl', 'disable', 'logstash-agent'], 
-                             check=False, capture_output=True)
-                logger.info("✓ Disabled logstash-agent service")
-            except Exception as e:
-                logger.warning(f"Failed to stop/disable service: {e}")
-        else:
-            logger.info("Service not found, skipping")
+                os.remove(INSTALL_PATHS['systemd_service'])
+                logger.info(f"✓ Removed {INSTALL_PATHS['systemd_service']}")
+            except OSError as e:
+                logger.warning("Could not remove packaged unit: %s", e)
+        try:
+            result = subprocess.run(
+                ['systemctl', 'daemon-reload'],
+                check=True, capture_output=True, text=True,
+            )
+            logger.info("✓ Reloaded systemd daemon")
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            logger.warning(f"Failed to reload systemd: {e}")
+            logger.info("Continuing (daemon will reload eventually)")
         
-        # Step 3: Remove systemd service file
-        logger.info("\nStep 3: Removing systemd service...")
-        if os.path.exists(INSTALL_PATHS['systemd_service']):
-            os.remove(INSTALL_PATHS['systemd_service'])
-            logger.info(f"✓ Removed {INSTALL_PATHS['systemd_service']}")
-            
-            # Reload systemd
-            try:
-                result = subprocess.run(['systemctl', 'daemon-reload'], 
-                                      check=True, capture_output=True, text=True)
-                logger.info("✓ Reloaded systemd daemon")
-            except subprocess.CalledProcessError as e:
-                logger.warning(f"Failed to reload systemd: {e}")
-                if e.stderr:
-                    logger.warning(f"stderr: {e.stderr}")
-                if e.stdout:
-                    logger.warning(f"stdout: {e.stdout}")
-                # Non-fatal - systemd will eventually pick up the change
-                logger.info("Continuing (daemon will reload eventually)")
-        else:
-            logger.info("Service file not found, skipping")
-        
-        # Step 3b: Remove sudoers drop-in
-        logger.info("\nRemoving sudoers configuration...")
+        # Step 5: Remove sudoers drop-in
+        logger.info("\nStep 5: Removing sudoers configuration...")
         sudoers_file = '/etc/sudoers.d/logstash-agent'
         if os.path.exists(sudoers_file):
             try:
@@ -1730,8 +1888,8 @@ def perform_uninstallation(purge: bool = False) -> None:
         else:
             logger.info("Sudoers file not found, skipping")
         
-        # Step 4: Remove symlink (check both /usr/local/bin and /usr/bin for RHEL)
-        logger.info("\nStep 4: Removing symlink...")
+        # Step 6: Remove symlink (check both /usr/local/bin and /usr/bin for RHEL)
+        logger.info("\nStep 6: Removing symlink...")
         symlink_removed = False
         
         # Check /usr/local/bin (default location)
@@ -1754,64 +1912,101 @@ def perform_uninstallation(purge: bool = False) -> None:
         if not symlink_removed:
             logger.info("Symlink not found, skipping")
         
-        # Step 5: Remove binary directory
-        logger.info("\nStep 5: Removing binary...")
+        # Step 7: Remove binary directory
+        logger.info("\nStep 7: Removing binary...")
         if os.path.exists(INSTALL_PATHS['binary_dir']):
             shutil.rmtree(INSTALL_PATHS['binary_dir'])
             logger.info(f"✓ Removed {INSTALL_PATHS['binary_dir']}")
             
-            # Remove parent directory if empty
+            # Remove parent directory if empty (only when no remaining instance trees)
             parent_dir = os.path.dirname(INSTALL_PATHS['binary_dir'])
-            if os.path.exists(parent_dir) and not os.listdir(parent_dir):
-                os.rmdir(parent_dir)
-                logger.info(f"✓ Removed {parent_dir}")
+            if os.path.exists(parent_dir):
+                try:
+                    remaining = os.listdir(parent_dir)
+                except OSError:
+                    remaining = ['?']
+                if not remaining:
+                    os.rmdir(parent_dir)
+                    logger.info(f"✓ Removed {parent_dir}")
+                elif purge:
+                    # With purge, remove leftover managed-/simulate- under opt root
+                    for name in list(remaining):
+                        if re.match(r'^(managed|simulate)-[0-9]+$', name):
+                            _reg.remove_path_tree(os.path.join(parent_dir, name))
+                    try:
+                        remaining = os.listdir(parent_dir)
+                    except OSError:
+                        remaining = ['?']
+                    # Also drop logstash-versions download cache under opt root if empty-ish
+                    if not remaining:
+                        try:
+                            os.rmdir(parent_dir)
+                            logger.info(f"✓ Removed {parent_dir}")
+                        except OSError:
+                            pass
+                else:
+                    logger.info(
+                        "Left %s (instance trees or downloads remain; use --purge to remove)",
+                        parent_dir,
+                    )
         else:
             logger.info("Binary directory not found, skipping")
         
-        # Step 6: Remove config directory
-        logger.info("\nStep 6: Removing configuration...")
+        # Step 8: Remove config directory
+        logger.info("\nStep 8: Removing configuration...")
         if os.path.exists(INSTALL_PATHS['config_dir']):
             shutil.rmtree(INSTALL_PATHS['config_dir'])
             logger.info(f"✓ Removed {INSTALL_PATHS['config_dir']}")
         else:
             logger.info("Config directory not found, skipping")
         
-        # Step 7: Optionally remove state directory
+        # Step 9: Optionally remove state directory (includes install-registry.json)
         if purge:
-            logger.info("\nStep 7: Removing state directory (--purge)...")
+            logger.info("\nStep 9: Removing state directory (--purge)...")
             if os.path.exists(INSTALL_PATHS['state_dir']):
                 shutil.rmtree(INSTALL_PATHS['state_dir'])
                 logger.info(f"✓ Removed {INSTALL_PATHS['state_dir']}")
             else:
                 logger.info("State directory not found, skipping")
         else:
-            logger.info("\nStep 7: Preserving state directory...")
+            logger.info("\nStep 9: Preserving state directory...")
             logger.info(f"State directory preserved: {INSTALL_PATHS['state_dir']}")
-            logger.info("(Use --purge to remove state and secrets)")
+            logger.info("(includes install-registry.json; use --purge to remove)")
+            # Clear package section but keep instance records if trees remain
+            try:
+                reg2 = _reg.load_registry()
+                reg2['package'] = None
+                # Drop packaged instance; keep multi that still have path_roots
+                inst = reg2.get('instances') or {}
+                inst.pop('packaged', None)
+                reg2['instances'] = inst
+                _reg.save_registry(reg2)
+            except Exception as e:
+                logger.warning("Could not update registry after uninstall: %s", e)
         
-        # Step 8: Optionally remove log directory
+        # Step 10: Optionally remove log directory
         if purge:
-            logger.info("\nStep 8: Removing log directory (--purge)...")
+            logger.info("\nStep 10: Removing log directory (--purge)...")
             if os.path.exists(INSTALL_PATHS['log_dir']):
                 shutil.rmtree(INSTALL_PATHS['log_dir'])
                 logger.info(f"✓ Removed {INSTALL_PATHS['log_dir']}")
             else:
                 logger.info("Log directory not found, skipping")
         else:
-            logger.info("\nStep 8: Preserving log directory...")
+            logger.info("\nStep 10: Preserving log directory...")
             logger.info(f"Log directory preserved: {INSTALL_PATHS['log_dir']}")
             logger.info("(Use --purge to remove logs)")
         
-        # Step 9: Optionally remove cache directory
+        # Step 11: Optionally remove cache directory
         if purge:
-            logger.info("\nStep 9: Removing cache directory (--purge)...")
+            logger.info("\nStep 11: Removing cache directory (--purge)...")
             if os.path.exists(INSTALL_PATHS['cache_dir']):
                 shutil.rmtree(INSTALL_PATHS['cache_dir'])
                 logger.info(f"✓ Removed {INSTALL_PATHS['cache_dir']}")
             else:
                 logger.info("Cache directory not found, skipping")
         else:
-            logger.info("\nStep 9: Preserving cache directory...")
+            logger.info("\nStep 11: Preserving cache directory...")
             logger.info(f"Cache directory preserved: {INSTALL_PATHS['cache_dir']}")
             logger.info("(Use --purge to remove cached downloads)")
         
@@ -1825,6 +2020,7 @@ def perform_uninstallation(purge: bool = False) -> None:
             logger.info(f"  - {INSTALL_PATHS['state_dir']}")
             logger.info(f"  - {INSTALL_PATHS['log_dir']}")
             logger.info(f"  - {INSTALL_PATHS['cache_dir']}")
+            logger.info("  - multi-instance trees under /opt/logstash-agent (if any)")
             logger.info("\nTo remove these, run:")
             logger.info("  sudo logstash-agent uninstall --purge")
         

@@ -2251,17 +2251,34 @@ Examples:
     # Uninstall command
     uninstall_parser = subparsers.add_parser(
         'uninstall',
-        help='Uninstall the agent from the system'
+        help='Uninstall the agent from the system (uses install registry)'
     )
     uninstall_parser.add_argument(
         '--purge',
         action='store_true',
-        help='Also remove state and log directories'
+        help='Also remove state/log/cache and multi-instance path trees'
+    )
+    uninstall_parser.add_argument(
+        '--instance',
+        metavar='ID',
+        default=None,
+        help='Tear down only one registry instance (e.g. managed-1, simulate-2, packaged)'
     )
     uninstall_parser.add_argument(
         '--yes',
         action='store_true',
         help='Skip the uninstallation confirmation prompt'
+    )
+
+    list_inst_parser = subparsers.add_parser(
+        'list-instances',
+        help='List package + multi-instance installs from the host registry'
+    )
+    list_inst_parser.add_argument(
+        '--json',
+        action='store_true',
+        dest='list_json',
+        help='Emit JSON instead of a table'
     )
     
     # Configure command
@@ -2488,25 +2505,78 @@ if __name__ == "__main__":
             logger.error(f"Unexpected recover-simulate error: {e}", exc_info=True)
             sys.exit(1)
 
+    # List install registry (no root required)
+    if args.command == 'list-instances':
+        try:
+            from logstashagent import install_registry as _reg
+
+            instances = _reg.list_instances(include_discovered=True)
+            reg = _reg.load_registry()
+            if getattr(args, 'list_json', False):
+                print(json.dumps({
+                    'package': reg.get('package'),
+                    'instances': instances,
+                    'registry_path': str(_reg.registry_path()),
+                }, indent=2))
+            else:
+                pkg = reg.get('package')
+                print(f"Registry: {_reg.registry_path()}")
+                if pkg:
+                    print(
+                        f"Package: agent_version={pkg.get('agent_version') or '?'} "
+                        f"updated={pkg.get('updated_at') or '?'}"
+                    )
+                else:
+                    print("Package: (not registered)")
+                print()
+                print(_reg.format_instances_table(instances))
+            sys.exit(0)
+        except Exception as e:
+            logger.error(f"list-instances failed: {e}", exc_info=True)
+            sys.exit(1)
+
     # Check if we're in uninstall mode
     if args.command == 'uninstall':
+        instance = getattr(args, 'instance', None)
         if not args.yes:
-            print("\nThis will uninstall LogstashAgent from the system.")
-            print("\nThe following will be removed:")
-            print("  - Binary: /opt/logstash-agent")
-            print("  - Symlink: /usr/local/bin/logstash-agent")
-            print("  - Config: /etc/logstash-agent")
-            print("  - Systemd service: /etc/systemd/system/logstash-agent.service")
-            
-            if args.purge:
-                print("\n--purge flag detected. Also removing:")
-                print("  - State: /var/lib/logstash-agent")
-                print("  - Logs: /var/log/logstash-agent")
+            if instance:
+                print(f"\nThis will uninstall only instance: {instance}")
+                if args.purge:
+                    print("  --purge: also delete the instance path tree")
+                else:
+                    print("  Units will be stopped/disabled; path tree preserved")
             else:
-                print("\nPreserving:")
-                print("  - State: /var/lib/logstash-agent")
-                print("  - Logs: /var/log/logstash-agent")
-                print("  (Use --purge to remove these)")
+                print("\nThis will uninstall LogstashAgent from the system.")
+                print("\nThe following will be removed:")
+                print("  - Binary: /opt/logstash-agent/bin")
+                print("  - Symlink: /usr/local/bin/logstash-agent")
+                print("  - Config: /etc/logstash-agent")
+                print("  - Systemd units (packaged + multi-instance templates)")
+                print("  - Registered multi-instance agent units (stopped/disabled)")
+                try:
+                    from logstashagent import install_registry as _reg
+
+                    insts = _reg.list_instances(include_discovered=True)
+                    multi = [i for i in insts if (i.get('role') or '') in ('managed', 'simulate')]
+                    if multi:
+                        print("\nRegistered / discovered instances:")
+                        for i in multi:
+                            print(f"  - {i.get('id')}: {i.get('agent_unit')}  {i.get('path_root') or ''}")
+                except Exception:
+                    pass
+
+                if args.purge:
+                    print("\n--purge flag detected. Also removing:")
+                    print("  - State: /var/lib/logstash-agent")
+                    print("  - Logs: /var/log/logstash-agent")
+                    print("  - Cache: /var/cache/logstash-agent")
+                    print("  - managed-N / simulate-N trees under /opt/logstash-agent")
+                else:
+                    print("\nPreserving:")
+                    print("  - State: /var/lib/logstash-agent (incl. install-registry.json)")
+                    print("  - Logs: /var/log/logstash-agent")
+                    print("  - multi-instance path trees (use --purge to remove)")
+                    print("  (Use --purge to remove these)")
             
             print()
             answer = input("Continue? [y/N]: ").strip().lower()
@@ -2515,7 +2585,7 @@ if __name__ == "__main__":
                 sys.exit(0)
         
         try:
-            installer.perform_uninstallation(purge=args.purge)
+            installer.perform_uninstallation(purge=args.purge, instance=instance)
             sys.exit(0)
         except installer.InstallError as e:
             logger.error(f"Uninstallation failed: {e}")
