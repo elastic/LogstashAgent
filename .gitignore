@@ -225,4 +225,4 @@ __marimo__/
 CODEBASE_ANALYSIS.md
 *.tar.gz
 LogstashAgent.tar.gz
-
+src/logstashagent/data/
