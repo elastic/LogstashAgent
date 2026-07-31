@@ -44,12 +44,19 @@ def get_encryption_key():
                 logger.error(f"Invalid CREDENTIAL_KEY in environment: {e}")
                 raise RuntimeError(f"Invalid CREDENTIAL_KEY format: {e}")
         
-        # Check for key file - installed location first, then package-local
-        if os.path.exists('/var/lib/logstash-agent'):
-            key_file = Path('/var/lib/logstash-agent') / '.secret_key'
-        else:
-            base_dir = Path(__file__).resolve().parent
-            key_file = base_dir / 'data' / '.secret_key'
+        # Prefer the active agent state directory (packaged or per-instance) so
+        # multi-instance coexistence keeps separate secrets; fall back for early
+        # import / tests that have not configured agent_state.
+        try:
+            from logstashagent import agent_state as _agent_state
+
+            key_file = _agent_state.resolve_state_dir() / '.secret_key'
+        except Exception:
+            if os.path.exists('/var/lib/logstash-agent'):
+                key_file = Path('/var/lib/logstash-agent') / '.secret_key'
+            else:
+                base_dir = Path(__file__).resolve().parent
+                key_file = base_dir / 'data' / '.secret_key'
         
         if key_file.exists():
             try:

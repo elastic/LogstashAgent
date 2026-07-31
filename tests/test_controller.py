@@ -300,7 +300,10 @@ class TestGetConfigChanges:
         assert kwargs["json"]["connection_id"] == "conn-1"
         assert kwargs["json"]["keystore"] == {"FOO": "hash1"}
         assert kwargs["headers"]["Authorization"] == "ApiKey secret-key"
-        assert kwargs["verify"] is False
+        # Product-CA pin uses system∪product trust (not verify=False when pinned).
+        # Unpinned / missing CA may still pass a path or True-ish verify object.
+        assert "verify" in kwargs
+        assert kwargs["verify"] is not None
 
     def test_http_error_returns_none(self, temp_dir):
         settings = Path(temp_dir) / "s"

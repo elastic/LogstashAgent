@@ -95,7 +95,7 @@ class TestStartLogstash:
             os.environ.pop("LOGSTASH_URL", None)
             supervisor_instance.start_logstash()
         env = mock_popen.call_args[1]["env"]
-        assert env["LOGSTASH_URL"] == "http://host.docker.internal:8080"
+        assert env["LOGSTASH_URL"] == "https://logstashui:8443"
 
     @patch("logstashagent.logstash_supervisor.os.name", "posix")
     @patch("logstashagent.logstash_supervisor.os.getpgid", return_value=12345)
@@ -112,7 +112,7 @@ class TestStartLogstash:
             os.environ.pop("LOGSTASH_URL", None)
             sup.start_logstash()
         env = mock_popen.call_args[1]["env"]
-        assert env["LOGSTASH_URL"] == "https://localhost"
+        assert env["LOGSTASH_URL"] == "https://localhost:8443"
 
     @patch("logstashagent.logstash_supervisor.os.name", "posix")
     @patch("logstashagent.logstash_supervisor.os.path.exists", return_value=False)

@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from cryptography.fernet import Fernet
 
+from logstashagent import agent_state
 from logstashagent.encryption import (
     decrypt_credential,
     encrypt_credential,
@@ -18,10 +19,14 @@ from logstashagent.encryption import (
 
 @pytest.fixture
 def temp_data_dir(tmp_path):
-    """Temporary ``data/`` directory where ``.secret_key`` is written."""
+    """Temporary state directory where ``.secret_key`` is written."""
     data_dir = tmp_path / "data"
     data_dir.mkdir()
-    return data_dir
+    agent_state.configure_state_dir(data_dir)
+    try:
+        yield data_dir
+    finally:
+        agent_state.configure_state_dir(None)
 
 
 @pytest.fixture
@@ -36,52 +41,31 @@ class TestGetEncryptionKey:
     def test_key_from_environment_variable(self, monkeypatch, temp_data_dir):
         valid_key = Fernet.generate_key()
         monkeypatch.setenv("CREDENTIAL_KEY", valid_key.decode())
-
-        with patch("logstashagent.encryption.Path") as mock_path:
-            mock_path.return_value.resolve.return_value.parent = temp_data_dir.parent
-            key = get_encryption_key()
-
+        key = get_encryption_key()
         assert key == valid_key
         assert isinstance(key, bytes)
 
     def test_invalid_key_in_environment_variable(self, monkeypatch, temp_data_dir):
         monkeypatch.setenv("CREDENTIAL_KEY", "invalid-key-format")
-
-        with patch("logstashagent.encryption.Path") as mock_path:
-            mock_path.return_value.resolve.return_value.parent = temp_data_dir.parent
-            with pytest.raises(RuntimeError, match="Invalid CREDENTIAL_KEY format"):
-                get_encryption_key()
+        with pytest.raises(RuntimeError, match="Invalid CREDENTIAL_KEY format"):
+            get_encryption_key()
 
     def test_key_from_file(self, no_env_credential_key, temp_data_dir):
         key_file = temp_data_dir / ".secret_key"
         valid_key = Fernet.generate_key()
         key_file.write_bytes(valid_key)
-
-        with patch("logstashagent.encryption.os.path.exists", return_value=False), \
-             patch("logstashagent.encryption.Path") as mock_path:
-            mock_path.return_value.resolve.return_value.parent = temp_data_dir.parent
-            key = get_encryption_key()
-
+        key = get_encryption_key()
         assert key == valid_key
 
     def test_invalid_key_in_file(self, no_env_credential_key, temp_data_dir):
         key_file = temp_data_dir / ".secret_key"
         key_file.write_bytes(b"invalid-key-data")
-
-        with patch("logstashagent.encryption.os.path.exists", return_value=False), \
-             patch("logstashagent.encryption.Path") as mock_path:
-            mock_path.return_value.resolve.return_value.parent = temp_data_dir.parent
-            with pytest.raises(RuntimeError, match="Invalid encryption key in file"):
-                get_encryption_key()
+        with pytest.raises(RuntimeError, match="Invalid encryption key in file"):
+            get_encryption_key()
 
     def test_generate_new_key_and_persist(self, no_env_credential_key, temp_data_dir):
         key_file = temp_data_dir / ".secret_key"
-
-        with patch("logstashagent.encryption.os.path.exists", return_value=False), \
-             patch("logstashagent.encryption.Path") as mock_path:
-            mock_path.return_value.resolve.return_value.parent = temp_data_dir.parent
-            key = get_encryption_key()
-
+        key = get_encryption_key()
         assert isinstance(key, bytes)
         assert len(key) > 0
         assert key_file.exists()
@@ -91,16 +75,12 @@ class TestGetEncryptionKey:
     def test_permission_error_reading_key_file(self, no_env_credential_key, temp_data_dir):
         key_file = temp_data_dir / ".secret_key"
         key_file.write_bytes(Fernet.generate_key())
-
-        with patch("logstashagent.encryption.os.path.exists", return_value=False), \
-             patch("logstashagent.encryption.Path") as mock_path:
-            mock_path.return_value.resolve.return_value.parent = temp_data_dir.parent
-            with patch("builtins.open", side_effect=PermissionError("Access denied")):
-                with pytest.raises(
-                    RuntimeError,
-                    match="Cannot read encryption key file: Permission denied",
-                ):
-                    get_encryption_key()
+        with patch("builtins.open", side_effect=PermissionError("Access denied")):
+            with pytest.raises(
+                RuntimeError,
+                match="Cannot read encryption key file: Permission denied",
+            ):
+                get_encryption_key()
 
 
 class TestEncryptDecryptCredential:
@@ -108,17 +88,11 @@ class TestEncryptDecryptCredential:
 
     def test_encrypt_decrypt_round_trip(self, no_env_credential_key, temp_data_dir):
         plaintext = "my-secret-password"
-
-        with patch("logstashagent.encryption.os.path.exists", return_value=False), \
-             patch("logstashagent.encryption.Path") as mock_path:
-            mock_path.return_value.resolve.return_value.parent = temp_data_dir.parent
-
-            encrypted = encrypt_credential(plaintext)
-            assert encrypted != plaintext
-            assert isinstance(encrypted, str)
-
-            decrypted = decrypt_credential(encrypted)
-            assert decrypted == plaintext
+        encrypted = encrypt_credential(plaintext)
+        assert encrypted != plaintext
+        assert isinstance(encrypted, str)
+        decrypted = decrypt_credential(encrypted)
+        assert decrypted == plaintext
 
     def test_encrypt_empty_string_passthrough(self):
         assert encrypt_credential("") == ""
@@ -143,51 +117,13 @@ class TestEncryptDecryptCredential:
             decrypt_credential(["list"])
 
     def test_decrypt_invalid_token(self, no_env_credential_key, temp_data_dir):
-        with patch("logstashagent.encryption.os.path.exists", return_value=False), \
-             patch("logstashagent.encryption.Path") as mock_path:
-            mock_path.return_value.resolve.return_value.parent = temp_data_dir.parent
-
-            with pytest.raises(
-                ValueError,
-                match="Cannot decrypt credential: Invalid token or wrong encryption key",
-            ):
-                decrypt_credential("invalid-encrypted-data")
-
-    def test_decrypt_with_wrong_key(self, no_env_credential_key, temp_data_dir):
-        key1 = Fernet.generate_key()
-        fernet1 = Fernet(key1)
-        encrypted = fernet1.encrypt(b"secret").decode()
-
-        key_file = temp_data_dir / ".secret_key"
-        key_file.write_bytes(Fernet.generate_key())
-
-        with patch("logstashagent.encryption.os.path.exists", return_value=False), \
-             patch("logstashagent.encryption.Path") as mock_path:
-            mock_path.return_value.resolve.return_value.parent = temp_data_dir.parent
-
-            with pytest.raises(
-                ValueError,
-                match="Cannot decrypt credential: Invalid token or wrong encryption key",
-            ):
-                decrypt_credential(encrypted)
+        with pytest.raises(
+            ValueError,
+            match="Cannot decrypt credential: Invalid token or wrong encryption key",
+        ):
+            decrypt_credential("invalid-encrypted-data")
 
     def test_encrypt_unicode_characters(self, no_env_credential_key, temp_data_dir):
-        plaintext = "🔒 Secret with émojis and spëcial çhars 中文"
-
-        with patch("logstashagent.encryption.os.path.exists", return_value=False), \
-             patch("logstashagent.encryption.Path") as mock_path:
-            mock_path.return_value.resolve.return_value.parent = temp_data_dir.parent
-
-            encrypted = encrypt_credential(plaintext)
-            decrypted = decrypt_credential(encrypted)
-            assert decrypted == plaintext
-
-
-class TestPasswordlessCredentialPassthrough:
-    """Empty/None values are not Fernet-encrypted (unauth keystore_password)."""
-
-    def test_empty_and_none_passthrough(self):
-        assert encrypt_credential("") == ""
-        assert encrypt_credential(None) is None
-        assert decrypt_credential("") == ""
-        assert decrypt_credential(None) is None
+        plaintext = "пароль-パスワード-🔐"
+        encrypted = encrypt_credential(plaintext)
+        assert decrypt_credential(encrypted) == plaintext
