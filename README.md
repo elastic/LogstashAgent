@@ -4,7 +4,7 @@
 >
 > Warning: **Beta Release** - This project is under active development. Features may change.
 >
-> **Current package version: 0.5.2** — see [CHANGELOG.md](CHANGELOG.md).
+> **Current package version: 0.5.1** — see [CHANGELOG.md](CHANGELOG.md).
 
 ## Overview
 
