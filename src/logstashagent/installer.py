@@ -2,19 +2,18 @@
 #or more contributor license agreements. Licensed under the Elastic License;
 #you may not use this file except in compliance with the Elastic License.
 
+import logging
 import os
 import re
-import sys
 import shutil
 import subprocess
-import logging
+import sys
 from pathlib import Path
-from typing import Optional
 
 # Unix-only imports
 try:
-    import pwd
     import grp
+    import pwd
 except ImportError:
     # Not on Unix - installer won't work but module can still be imported
     pwd = None
@@ -173,7 +172,6 @@ WantedBy=multi-user.target
 
 class InstallError(Exception):
     """Installation error"""
-    pass
 
 
 def verify_root():
@@ -262,28 +260,28 @@ def get_logstash_uid_gid():
 def create_directories():
     """Create all required directories for LogstashAgent"""
     logger.info("Creating installation directories...")
-    
+
     uid, gid = get_logstash_uid_gid()
-    
+
     # Create binary directory (owned by root)
     os.makedirs(INSTALL_PATHS['binary_dir'], mode=0o755, exist_ok=True)
     logger.info(f"✓ Created {INSTALL_PATHS['binary_dir']}")
-    
+
     # Create config directory (owned by logstash)
     os.makedirs(INSTALL_PATHS['config_dir'], mode=0o755, exist_ok=True)
     os.chown(INSTALL_PATHS['config_dir'], uid, gid)
     logger.info(f"✓ Created {INSTALL_PATHS['config_dir']} (owned by logstash)")
-    
+
     # Create state directory (owned by logstash)
     os.makedirs(INSTALL_PATHS['state_dir'], mode=0o750, exist_ok=True)
     os.chown(INSTALL_PATHS['state_dir'], uid, gid)
     logger.info(f"✓ Created {INSTALL_PATHS['state_dir']} (owned by logstash)")
-    
+
     # Create log directory (owned by logstash)
     os.makedirs(INSTALL_PATHS['log_dir'], mode=0o755, exist_ok=True)
     os.chown(INSTALL_PATHS['log_dir'], uid, gid)
     logger.info(f"✓ Created {INSTALL_PATHS['log_dir']} (owned by logstash)")
-    
+
     # Create cache directory (owned by logstash)
     os.makedirs(INSTALL_PATHS['cache_dir'], mode=0o755, exist_ok=True)
     os.chown(INSTALL_PATHS['cache_dir'], uid, gid)
@@ -296,40 +294,47 @@ def install_binary():
     For PyInstaller bundles, also copies the _internal directory with dependencies
     """
     logger.info("Installing binary...")
-    
+
     # Check if we're running as a PyInstaller bundle
     if getattr(sys, 'frozen', False):
         # Running as PyInstaller bundle
         source_binary = sys.executable
         source_dir = os.path.dirname(source_binary)
-        
+
         # Copy the main executable
         shutil.copy2(source_binary, INSTALL_PATHS['binary'])
         os.chmod(INSTALL_PATHS['binary'], 0o755)
         logger.info(f"✓ Installed binary to {INSTALL_PATHS['binary']}")
-        
+
         # Check for _internal directory (PyInstaller dependencies)
         internal_source = os.path.join(source_dir, '_internal')
         if os.path.exists(internal_source):
             internal_dest = os.path.join(INSTALL_PATHS['binary_dir'], '_internal')
-            
+
             # Remove existing _internal if it exists
             if os.path.exists(internal_dest):
                 shutil.rmtree(internal_dest)
-            
+
             # Copy the entire _internal directory
             shutil.copytree(internal_source, internal_dest)
             logger.info(f"✓ Installed PyInstaller dependencies to {internal_dest}")
-            
+
             # Set SELinux context for _internal directory on RHEL/CentOS
             try:
-                result = subprocess.run(['which', 'restorecon'], capture_output=True)
+                result = subprocess.run(
+                    ['which', 'restorecon'],
+                    capture_output=True,
+                    check=False
+                )
                 if result.returncode == 0:
-                    subprocess.run(['restorecon', '-Rv', internal_dest], 
-                                 check=False, capture_output=True)
+                    subprocess.run(
+                        ['restorecon', '-Rv', internal_dest],
+                        check=False,
+                        capture_output=True
+                    )
                     logger.debug(f"Set SELinux context for {internal_dest}")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"Failed to set SELinux context for {internal_dest}: {e}")
         else:
             logger.warning("_internal directory not found - this may be a onefile build")
     else:
@@ -338,18 +343,25 @@ def install_binary():
         logger.warning("Running from Python script, not a compiled binary")
         logger.warning("In production, this should be a PyInstaller executable")
         source_binary = sys.executable
-        
+
         # Copy the binary
         shutil.copy2(source_binary, INSTALL_PATHS['binary'])
         os.chmod(INSTALL_PATHS['binary'], 0o755)
         logger.info(f"✓ Installed binary to {INSTALL_PATHS['binary']}")
-    
+
     # Set SELinux context for RHEL/CentOS systems
     try:
-        result = subprocess.run(['which', 'restorecon'], capture_output=True)
+        result = subprocess.run(
+            ['which', 'restorecon'],
+            capture_output=True,
+            check=False,
+        )
         if result.returncode == 0:
-            subprocess.run(['restorecon', '-v', INSTALL_PATHS['binary']], 
-                         check=False, capture_output=True)
+            subprocess.run(
+                ['restorecon', '-v', INSTALL_PATHS['binary']],
+                check=False,
+                capture_output=True,
+            )
             logger.info(f"✓ Set SELinux context for {INSTALL_PATHS['binary']}")
     except Exception as e:
         logger.debug(f"SELinux context setting skipped: {e}")
@@ -358,14 +370,14 @@ def install_binary():
 def create_symlink():
     """Create symlink in /usr/local/bin or /usr/bin (RHEL)"""
     logger.info("Creating symlink...")
-    
+
     # On RHEL, /usr/local/bin is not in default PATH, so use /usr/bin instead
     # Detect RHEL by checking for /etc/redhat-release
     symlink_path = INSTALL_PATHS['symlink']
     if os.path.exists('/etc/redhat-release'):
         symlink_path = '/usr/bin/logstash-agent'
         logger.info("RHEL detected, using /usr/bin for symlink")
-    
+
     # Remove existing symlink if it exists
     if os.path.islink(symlink_path):
         os.unlink(symlink_path)
@@ -374,7 +386,7 @@ def create_symlink():
             f"{symlink_path} exists and is not a symlink. "
             "Please remove it manually."
         )
-    
+
     # Create the symlink
     os.symlink(INSTALL_PATHS['binary'], symlink_path)
     logger.info(f"✓ Created symlink {symlink_path} -> {INSTALL_PATHS['binary']}")
@@ -382,9 +394,9 @@ def create_symlink():
 
 def write_config_file(
     logstash_ui_url: str,
-    policy_config: Optional[dict] = None,
+    policy_config: dict | None = None,
     *,
-    config_path: Optional[str] = None,
+    config_path: str | None = None,
 ) -> str:
     """
     Write the initial agent config file (packaged / managed / simulate).
@@ -518,8 +530,8 @@ logstash_ui_url: {logstash_ui_url}
     try:
         uid, gid = get_logstash_uid_gid()
         os.chown(config_path, uid, gid)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"Failed to set ownership for {config_path}: {e}")
     os.chmod(config_path, 0o640)
 
     logger.info(f"✓ Created configuration file {config_path}")
@@ -603,7 +615,7 @@ def materialize_simulate_instance(policy_config: dict) -> dict:
         'settings_path', 'config_path', 'logs_path', 'data_path',
         'keystore_env_file', 'logstash_download_dir', 'binary_path',
     ):
-        if key in policy_config and policy_config[key]:
+        if policy_config.get(key):
             policy_config[key] = normalize_opt_path(policy_config[key])
 
     instance_id = policy_config.get('instance_id')
@@ -944,8 +956,8 @@ def setup_simulate_from_policy(policy_config: dict) -> dict:
     )
     # Track in host install registry
     try:
-        from logstashagent import install_registry as _reg
         from logstashagent import agent_state as _as
+        from logstashagent import install_registry as _reg
 
         role = 'managed' if pt == 'MANAGED' else 'simulate'
         state = _as.get_state() or {}
@@ -972,7 +984,7 @@ def setup_simulate_from_policy(policy_config: dict) -> dict:
     return result
 
 
-def policy_config_from_state(state: Optional[dict] = None) -> dict:
+def policy_config_from_state(state: dict | None = None) -> dict:
     """
     Rebuild a policy_config dict from agent state (for deferred setup-simulate).
     Prefers the full ``policy_config`` blob saved at enroll.
@@ -1035,7 +1047,7 @@ def _can_write_simulate_tree(policy_config: dict) -> bool:
     return False
 
 
-def _try_sudo_setup_simulate() -> Optional[dict]:
+def _try_sudo_setup_simulate() -> dict | None:
     """
     Attempt passwordless sudo to finish setup via setup-simulate subcommand.
     Returns result dict if sudo ran, None if sudo unavailable/denied.
@@ -1407,7 +1419,8 @@ logstash ALL=(ALL) NOPASSWD: /usr/bin/chmod 640 /etc/default/logstash
         result = subprocess.run(
             ['visudo', '-c', '-f', sudoers_file],
             capture_output=True,
-            timeout=5
+            timeout=5,
+            check=False,
         )
         if result.returncode == 0:
             logger.info("✓ Sudoers configuration validated successfully")
@@ -1498,14 +1511,18 @@ def install_systemd_service():
     # Write the service file
     with open(INSTALL_PATHS['systemd_service'], 'w') as f:
         f.write(_build_systemd_service())
-    
+
     os.chmod(INSTALL_PATHS['systemd_service'], 0o644)
     logger.info(f"✓ Created systemd service {INSTALL_PATHS['systemd_service']}")
-    
+
     # Reload systemd
     try:
-        result = subprocess.run(['systemctl', 'daemon-reload'], 
-                              check=True, capture_output=True, text=True)
+        _ = subprocess.run(
+            ['systemctl', 'daemon-reload'],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
         logger.info("✓ Reloaded systemd daemon")
     except subprocess.CalledProcessError as e:
         logger.warning(f"Failed to reload systemd: {e}")
@@ -1517,11 +1534,15 @@ def install_systemd_service():
         logger.info("Continuing (daemon will reload on next systemctl command)")
 
 
-def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str, 
-                        enrollment_func) -> None:
+def perform_installation(
+    enroll_token: str,
+    logstash_ui_url: str,
+    agent_id: str,
+    enrollment_func,
+) -> None:
     """
     Perform the complete installation process.
-    
+
     Args:
         enroll_token: Enrollment token for LogstashUI
         logstash_ui_url: URL of the LogstashUI instance
@@ -1531,7 +1552,7 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
     logger.info("="*60)
     logger.info("LOGSTASH AGENT INSTALLATION")
     logger.info("="*60)
-    
+
     try:
         # Step 1: Verify prerequisites
         logger.info("\nStep 1: Verifying prerequisites...")
@@ -1546,27 +1567,27 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
                 "   installed and /etc/logstash-agent/logstash-agent.yml is\n"
                 "   updated with the correct binary and settings paths.\n"
             )
-        
+
         # Step 2: Create directories
         logger.info("\nStep 2: Creating directories...")
         create_directories()
-        
+
         # Step 3: Install binary
         logger.info("\nStep 3: Installing binary...")
         install_binary()
-        
+
         # Step 4: Create symlink
         logger.info("\nStep 4: Creating symlink...")
         create_symlink()
-        
+
         # Host coexistence: if a packaged agent is already registered, protect its
         # state.json before multi-instance enroll writes temporary enrollment state
         # into /var/lib/logstash-agent.
-        from logstashagent import install_registry as _reg
         from logstashagent import agent_state as _as
+        from logstashagent import install_registry as _reg
 
         packaged_state_path = Path(INSTALL_PATHS['state_dir']) / 'state.json'
-        packaged_state_backup: Optional[bytes] = None
+        packaged_state_backup: bytes | None = None
         try:
             existing_reg = _reg.load_registry()
             has_packaged = 'packaged' in (existing_reg.get('instances') or {})
@@ -1597,7 +1618,7 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
 
         # Step 6: Write config file (mode-aware; multi → instance tree, not /etc)
         logger.info("\nStep 6: Writing configuration...")
-        written_config = write_config_file(logstash_ui_url, policy_config=policy_config)
+        _ = write_config_file(logstash_ui_url, policy_config=policy_config)
 
         # Step 7: Install systemd units
         # Always install multi-instance templates so a later managed/simulate
@@ -1686,7 +1707,7 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
                 stat_info = os.stat(log_file)
                 if stat_info.st_uid == 0:  # root
                     os.remove(log_file)
-                    logger.info(f"✓ Removed root-owned log file (will be recreated by service)")
+                    logger.info("✓ Removed root-owned log file (will be recreated by service)")
             except Exception as e:
                 logger.warning(f"Could not clean up log file: {e}")
 
@@ -1724,8 +1745,8 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
 
         # Record package + instance in install registry
         try:
-            from logstashagent import install_registry as _reg
             from logstashagent import agent_state as _as
+            from logstashagent import install_registry as _reg
 
             state = _as.get_state() or {}
             ver = str(state.get('agent_version') or '')
@@ -1828,8 +1849,8 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
                             e.get('agent_unit'),
                             e.get('path_root') or '(packaged)',
                         )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to list other roles: {e}")
             logger.info("="*60)
         else:
             if not logstash_present:
@@ -1882,22 +1903,22 @@ def perform_installation(enroll_token: str, logstash_ui_url: str, agent_id: str,
                             e.get('agent_unit'),
                             e.get('path_root'),
                         )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to list other roles: {e}")
             logger.info("="*60)
-        
+
     except InstallError as e:
         logger.error(f"\nInstallation failed: {e}")
         raise
     except Exception as e:
-        logger.error(f"\nUnexpected error during installation: {e}", exc_info=True)
+        logger.exception("\nUnexpected error during installation")
         raise InstallError(f"Installation failed: {e}")
 
 
 def perform_uninstallation(
     purge: bool = False,
     *,
-    instance: Optional[str] = None,
+    instance: str | None = None,
 ) -> None:
     """
     Perform uninstallation using the host install registry.
@@ -1913,7 +1934,7 @@ def perform_uninstallation(
     logger.info("="*60)
     logger.info("LOGSTASH AGENT UNINSTALLATION")
     logger.info("="*60)
-    
+
     try:
         # Step 1: Verify prerequisites
         logger.info("\nStep 1: Verifying prerequisites...")
@@ -1927,11 +1948,10 @@ def perform_uninstallation(
         if instance:
             key = instance.strip().lower()
             entry = next((e for e in all_instances if (e.get('id') or '').lower() == key), None)
-            if not entry:
+            if not entry and key in ('default', 'package'):
                 # Allow role aliases
-                if key in ('default', 'package'):
-                    key = 'packaged'
-                    entry = next((e for e in all_instances if e.get('id') == 'packaged'), None)
+                key = 'packaged'
+                entry = next((e for e in all_instances if e.get('id') == 'packaged'), None)
             if not entry:
                 raise InstallError(
                     f"Instance '{instance}' not found in install registry. "
@@ -1944,8 +1964,8 @@ def perform_uninstallation(
                     ['systemctl', 'daemon-reload'],
                     check=False, capture_output=True, text=True,
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to reload systemd: {e}")
             logger.info("\n" + "="*60)
             logger.info("INSTANCE UNINSTALL COMPLETE: %s", entry.get('id'))
             if purge:
@@ -2014,15 +2034,17 @@ def perform_uninstallation(
             except OSError as e:
                 logger.warning("Could not remove packaged unit: %s", e)
         try:
-            result = subprocess.run(
+            _ = subprocess.run(
                 ['systemctl', 'daemon-reload'],
-                check=True, capture_output=True, text=True,
+                check=True,
+                capture_output=True,
+                text=True,
             )
             logger.info("✓ Reloaded systemd daemon")
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
             logger.warning(f"Failed to reload systemd: {e}")
             logger.info("Continuing (daemon will reload eventually)")
-        
+
         # Step 5: Remove sudoers drop-in
         logger.info("\nStep 5: Removing sudoers configuration...")
         sudoers_file = '/etc/sudoers.d/logstash-agent'
@@ -2034,11 +2056,11 @@ def perform_uninstallation(
                 logger.warning(f"Could not remove sudoers file: {e}")
         else:
             logger.info("Sudoers file not found, skipping")
-        
+
         # Step 6: Remove symlink (check both /usr/local/bin and /usr/bin for RHEL)
         logger.info("\nStep 6: Removing symlink...")
         symlink_removed = False
-        
+
         # Check /usr/local/bin (default location)
         if os.path.islink(INSTALL_PATHS['symlink']):
             os.unlink(INSTALL_PATHS['symlink'])
@@ -2046,7 +2068,7 @@ def perform_uninstallation(
             symlink_removed = True
         elif os.path.exists(INSTALL_PATHS['symlink']):
             logger.warning(f"{INSTALL_PATHS['symlink']} exists but is not a symlink, skipping")
-        
+
         # Check /usr/bin (RHEL location)
         rhel_symlink = '/usr/bin/logstash-agent'
         if os.path.islink(rhel_symlink):
@@ -2055,16 +2077,16 @@ def perform_uninstallation(
             symlink_removed = True
         elif os.path.exists(rhel_symlink):
             logger.warning(f"{rhel_symlink} exists but is not a symlink, skipping")
-        
+
         if not symlink_removed:
             logger.info("Symlink not found, skipping")
-        
+
         # Step 7: Remove binary directory
         logger.info("\nStep 7: Removing binary...")
         if os.path.exists(INSTALL_PATHS['binary_dir']):
             shutil.rmtree(INSTALL_PATHS['binary_dir'])
             logger.info(f"✓ Removed {INSTALL_PATHS['binary_dir']}")
-            
+
             # Remove parent directory if empty (only when no remaining instance trees)
             parent_dir = os.path.dirname(INSTALL_PATHS['binary_dir'])
             if os.path.exists(parent_dir):
@@ -2077,7 +2099,7 @@ def perform_uninstallation(
                     logger.info(f"✓ Removed {parent_dir}")
                 elif purge:
                     # With purge, remove leftover managed-/simulate- under opt root
-                    for name in list(remaining):
+                    for name in remaining:
                         if re.match(r'^(managed|simulate)-[0-9]+$', name):
                             _reg.remove_path_tree(os.path.join(parent_dir, name))
                     try:
@@ -2098,7 +2120,7 @@ def perform_uninstallation(
                     )
         else:
             logger.info("Binary directory not found, skipping")
-        
+
         # Step 8: Remove config directory
         logger.info("\nStep 8: Removing configuration...")
         if os.path.exists(INSTALL_PATHS['config_dir']):
@@ -2106,7 +2128,7 @@ def perform_uninstallation(
             logger.info(f"✓ Removed {INSTALL_PATHS['config_dir']}")
         else:
             logger.info("Config directory not found, skipping")
-        
+
         # Step 9: Optionally remove state directory (includes install-registry.json)
         if purge:
             logger.info("\nStep 9: Removing state directory (--purge)...")
@@ -2130,7 +2152,7 @@ def perform_uninstallation(
                 _reg.save_registry(reg2)
             except Exception as e:
                 logger.warning("Could not update registry after uninstall: %s", e)
-        
+
         # Step 10: Optionally remove log directory
         if purge:
             logger.info("\nStep 10: Removing log directory (--purge)...")
@@ -2143,7 +2165,7 @@ def perform_uninstallation(
             logger.info("\nStep 10: Preserving log directory...")
             logger.info(f"Log directory preserved: {INSTALL_PATHS['log_dir']}")
             logger.info("(Use --purge to remove logs)")
-        
+
         # Step 11: Optionally remove cache directory
         if purge:
             logger.info("\nStep 11: Removing cache directory (--purge)...")
@@ -2156,12 +2178,12 @@ def perform_uninstallation(
             logger.info("\nStep 11: Preserving cache directory...")
             logger.info(f"Cache directory preserved: {INSTALL_PATHS['cache_dir']}")
             logger.info("(Use --purge to remove cached downloads)")
-        
+
         # Uninstallation complete
         logger.info("\n" + "="*60)
         logger.info("UNINSTALLATION COMPLETED SUCCESSFULLY!")
         logger.info("="*60)
-        
+
         if not purge:
             logger.info("\nPreserved directories:")
             logger.info(f"  - {INSTALL_PATHS['state_dir']}")
@@ -2170,14 +2192,14 @@ def perform_uninstallation(
             logger.info("  - multi-instance trees under /opt/logstash-agent (if any)")
             logger.info("\nTo remove these, run:")
             logger.info("  sudo logstash-agent uninstall --purge")
-        
+
         logger.info("="*60)
-        
+
     except InstallError as e:
         logger.error(f"\nUninstallation failed: {e}")
         raise
     except Exception as e:
-        logger.error(f"\nUnexpected error during uninstallation: {e}", exc_info=True)
+        logger.exception("\nUnexpected error during uninstallation")
         raise InstallError(f"Uninstallation failed: {e}")
 
 
@@ -2185,55 +2207,55 @@ def download_release(version: str, download_dir: str) -> str:
     """
     Download a specific release from GitHub.
     Uses a persistent cache directory to avoid re-downloading.
-    
+
     Args:
         version: Version to download (e.g., "0.1.4")
         download_dir: Directory to download to (unused, kept for compatibility)
-    
+
     Returns:
         Path to the downloaded tarball
     """
     import requests
-    
+
     # Use persistent cache directory
     cache_dir = INSTALL_PATHS['cache_dir']
-    
+
     # Create cache directory if it doesn't exist
     if not os.path.exists(cache_dir):
         os.makedirs(cache_dir, mode=0o755)
         logger.info(f"Created cache directory: {cache_dir}")
-        
+
         # Set ownership to logstash:logstash
         try:
             logstash_uid = pwd.getpwnam('logstash').pw_uid
             logstash_gid = grp.getgrnam('logstash').gr_gid
             os.chown(cache_dir, logstash_uid, logstash_gid)
-            logger.info(f"Set cache directory ownership to logstash:logstash")
+            logger.info("Set cache directory ownership to logstash:logstash")
         except (KeyError, OSError) as e:
             logger.warning(f"Could not set cache directory ownership: {e}")
-    
+
     # Check if tarball already exists in cache
     cached_tarball = os.path.join(cache_dir, f"logstash-agent-{version}.tar.gz")
-    
+
     if os.path.exists(cached_tarball):
         logger.info(f"✓ Found cached download: {cached_tarball}")
         logger.info("Skipping download (using cached version)")
         return cached_tarball
-    
+
     # GitHub release URL
     url = f"https://github.com/elastic/LogstashAgent/releases/download/v{version}/logstash-agent-linux-amd64.tar.gz"
-    
+
     logger.info(f"Downloading {url}...")
     logger.info(f"Cache location: {cached_tarball}")
-    
+
     try:
         response = requests.get(url, stream=True, timeout=60)
         response.raise_for_status()
-        
+
         # Download with progress
         total_size = int(response.headers.get('content-length', 0))
         downloaded = 0
-        
+
         with open(cached_tarball, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192):
                 if chunk:
@@ -2242,7 +2264,7 @@ def download_release(version: str, download_dir: str) -> str:
                     if total_size > 0:
                         percent = (downloaded / total_size) * 100
                         logger.debug(f"Downloaded {percent:.1f}%")
-        
+
         # Set ownership to logstash:logstash so agent can read it
         try:
             logstash_uid = pwd.getpwnam('logstash').pw_uid
@@ -2251,10 +2273,10 @@ def download_release(version: str, download_dir: str) -> str:
             os.chmod(cached_tarball, 0o644)  # rw-r--r--
         except (KeyError, OSError) as e:
             logger.warning(f"Could not set tarball ownership: {e}")
-        
+
         logger.info(f"✓ Downloaded to cache: {cached_tarball}")
         return cached_tarball
-        
+
     except requests.exceptions.RequestException as e:
         raise InstallError(f"Failed to download release {version}: {e}")
 
@@ -2262,31 +2284,31 @@ def download_release(version: str, download_dir: str) -> str:
 def extract_binary(tarball_path: str, extract_dir: str) -> str:
     """
     Extract the binary from the tarball.
-    
+
     Args:
         tarball_path: Path to the tarball
         extract_dir: Directory to extract to
-    
+
     Returns:
         Path to the extracted binary
     """
     import tarfile
-    
+
     logger.info(f"Extracting {tarball_path}...")
-    
+
     try:
         with tarfile.open(tarball_path, 'r:gz') as tar:
             tar.extractall(extract_dir)
-        
+
         # Find the binary
         binary_path = os.path.join(extract_dir, 'logstash-agent', 'logstash-agent')
-        
+
         if not os.path.exists(binary_path):
             raise InstallError(f"Binary not found in tarball at expected location: {binary_path}")
-        
+
         logger.info(f"✓ Extracted binary to {binary_path}")
         return binary_path
-        
+
     except (tarfile.TarError, OSError) as e:
         raise InstallError(f"Failed to extract tarball: {e}")
 
@@ -2307,7 +2329,8 @@ def is_sudo_rs() -> bool:
             ['sudo', '--version'],
             capture_output=True,
             text=True,
-            timeout=5
+            timeout=5,
+            check=False,
         )
         return 'sudo-rs' in result.stdout or 'sudo-rs' in result.stderr
     except Exception:
@@ -2329,19 +2352,21 @@ def systemctl_via_sudo(action: str, unit: str, *, timeout: int = 30) -> subproce
             capture_output=True,
             text=True,
             timeout=timeout,
+            check=False,
         )
     return subprocess.run(
         ['sudo', 'systemctl', action, unit],
         capture_output=True,
         text=True,
         timeout=timeout,
+        check=False,
     )
 
 
 def verify_service_running() -> bool:
     """
     Verify that the logstash-agent service is running.
-    
+
     Returns:
         True if service is active, False otherwise
     """
@@ -2349,7 +2374,8 @@ def verify_service_running() -> bool:
         result = subprocess.run(
             ['systemctl', 'is-active', 'logstash-agent'],
             capture_output=True,
-            timeout=5
+            timeout=5,
+            check=False,
         )
         return result.returncode == 0
     except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
@@ -2359,7 +2385,7 @@ def verify_service_running() -> bool:
 def perform_upgrade(version: str, auto: bool = False) -> None:
     """
     Perform the upgrade process.
-    
+
     Args:
         version: Version to upgrade to (e.g., "0.1.4")
         auto: If True, this is an automatic upgrade triggered by the controller
@@ -2367,17 +2393,17 @@ def perform_upgrade(version: str, auto: bool = False) -> None:
     logger.info("="*60)
     logger.info(f"LOGSTASH AGENT UPGRADE TO VERSION {version}")
     logger.info("="*60)
-    
+
     temp_dir = None
     backup_path = f"{INSTALL_PATHS['binary']}.backup"
     service_was_running = False
-    
+
     try:
         # Step 1: Verify prerequisites
         logger.info("\nStep 1: Verifying prerequisites...")
         verify_root()
         verify_platform()
-        
+
         # Verify agent is installed
         if not os.path.exists(INSTALL_PATHS['binary']):
             raise InstallError(
@@ -2385,25 +2411,25 @@ def perform_upgrade(version: str, auto: bool = False) -> None:
                 "Run 'install' command first."
             )
         logger.info("✓ Agent installation verified")
-        
+
         # Step 2: Create temporary directory
         logger.info("\nStep 2: Preparing download...")
         import tempfile
         temp_dir = tempfile.mkdtemp(prefix='logstash-agent-upgrade-')
         logger.info(f"✓ Created temporary directory: {temp_dir}")
-        
+
         # Step 3: Download release
         logger.info(f"\nStep 3: Downloading version {version}...")
         tarball_path = download_release(version, temp_dir)
-        
+
         # Step 4: Extract binary
         logger.info("\nStep 4: Extracting binary...")
         new_binary_path = extract_binary(tarball_path, temp_dir)
-        
+
         # Make it executable
         os.chmod(new_binary_path, 0o755)
         logger.info("✓ Binary extracted and marked executable")
-        
+
         # Step 5: Check if service is running
         logger.info("\nStep 5: Checking service status...")
         service_was_running = verify_service_running()
@@ -2411,20 +2437,20 @@ def perform_upgrade(version: str, auto: bool = False) -> None:
             logger.info("Service is running, will be restarted")
         else:
             logger.info("Service is not running")
-        
+
         # Step 6: Skip stopping service - just overwrite and restart
         # The atomic rename allows us to replace the binary while it's running
         # Then systemctl restart will cleanly stop old process and start new one
         logger.info("\nStep 6: Skipping service stop (will restart after binary replacement)...")
         logger.info("✓ Service will be restarted with new binary")
-        
+
         # Step 7: Backup current binary and dependencies
         logger.info("\nStep 7: Backing up current binary...")
         if os.path.exists(backup_path):
             os.remove(backup_path)
         shutil.copy2(INSTALL_PATHS['binary'], backup_path)
         logger.info(f"✓ Backed up binary to {backup_path}")
-        
+
         # Also backup _internal directory if it exists
         internal_backup_path = f"{INSTALL_PATHS['binary_dir']}/_internal.backup"
         internal_current = os.path.join(INSTALL_PATHS['binary_dir'], '_internal')
@@ -2433,26 +2459,30 @@ def perform_upgrade(version: str, auto: bool = False) -> None:
                 shutil.rmtree(internal_backup_path)
             shutil.copytree(internal_current, internal_backup_path)
             logger.info(f"✓ Backed up dependencies to {internal_backup_path}")
-        
+
         # Step 8: Replace binary
         logger.info("\nStep 8: Installing new binary...")
-        
+
         # Get source directory for PyInstaller bundle
         new_binary_dir = os.path.dirname(new_binary_path)
-        
+
         # Check if binary is still in use before attempting copy
         try:
             # Try to check if any process is using the binary
-            result = subprocess.run(['lsof', INSTALL_PATHS['binary']], 
-                                  capture_output=True, timeout=5)
+            result = subprocess.run(
+                ['lsof', INSTALL_PATHS['binary']],
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
             if result.returncode == 0:
-                logger.warning(f"Binary is still in use by processes:")
+                logger.warning("Binary is still in use by processes:")
                 logger.warning(result.stdout.decode())
             else:
                 logger.info("Binary is not in use by any processes")
         except Exception as e:
             logger.debug(f"Could not check if binary is in use: {e}")
-        
+
         # Install the main binary using atomic rename
         # We can't use shutil.copy2() directly because the upgrade process itself
         # is running from this binary, causing "Text file busy" error
@@ -2463,7 +2493,7 @@ def perform_upgrade(version: str, auto: bool = False) -> None:
             shutil.copy2(new_binary_path, temp_binary)
             os.chmod(temp_binary, 0o755)
             logger.info(f"✓ Copied new binary to {temp_binary}")
-            
+
             # Atomically rename over the old binary
             # This works even if the old binary is currently executing
             os.rename(temp_binary, INSTALL_PATHS['binary'])
@@ -2473,83 +2503,94 @@ def perform_upgrade(version: str, auto: bool = False) -> None:
             logger.error(f"Error code: {e.errno}")
             logger.error(f"Error message: {e.strerror}")
             # Check service status
-            service_check = subprocess.run(['systemctl', 'is-active', 'logstash-agent'],
-                                         capture_output=True)
+            service_check = subprocess.run(
+                ['systemctl', 'is-active', 'logstash-agent'],
+                capture_output=True,
+                check=False,
+            )
             logger.error(f"Service status: {service_check.stdout.decode().strip()}")
             # Clean up temp file if it exists
             if os.path.exists(temp_binary):
                 os.remove(temp_binary)
             raise
-        
+
         # Check for _internal directory (PyInstaller dependencies)
         internal_source = os.path.join(new_binary_dir, '_internal')
         if os.path.exists(internal_source):
             internal_dest = os.path.join(INSTALL_PATHS['binary_dir'], '_internal')
-            
+
             # Remove existing _internal if it exists
             if os.path.exists(internal_dest):
                 shutil.rmtree(internal_dest)
-            
+
             # Copy the entire _internal directory
             shutil.copytree(internal_source, internal_dest)
             logger.info(f"✓ Installed PyInstaller dependencies to {internal_dest}")
-            
+
             # Set SELinux context for _internal directory on RHEL/CentOS
             try:
-                result = subprocess.run(['which', 'restorecon'], capture_output=True)
+                result = subprocess.run(
+                    ['which', 'restorecon'],
+                    capture_output=True,
+                    check=False,
+                )
                 if result.returncode == 0:
-                    subprocess.run(['restorecon', '-Rv', internal_dest], 
+                    subprocess.run(['restorecon', '-Rv', internal_dest],
                                  check=False, capture_output=True)
                     logger.debug(f"Set SELinux context for {internal_dest}")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to set SELinux context for {internal_dest}: {e}")
         else:
             logger.warning("_internal directory not found in upgrade package")
-        
+
         # Set SELinux context for upgraded binary on RHEL/CentOS
         try:
-            result = subprocess.run(['which', 'restorecon'], capture_output=True)
+            result = subprocess.run(
+                ['which', 'restorecon'],
+                capture_output=True,
+                check=False,
+            )
             if result.returncode == 0:
-                subprocess.run(['restorecon', '-v', INSTALL_PATHS['binary']], 
+                subprocess.run(['restorecon', '-v', INSTALL_PATHS['binary']],
                              check=False, capture_output=True)
-                logger.info(f"✓ Set SELinux context for upgraded binary")
+                logger.info("✓ Set SELinux context for upgraded binary")
         except Exception as e:
             logger.debug(f"SELinux context setting skipped: {e}")
-        
+
         # Step 9: Restart service (always restart after upgrade)
         logger.info("\nStep 9: Restarting service with new binary...")
         try:
-            subprocess.run(['systemctl', 'restart', 'logstash-agent'], 
+            subprocess.run(['systemctl', 'restart', 'logstash-agent'],
                          check=True, capture_output=True, timeout=30)
             logger.info("✓ Service restarted")
-            
+
             # Step 10: Verify service is running
             logger.info("\nStep 10: Verifying service health...")
             import time
             time.sleep(2)  # Give it a moment to start
-            
+
             if verify_service_running():
                 logger.info("✓ Service is running successfully")
             else:
                 raise InstallError("Service failed to start with new binary")
-                
+
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, InstallError) as e:
             # Rollback!
             logger.error(f"Service failed to start: {e}")
             logger.info("\nPerforming rollback...")
-            
+
             rollback_success = True
             rollback_errors = []
-            
+
             try:
                 # Stop the failed service
-                subprocess.run(['systemctl', 'stop', 'logstash-agent'], 
+                subprocess.run(['systemctl', 'stop', 'logstash-agent'],
                              check=False, capture_output=True)
                 logger.info("✓ Stopped failed service")
             except Exception as stop_error:
                 logger.warning(f"Could not stop service: {stop_error}")
                 rollback_errors.append(f"Failed to stop service: {stop_error}")
-            
+
             try:
                 # Restore backup binary
                 if not os.path.exists(backup_path):
@@ -2560,7 +2601,7 @@ def perform_upgrade(version: str, auto: bool = False) -> None:
                 logger.error(f"Failed to restore binary: {restore_error}")
                 rollback_errors.append(f"Failed to restore binary: {restore_error}")
                 rollback_success = False
-            
+
             try:
                 # Restore backup _internal if it exists
                 internal_backup_path = f"{INSTALL_PATHS['binary_dir']}/_internal.backup"
@@ -2573,11 +2614,11 @@ def perform_upgrade(version: str, auto: bool = False) -> None:
             except Exception as deps_error:
                 logger.warning(f"Failed to restore dependencies: {deps_error}")
                 rollback_errors.append(f"Failed to restore dependencies: {deps_error}")
-            
+
             if rollback_success:
                 try:
                     # Start with old binary
-                    subprocess.run(['systemctl', 'start', 'logstash-agent'], 
+                    subprocess.run(['systemctl', 'start', 'logstash-agent'],
                                  check=True, capture_output=True, timeout=30)
                     logger.info("✓ Service restarted with previous version")
                     logger.info("\nRollback completed successfully")
@@ -2585,7 +2626,7 @@ def perform_upgrade(version: str, auto: bool = False) -> None:
                     logger.error(f"Failed to start service after rollback: {start_error}")
                     rollback_errors.append(f"Failed to start service: {start_error}")
                     rollback_success = False
-            
+
             if not rollback_success:
                 logger.error("\n" + "="*60)
                 logger.error("ROLLBACK FAILED - MANUAL INTERVENTION REQUIRED")
@@ -2597,21 +2638,21 @@ def perform_upgrade(version: str, auto: bool = False) -> None:
                 logger.error(f"  1. Check if backup exists: ls -la {backup_path}")
                 logger.error(f"  2. Manually restore: sudo cp {backup_path} {INSTALL_PATHS['binary']}")
                 logger.error(f"  3. Restore permissions: sudo chmod 755 {INSTALL_PATHS['binary']}")
-                logger.error(f"  4. Start service: sudo systemctl start logstash-agent")
-                logger.error(f"  5. Check status: sudo systemctl status logstash-agent")
+                logger.error("  4. Start service: sudo systemctl start logstash-agent")
+                logger.error("  5. Check status: sudo systemctl status logstash-agent")
                 logger.error("="*60)
                 raise InstallError(
-                    f"Upgrade failed and rollback encountered errors. "
-                    f"Manual recovery required. See log for details.")
-            
+                    "Upgrade failed and rollback encountered errors. "
+                    "Manual recovery required. See log for details.")
+
             raise InstallError(f"Upgrade failed and was rolled back: {e}")
-        
+
         # Step 11: Cleanup
         logger.info("\nStep 11: Cleaning up...")
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
             logger.info("✓ Removed temporary files")
-        
+
         # Remove backup files after successful upgrade
         if os.path.exists(backup_path):
             try:
@@ -2619,7 +2660,7 @@ def perform_upgrade(version: str, auto: bool = False) -> None:
                 logger.info(f"✓ Removed backup binary: {backup_path}")
             except OSError as e:
                 logger.warning(f"Could not remove backup binary: {e}")
-        
+
         internal_backup_path = f"{INSTALL_PATHS['binary_dir']}/_internal.backup"
         if os.path.exists(internal_backup_path):
             try:
@@ -2627,26 +2668,26 @@ def perform_upgrade(version: str, auto: bool = False) -> None:
                 logger.info(f"✓ Removed backup dependencies: {internal_backup_path}")
             except OSError as e:
                 logger.warning(f"Could not remove backup dependencies: {e}")
-        
+
         # Keep cached tarball for future upgrades (persistent cache)
         logger.debug(f"Cached tarball preserved at {INSTALL_PATHS['cache_dir']} for future use")
-        
+
         # Upgrade complete
         logger.info("\n" + "="*60)
         logger.info(f"UPGRADE TO VERSION {version} COMPLETED SUCCESSFULLY!")
         logger.info("="*60)
         logger.info(f"\nBackup of previous version: {backup_path}")
         logger.info("(Backup will be overwritten on next upgrade)")
-        
+
         if service_was_running:
             logger.info("\nService status:")
             logger.info("  sudo systemctl status logstash-agent")
         else:
             logger.info("\nTo start the service:")
             logger.info("  sudo systemctl start logstash-agent")
-        
+
         logger.info("="*60)
-        
+
     except InstallError as e:
         logger.error(f"\nUpgrade failed: {e}")
         # Cleanup temp directory
@@ -2654,7 +2695,7 @@ def perform_upgrade(version: str, auto: bool = False) -> None:
             shutil.rmtree(temp_dir)
         raise
     except Exception as e:
-        logger.error(f"\nUnexpected error during upgrade: {e}", exc_info=True)
+        logger.exception("\nUnexpected error during upgrade")
         # Cleanup temp directory
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)

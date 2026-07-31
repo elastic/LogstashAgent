@@ -2,13 +2,14 @@
 #or more contributor license agreements. Licensed under the Elastic License;
 #you may not use this file except in compliance with the Elastic License.
 
-import os
-import requests
-import json
 import base64
+import hashlib
+import json
 import logging
 import socket
-import hashlib
+
+import requests
+
 from . import agent_state
 
 logger = logging.getLogger(__name__)
@@ -29,23 +30,23 @@ def decode_enrollment_token(encoded_token: str) -> dict:
 
     Payload (v2) may include optional ``fingerprint`` (SHA-256 of product CA DER,
     lowercase hex) and ``token_version``. Does not include ui_url (use CLI).
-    
+
     Args:
         encoded_token: Base64-encoded JSON token
-        
+
     Returns:
         dict: Decoded token payload containing enrollment_token
-        
+
     Raises:
         ValueError: If token is invalid or cannot be decoded
     """
     try:
         decoded_json = base64.b64decode(encoded_token.encode('utf-8')).decode('utf-8')
         token_payload = json.loads(decoded_json)
-        
+
         if 'enrollment_token' not in token_payload:
             raise ValueError("Invalid token payload: missing enrollment_token")
-            
+
         return token_payload
     except Exception as e:
         raise ValueError(f"Failed to decode enrollment token: {str(e)}")
@@ -54,24 +55,24 @@ def decode_enrollment_token(encoded_token: str) -> dict:
 def enroll_agent(encoded_token: str, logstash_ui_url: str, agent_id: str) -> dict:
     """
     Enroll the agent with logstashui
-    
+
     Args:
         encoded_token: Base64-encoded enrollment token
         logstash_ui_url: logstashui URL (from --logstash-ui-url)
         agent_id: Unique agent ID for this instance
-        
+
     Returns:
         dict: Enrollment response containing api_key, policy_id, connection_id
-        
+
     Raises:
         Exception: If enrollment fails
     """
     # Validate the enrollment token by decoding it
     token_payload = decode_enrollment_token(encoded_token)
-    
+
     # Use provided URL (not taken from token — CLI / generated command)
     ui_url = logstash_ui_url.rstrip('/')
-    
+
     # Pin product CA when token includes fingerprint (Approach A)
     try:
         from logstashagent.tls_trust import ensure_trust_from_token_payload, ssl_verify_argument
@@ -84,14 +85,14 @@ def enroll_agent(encoded_token: str, logstash_ui_url: str, agent_id: str) -> dic
             f"Failed to establish trust with LogstashUI CA: {e}. "
             f"Check fingerprint and that {ui_url}/.well-known/logstashui/ca.crt is reachable."
         ) from e
-    
+
     # Get hostname
     hostname = get_hostname()
-    
+
     logger.info(f"Enrolling agent with logstashui at {ui_url}")
     logger.info(f"Hostname: {hostname}")
     logger.info(f"Agent ID: {agent_id}")
-    
+
     # Prepare enrollment request - send the base64-encoded token, not the decoded one
     enrollment_url = f"{ui_url}/ConnectionManager/Enroll/"
     enrollment_data = {
@@ -106,7 +107,7 @@ def enroll_agent(encoded_token: str, logstash_ui_url: str, agent_id: str) -> dic
         enrollment_data["csr_pem"] = tls_server.build_csr_pem().decode("utf-8")
     except Exception as e:
         logger.warning("Could not build agent server CSR for enroll: %s", e)
-    
+
     try:
         # Send enrollment request (verify system CAs ± product CA)
         response = requests.post(
@@ -115,26 +116,26 @@ def enroll_agent(encoded_token: str, logstash_ui_url: str, agent_id: str) -> dic
             timeout=30,
             verify=verify,
         )
-        
+
         # Log response details for debugging
         logger.debug(f"Response status code: {response.status_code}")
         logger.debug(f"Response headers: {response.headers}")
-        
+
         # Check for error status codes before raising
         if response.status_code >= 400:
             logger.error(f"Server returned error status {response.status_code}")
             logger.error(f"Response body: {response.text}")
-        
+
         response.raise_for_status()
-        
+
         # Try to parse JSON response
         try:
             result = response.json()
-        except json.JSONDecodeError as e:
+        except json.JSONDecodeError:
             logger.error(f"Server returned non-JSON response. Status: {response.status_code}")
             logger.error(f"Response text: {response.text[:500]}")  # First 500 chars
             raise Exception(f"Server returned non-JSON response (status {response.status_code}). Check that the enrollment endpoint exists at {enrollment_url}")
-        
+
         if not result.get('success'):
             error_msg = result.get('error', 'Unknown error')
             raise Exception(f"Enrollment failed: {error_msg}")
@@ -146,13 +147,13 @@ def enroll_agent(encoded_token: str, logstash_ui_url: str, agent_id: str) -> dic
                 logger.info("Agent server certificate issued at enroll")
         except Exception as e:
             logger.warning("Could not persist server certificate from enroll: %s", e)
-        
+
         logger.info("Agent enrolled successfully!")
         logger.info(f"Connection ID: {result.get('connection_id')}")
         logger.info(f"Policy ID: {result.get('policy_id')}")
-        
+
         return result
-        
+
     except requests.exceptions.RequestException as e:
         logger.error(f"Failed to connect to logstashui: {e}")
         raise Exception(f"Failed to connect to logstashui at {ui_url}: {str(e)}")
@@ -161,10 +162,10 @@ def enroll_agent(encoded_token: str, logstash_ui_url: str, agent_id: str) -> dic
 def compute_hash(content: str) -> str:
     """
     Compute SHA256 hash of a string
-    
+
     Args:
         content: String content to hash
-        
+
     Returns:
         str: Hexadecimal hash string
     """
@@ -174,7 +175,7 @@ def compute_hash(content: str) -> str:
 def save_enrollment_config(api_key: str, logstash_ui_url: str, policy_id: int, connection_id: int, policy_config: dict):
     """
     Save enrollment configuration to state.json
-    
+
     Args:
         api_key: API key returned from enrollment
         logstash_ui_url: logstashui URL
@@ -189,7 +190,7 @@ def save_enrollment_config(api_key: str, logstash_ui_url: str, policy_id: int, c
         agent_state.update_state('api_key', api_key)
         agent_state.update_state('policy_id', policy_id)
         agent_state.update_state('connection_id', connection_id)
-        
+
         # Save paths
         agent_state.update_state('settings_path', policy_config.get('settings_path'))
         agent_state.update_state('logs_path', policy_config.get('logs_path'))
@@ -242,10 +243,10 @@ def save_enrollment_config(api_key: str, logstash_ui_url: str, policy_id: int, c
             # Multi-instance roles need host materialize (SIMULATE; MANAGED reuses setup for now)
             if policy_type in ('SIMULATE', 'MANAGED'):
                 agent_state.update_state('simulate_setup_pending', True)
-        
+
         # Set initial revision number to 0 (agent has no configuration yet)
         agent_state.update_state('revision_number', 0)
-        
+
         logger.info(f"Enrollment configuration saved to state.json")
         logger.info(f"Mode/policy_type: {agent_state.get_state().get('mode')}/{policy_type}")
         logger.info(f"Settings path: {policy_config.get('settings_path')}")
@@ -255,7 +256,7 @@ def save_enrollment_config(api_key: str, logstash_ui_url: str, policy_id: int, c
             logger.info(f"Simulate instance_id: {policy_config.get('instance_id')}")
         logger.info(f"Revision number set to 0 (no configuration deployed yet)")
         logger.info(f"Agent is now enrolled and managed by logstashui at {logstash_ui_url}")
-        
+
     except Exception as e:
         logger.error(f"Failed to save enrollment configuration: {e}")
         raise Exception(f"Failed to save enrollment configuration: {str(e)}")
@@ -264,7 +265,7 @@ def save_enrollment_config(api_key: str, logstash_ui_url: str, policy_id: int, c
 def perform_enrollment(encoded_token: str, logstash_ui_url: str, agent_id: str):
     """
     Perform the complete enrollment process
-    
+
     Args:
         encoded_token: Base64-encoded enrollment token
         logstash_ui_url: logstashui URL (required)
@@ -273,10 +274,10 @@ def perform_enrollment(encoded_token: str, logstash_ui_url: str, agent_id: str):
     try:
         # Use the provided UI URL
         ui_url = logstash_ui_url
-        
+
         # Enroll the agent
         result = enroll_agent(encoded_token, ui_url, agent_id)
-        
+
         # Save enrollment configuration
         policy_config = result.get('policy_config', {}) or {}
         save_enrollment_config(
@@ -302,7 +303,7 @@ def perform_enrollment(encoded_token: str, logstash_ui_url: str, agent_id: str):
                 agent_state.update_state('simulate_setup_pending', False)
             else:
                 agent_state.update_state('simulate_setup_pending', True)
-        
+
         logger.info("=" * 60)
         logger.info("ENROLLMENT SUCCESSFUL!")
         logger.info("=" * 60)
@@ -333,9 +334,9 @@ def perform_enrollment(encoded_token: str, logstash_ui_url: str, agent_id: str):
             logger.info("Configuration saved to state.json")
             logger.info("You can now start the agent using the --run flag")
         logger.info("=" * 60)
-        
+
         return result
-        
+
     except Exception as e:
         logger.error(f"Enrollment failed: {e}")
         raise

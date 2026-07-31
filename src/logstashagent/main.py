@@ -3,6 +3,7 @@
 #you may not use this file except in compliance with the Elastic License.
 
 import warnings
+
 # Suppress FastAPI deprecation warnings before importing FastAPI
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -21,32 +22,45 @@ _SKIP_SIMULATION_IMPORTS = (
     or 'recover-simulate' in sys.argv
 )
 
-from fastapi import FastAPI, HTTPException, Path as FastAPIPath, Query, Request
-from fastapi.responses import JSONResponse
-from typing import Optional, Dict, Any, List
-from datetime import datetime, timezone
-import os
-import yaml
-import json
 import glob
+import json
 import logging
+import os
 import re
-from logstashagent import agent_state, enrollment, log_analyzer, logstash_supervisor, controller, installer
+from datetime import UTC, datetime
+from typing import Any
+
+import yaml
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Path as FastAPIPath
+from fastapi.responses import JSONResponse
+
+from logstashagent import (
+    agent_state,
+    controller,
+    enrollment,
+    installer,
+    log_analyzer,
+    logstash_supervisor,
+)
+
 if not _SKIP_SIMULATION_IMPORTS:
     from logstashagent import slots
-from logstashagent.logstash_api import LogstashAPI
-import requests
-import time
-import base64
+import argparse
 import asyncio
 import atexit
-from collections import deque
+import base64
 import threading
-from pathlib import Path
+import time
+from collections import deque
+from importlib.metadata import PackageNotFoundError, version
 from logging.handlers import RotatingFileHandler
-import argparse
+from pathlib import Path
+
+import requests
 import uvicorn
-from importlib.metadata import version, PackageNotFoundError
+
+from logstashagent.logstash_api import LogstashAPI
 
 # Configure basic console logging first
 # File logging will be added later based on the command mode
@@ -75,7 +89,7 @@ def setup_file_logging():
     else:
         logs_dir = Path(__file__).parent / 'data' / 'logs'
         logs_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Add file handler to root logger
     file_handler = RotatingFileHandler(
         logs_dir / 'logstashagent.log',
@@ -87,7 +101,7 @@ def setup_file_logging():
         datefmt='%Y-%m-%d %H:%M:%S'
     ))
     logging.getLogger().addHandler(file_handler)
-    
+
     logger.info(f"File logging initialized - logs directory: {logs_dir}")
     return logs_dir
 
@@ -175,7 +189,7 @@ def load_agent_config() -> dict:
         "/etc/logstashui.yml",
         "/etc/logstashui.example.yml"
     ]
-    
+
     for logstashui_config_path in config_paths:
         if os.path.exists(logstashui_config_path):
             try:
@@ -191,13 +205,13 @@ def load_agent_config() -> dict:
                                 agent_config['simulation_mode'] = simulation_config['mode']
                             if 'mode' not in agent_config:
                                 agent_config['mode'] = 'simulation'
-                            
+
                             # FORCE embedded mode to use container paths (ignore config file paths)
                             if agent_config.get('simulation_mode') == 'embedded':
                                 agent_config['logstash_binary'] = '/usr/share/logstash/bin/logstash'
                                 agent_config['logstash_settings'] = '/etc/logstash'
                                 agent_config['logstash_log_path'] = '/var/log/logstash'
-                            
+
                             # Only log simulation_mode details when in simulation mode
                             mode = agent_config.get('mode', 'simulation')
                             if mode == 'simulation':
@@ -211,7 +225,7 @@ def load_agent_config() -> dict:
                             return agent_config
             except Exception as e:
                 logger.warning(f"Failed to load config from {logstashui_config_path}: {e}, trying next path")
-    
+
     # Fallback to logstashagent.yml
     try:
         with open(CONFIG_PATH, 'r') as f:
@@ -502,7 +516,7 @@ app = FastAPI(title="logstashagent API", version="0.0.1")
 # Request queue for simulation requests during Logstash restarts
 _simulation_queue: deque = deque(maxlen=100)  # Max 100 queued requests
 _queue_lock = threading.Lock()
-_queue_processor_task: Optional[asyncio.Task] = None
+_queue_processor_task: asyncio.Task | None = None
 
 @app.on_event("startup")
 async def startup_event():
@@ -585,14 +599,14 @@ atexit.register(_atexit_shutdown_supervisor)
 def get_logstash_paths():
     """Get Logstash paths based on configuration (Docker vs native)"""
     logstash_settings = AGENT_CONFIG.get('logstash_settings', '/etc/logstash/')
-    
+
     # Ensure settings path ends with /
     if not logstash_settings.endswith('/') and not logstash_settings.endswith('\\'):
         logstash_settings += '/'
-    
+
     # Normalize to forward slashes for consistency
     logstash_settings = logstash_settings.replace('\\', '/')
-    
+
     return {
         'pipelines_yml': f"{logstash_settings}pipelines.yml",
         'conf_d': f"{logstash_settings}conf.d",
@@ -624,7 +638,7 @@ def _validate_pipeline_id(pipeline_id: str) -> None:
     if not re.match(r'^[a-zA-Z0-9_\-\.]+$', pipeline_id):
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid pipeline_id: must contain only alphanumeric characters, hyphens, underscores, and dots"
+            detail="Invalid pipeline_id: must contain only alphanumeric characters, hyphens, underscores, and dots"
         )
 
     # Additional check: prevent .. sequences even if they pass regex
@@ -664,10 +678,10 @@ def _save_pipelines_yml(pipelines: list):
     """Save the pipelines.yml file atomically, ensuring static pipelines are preserved"""
     # Get logstash settings path from config
     logstash_settings = AGENT_CONFIG.get('logstash_settings', '/etc/logstash/')
-    
+
     # Detect OS and handle path separators appropriately
     is_windows = os.name == 'nt'
-    
+
     if is_windows:
         # Windows: Ensure path ends with backslash, then escape for YAML
         if not logstash_settings.endswith('/') and not logstash_settings.endswith('\\'):
@@ -681,7 +695,7 @@ def _save_pipelines_yml(pipelines: list):
             logstash_settings += '/'
         yaml_path = logstash_settings
         path_sep = '/'
-    
+
     # Define static pipelines that must always be present
     # Static pipeline .conf files are in config/config/ subdirectory
     static_pipelines = [
@@ -696,14 +710,14 @@ def _save_pipelines_yml(pipelines: list):
             'path.config': f'{yaml_path}config{path_sep}simulate_end.conf'
         }
     ]
-    
+
     # Remove any existing static pipeline entries from the input list
     static_ids = {'simulate-start', 'simulate-end'}
     dynamic_pipelines = [p for p in pipelines if p.get('pipeline.id') not in static_ids]
-    
+
     # Combine static pipelines (first) with dynamic pipelines
     final_pipelines = static_pipelines + dynamic_pipelines
-    
+
     temp_path = f"{PIPELINES_YML_PATH}.tmp"
     try:
         with open(temp_path, 'w') as f:
@@ -777,7 +791,7 @@ def delete_pipeline_internal(pipeline_id: str) -> bool:
         return False
 
 
-def _load_pipeline_config(pipeline_id: str) -> Optional[str]:
+def _load_pipeline_config(pipeline_id: str) -> str | None:
     """Load the pipeline configuration file(s) - supports wildcards"""
     pipelines = _load_pipelines_yml()
 
@@ -813,7 +827,7 @@ def _load_pipeline_config(pipeline_id: str) -> Optional[str]:
     return None
 
 
-def _load_pipeline_metadata(pipeline_id: str) -> Dict[str, Any]:
+def _load_pipeline_metadata(pipeline_id: str) -> dict[str, Any]:
     """Load pipeline metadata (description, settings, etc.)"""
     _validate_pipeline_id(pipeline_id)
     metadata_path = os.path.join(METADATA_DIR, f"{pipeline_id}.json")
@@ -828,7 +842,7 @@ def _load_pipeline_metadata(pipeline_id: str) -> Dict[str, Any]:
     # Return default metadata if file doesn't exist or failed to load
     return {
         "description": "",
-        "last_modified": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z',
+        "last_modified": datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z',
         "pipeline_metadata": {
             "type": "logstash_pipeline",
             "version": 1
@@ -845,7 +859,7 @@ def _load_pipeline_metadata(pipeline_id: str) -> Dict[str, Any]:
     }
 
 
-def _save_pipeline_metadata(pipeline_id: str, metadata: Dict[str, Any]):
+def _save_pipeline_metadata(pipeline_id: str, metadata: dict[str, Any]):
     """Save pipeline metadata"""
     _validate_pipeline_id(pipeline_id)
     metadata_path = os.path.join(METADATA_DIR, f"{pipeline_id}.json")
@@ -861,7 +875,7 @@ def _save_pipeline_metadata(pipeline_id: str, metadata: Dict[str, Any]):
         raise e
 
 
-def _get_pipeline_settings_from_yml(pipeline_id: str) -> Dict[str, Any]:
+def _get_pipeline_settings_from_yml(pipeline_id: str) -> dict[str, Any]:
     """Extract pipeline settings from pipelines.yml"""
     _validate_pipeline_id(pipeline_id)
     pipelines = _load_pipelines_yml()
@@ -894,7 +908,7 @@ async def _process_simulation_queue():
     """
     logger.info("Queue processor started")
     last_healthy_time = None
-    
+
     while True:
         try:
             await asyncio.sleep(2)  # Check every 2 seconds
@@ -913,19 +927,19 @@ async def _process_simulation_queue():
                     health.get('via'),
                 )
                 continue
-            
+
             # Wait at least 10 seconds after Logstash becomes healthy before processing
             time_since_healthy = time.time() - last_healthy_time
             if time_since_healthy < 10:
                 continue
-            
+
             # Verify Logstash port 9449 is actually ready before processing queue
             try:
                 test_response = requests.get("http://127.0.0.1:9449", timeout=2)
             except Exception:
                 logger.debug("Logstash port 9449 not ready yet, waiting...")
                 continue
-            
+
             # Process all queued requests
             while True:
                 queued_item = None
@@ -934,25 +948,25 @@ async def _process_simulation_queue():
                         queued_item = _simulation_queue.popleft()
                     else:
                         break
-                
+
                 if queued_item:
                     log_data = queued_item['log_data']
                     slot_config = queued_item.get('slot_config')
-                    
+
                     logger.info(f"Processing queued simulation: slot={log_data.get('slot')}, run_id={log_data.get('run_id')}")
-                    
+
                     # Restore slot configuration if needed
                     if slot_config:
                         slot_id = slot_config['slot_id']
                         pipeline_name = slot_config['pipeline_name']
                         pipelines = slot_config['pipelines']
-                        
+
                         # Re-allocate slot (will reuse if hash matches)
                         try:
                             # Check if slot already exists
                             existing_slots = slots.get_slot_state()
                             slot_exists = slot_id in existing_slots
-                            
+
                             if not slot_exists:
                                 # Allocate slot and create pipelines
                                 slots.allocate_slot(pipeline_name, pipelines)
@@ -963,7 +977,7 @@ async def _process_simulation_queue():
                         except Exception as e:
                             logger.error(f"Failed to restore slot {slot_id}: {e}")
                             continue
-                    
+
                     # Forward the simulation request with retries
                     max_retries = 3
                     success = False
@@ -985,14 +999,14 @@ async def _process_simulation_queue():
                                 await asyncio.sleep(1)
                             else:
                                 logger.error(f"Failed to process queued simulation after {max_retries} attempts: {e}")
-                    
+
                     if not success:
                         # Re-queue the failed item at the front for retry later
                         with _queue_lock:
                             _simulation_queue.appendleft(queued_item)
                         logger.warning("Re-queued failed simulation for retry later")
                         break  # Stop processing queue, will retry on next iteration
-                        
+
         except asyncio.CancelledError:
             logger.info("Queue processor cancelled")
             break
@@ -1061,7 +1075,7 @@ async def simulate_log(request: Request):
     """
     Proxy endpoint for simulation log input.
     Accepts HTTPS requests from logstashui and forwards them to the local HTTP port 9449.
-    
+
     Queues requests when Logstash is unhealthy and processes them when it recovers.
     """
     try:
@@ -1085,7 +1099,7 @@ async def simulate_log(request: Request):
                         'pipeline_name': slot_data.get('pipeline_name'),
                         'pipelines': slot_data.get('pipelines')
                     }
-            
+
             with _queue_lock:
                 _simulation_queue.append({
                     'log_data': log_data,
@@ -1093,7 +1107,7 @@ async def simulate_log(request: Request):
                     'queued_at': time.time()
                 })
                 queue_size = len(_simulation_queue)
-            
+
             logger.warning(f"Logstash unhealthy - queued simulation request (queue size: {queue_size})")
             return JSONResponse(
                 status_code=202,
@@ -1103,14 +1117,14 @@ async def simulate_log(request: Request):
                     "queue_position": queue_size
                 }
             )
-        
+
         # Logstash is healthy - forward immediately with retry logic
         max_retries = 3
         for attempt in range(max_retries):
             try:
                 timeout = 1 + attempt  # 1s, 2s, 3s - aggressive timeouts to detect hung Logstash
                 logger.debug(f"Simulation attempt {attempt + 1}/{max_retries}, timeout={timeout}s")
-                
+
                 # Forward to local Logstash HTTP input on port 9449
                 response = requests.post(
                     "http://127.0.0.1:9449",
@@ -1118,16 +1132,16 @@ async def simulate_log(request: Request):
                     timeout=timeout
                 )
                 response.raise_for_status()
-                
+
                 logger.info(
                     f"Forwarded simulation log to Logstash: slot={slot_id}, run_id={log_data.get('run_id')}")
-                
+
                 return JSONResponse(
                     status_code=200,
                     content={"status": "success", "message": "Log forwarded to Logstash"}
                 )
-                
-            except requests.exceptions.Timeout as e:
+
+            except requests.exceptions.Timeout:
                 if attempt < max_retries - 1:
                     logger.warning(f"Simulation timeout on attempt {attempt + 1}, retrying...")
                     await asyncio.sleep(1)
@@ -1135,7 +1149,7 @@ async def simulate_log(request: Request):
                 else:
                     # All retries failed - Logstash is likely stunned/OOM
                     logger.error(f"Simulation failed after {max_retries} attempts due to timeout - triggering restart")
-                    
+
                     # Queue the request for retry after restart
                     slot_config = None
                     if slot_id:
@@ -1147,7 +1161,7 @@ async def simulate_log(request: Request):
                                 'pipeline_name': slot_data.get('pipeline_name'),
                                 'pipelines': slot_data.get('pipelines')
                             }
-                    
+
                     with _queue_lock:
                         _simulation_queue.append({
                             'log_data': log_data,
@@ -1155,7 +1169,7 @@ async def simulate_log(request: Request):
                             'queued_at': time.time()
                         })
                         queue_size = len(_simulation_queue)
-                    
+
                     # Trigger restart (systemctl for enrolled simulate, else supervisor)
                     trigger_sim_logstash_restart(
                         "Simulation POST failed - Logstash stunned/OOM"
@@ -1201,7 +1215,7 @@ async def simulate_log(request: Request):
                         queue_size = len(_simulation_queue)
 
                     trigger_sim_logstash_restart(
-                        f"Simulation POST failed: {str(e)}"
+                        f"Simulation POST failed: {e!s}"
                     )
 
                     logger.warning(f"Queued failed simulation for retry after restart (queue size: {queue_size})")
@@ -1213,18 +1227,18 @@ async def simulate_log(request: Request):
                             "queue_position": queue_size
                         }
                     )
-                    
+
     except requests.exceptions.RequestException as e:
         logger.error(f"Failed to forward log to Logstash: {e}")
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to forward log to Logstash: {str(e)}"
+            detail=f"Failed to forward log to Logstash: {e!s}"
         )
     except Exception as e:
         logger.error(f"Error in simulate_log endpoint: {e}")
         raise HTTPException(
             status_code=500,
-            detail=f"Error processing simulation log: {str(e)}"
+            detail=f"Error processing simulation log: {e!s}"
         )
 
 
@@ -1305,7 +1319,7 @@ async def get_pipeline(pipeline_id: str = FastAPIPath(..., description="Pipeline
 
 
 @app.put("/_logstash/pipeline/{pipeline_id}")
-async def put_pipeline(pipeline_id: str, body: Dict[str, Any]):
+async def put_pipeline(pipeline_id: str, body: dict[str, Any]):
     """Create or update a pipeline (mimics Elasticsearch API)"""
     _validate_pipeline_id(pipeline_id)
 
@@ -1329,7 +1343,7 @@ async def put_pipeline(pipeline_id: str, body: Dict[str, Any]):
             pipelines[i] = {
                 'pipeline.id': pipeline_id,
                 'path.config': config_path,
-                **{k: v for k, v in pipeline_settings.items() if k.startswith('pipeline.') or k.startswith('queue.')}
+                **{k: v for k, v in pipeline_settings.items() if k.startswith(('pipeline.', 'queue.'))}
             }
             break
 
@@ -1345,7 +1359,7 @@ async def put_pipeline(pipeline_id: str, body: Dict[str, Any]):
         new_pipeline = {
             'pipeline.id': pipeline_id,
             'path.config': config_path,
-            **{k: v for k, v in pipeline_settings.items() if k.startswith('pipeline.') or k.startswith('queue.')}
+            **{k: v for k, v in pipeline_settings.items() if k.startswith(('pipeline.', 'queue.'))}
         }
         pipelines.append(new_pipeline)
 
@@ -1359,18 +1373,18 @@ async def put_pipeline(pipeline_id: str, body: Dict[str, Any]):
     except Exception as e:
         if os.path.exists(temp_config_path):
             os.remove(temp_config_path)
-        raise HTTPException(status_code=500, detail=f"Failed to write pipeline config: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to write pipeline config: {e!s}")
 
     # Save pipelines.yml
     try:
         _save_pipelines_yml(pipelines)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to update pipelines.yml: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to update pipelines.yml: {e!s}")
 
     # Save metadata
     metadata = {
         "description": body.get('description', ''),
-        "last_modified": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z',
+        "last_modified": datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z',
         "pipeline_metadata": body.get('pipeline_metadata', {
             "type": "logstash_pipeline",
             "version": 1
@@ -1382,7 +1396,7 @@ async def put_pipeline(pipeline_id: str, body: Dict[str, Any]):
     try:
         _save_pipeline_metadata(pipeline_id, metadata)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save metadata: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to save metadata: {e!s}")
 
     return {"acknowledged": True}
 
@@ -1415,27 +1429,27 @@ async def delete_pipeline(pipeline_id: str = FastAPIPath(..., description="Pipel
         try:
             os.remove(config_path)
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to delete pipeline config: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Failed to delete pipeline config: {e!s}")
 
     # Delete metadata file
     metadata_path = os.path.join(METADATA_DIR, f"{pipeline_id}.json")
     if os.path.exists(metadata_path):
         try:
             os.remove(metadata_path)
-        except Exception:
-            pass  # Non-critical if metadata deletion fails
+        except Exception as e:
+            logger.warning(f"Failed to delete metadata: {e!s}")  # Non-critical if metadata deletion fails
 
     # Save updated pipelines.yml
     try:
         _save_pipelines_yml(new_pipelines)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to update pipelines.yml: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to update pipelines.yml: {e!s}")
 
     return {"acknowledged": True}
 
 
 @app.post("/_logstash/slots/allocate")
-async def allocate_simulation_slot(body: Dict[str, Any]):
+async def allocate_simulation_slot(body: dict[str, Any]):
     """
     Allocate a slot for simulation pipelines.
 
@@ -1524,7 +1538,7 @@ async def allocate_simulation_slot(body: Dict[str, Any]):
     if not reused or not pipelines_exist:
         try:
             await _create_slot_pipelines(slot_id, pipelines)
-        except HTTPException as e:
+        except HTTPException:
             # Release the slot if pipeline creation fails
             slots.release_slot(slot_id)
             # Re-raise HTTPException as-is to preserve detail structure (may contain slot_id dict)
@@ -1536,7 +1550,7 @@ async def allocate_simulation_slot(body: Dict[str, Any]):
             raise HTTPException(
                 status_code=500,
                 detail={
-                    "message": f"Failed to create slot pipelines: {str(e)}",
+                    "message": f"Failed to create slot pipelines: {e!s}",
                     "slot_id": slot_id
                 }
             )
@@ -1549,7 +1563,7 @@ async def allocate_simulation_slot(body: Dict[str, Any]):
     }
 
 
-async def _create_slot_pipelines(slot_id: int, pipelines: List[Dict[str, Any]]):
+async def _create_slot_pipelines(slot_id: int, pipelines: list[dict[str, Any]]):
     """
     Create the filter pipelines for a specific slot.
 
@@ -1566,9 +1580,9 @@ async def _create_slot_pipelines(slot_id: int, pipelines: List[Dict[str, Any]]):
 
         # Determine next filter address
         if idx < len(pipelines):
-            next_filter_id = f"slot{slot_id}-filter{idx + 1}"
+            _ = f"slot{slot_id}-filter{idx + 1}"
         else:
-            next_filter_id = "filter-final"
+            _ = "filter-final"
 
         # Generate pipeline config with both pipeline and HTTP outputs
         pipeline_config = f"""input {{
@@ -1588,7 +1602,7 @@ output {{
         pipeline_name = f"slot{slot_id}-filter{idx}"
         pipeline_body = {
             "pipeline": pipeline_config,
-            "last_modified": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z',
+            "last_modified": datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z',
             "pipeline_metadata": {
                 "version": 1,
                 "type": "logstash_pipeline"
@@ -1715,7 +1729,7 @@ async def get_pipeline_logs(
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Error fetching logs for pipeline {pipeline_id}: {str(e)}"
+            detail=f"Error fetching logs for pipeline {pipeline_id}: {e!s}"
         )
 
 
@@ -1749,14 +1763,14 @@ async def get_pipelines_status():
             return {
                 "running_pipelines": all_pipelines,
                 "count": len(all_pipelines),
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": datetime.now(UTC).isoformat(),
                 "states": pipeline_states
             }
     except Exception as e:
         logger.error(f"Error in get_pipelines_status: {e}")
         raise HTTPException(
             status_code=500,
-            detail=f"Error fetching pipeline status from Logstash API: {str(e)}"
+            detail=f"Error fetching pipeline status from Logstash API: {e!s}"
         )
 
 
@@ -1810,8 +1824,8 @@ def _read_instance_keystore_secrets(password: str | None = None) -> tuple[dict, 
         emb = extract_embedded_password(keystore_path)
         if emb:
             try_passwords.append(emb)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Failed to extract embedded password: {e!s}")
 
     last_err = None
     for pwd in try_passwords:
@@ -1909,12 +1923,12 @@ async def keystore_sync(request: Request):
     keystore_path = Path(settings_path) / "logstash.keystore"
 
     try:
+        from logstashagent import controller as _controller
         from logstashagent.ls_keystore_utils.keystore_write import (
             create_keystore_file,
             generate_default_keystore_password,
             write_keystore_secrets,
         )
-        from logstashagent import controller as _controller
 
         secrets_map = _normalize_secrets_map(secrets)
 
@@ -1990,7 +2004,7 @@ async def keystore_sync(request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("Keystore sync failed: %s", e, exc_info=True)
+        logger.exception("Keystore sync failed")
         raise HTTPException(status_code=500, detail=f"Keystore sync failed: {e}")
 
 
@@ -2060,7 +2074,7 @@ async def write_file(request: Request):
         logger.error(f"Error writing file: {e}")
         raise HTTPException(
             status_code=500,
-            detail=f"Error writing file: {str(e)}"
+            detail=f"Error writing file: {e!s}"
         )
 
 
@@ -2068,11 +2082,11 @@ async def write_file(request: Request):
 async def validate_logstash_config(request: Request):
     """
     Validate a Logstash pipeline configuration using logstash --config.test_and_exit.
-    
+
     Request body:
         - pipeline_name: Name of the pipeline (used for temp file naming)
         - config: The Logstash configuration to validate
-    
+
     Returns:
         - status: "OK" or "ERROR"
         - notifications: List of warning/deprecation messages
@@ -2084,16 +2098,16 @@ async def validate_logstash_config(request: Request):
         body = await request.json()
         pipeline_name = body.get("pipeline_name", "pipeline")
         config = body.get("config")
-        
+
         if not config:
             raise HTTPException(
                 status_code=400,
                 detail="No configuration provided"
             )
-        
+
         # Create temporary config file
         temp_file_path = f"/tmp/{pipeline_name}.conf"
-        
+
         try:
             # Replace keystore variables without defaults to avoid validation failures
             # Pattern: ${variable_name} -> ${variable_name:test}
@@ -2104,29 +2118,30 @@ async def validate_logstash_config(request: Request):
                 r'${\1:test}',       # Replace with ${variable_name:test}
                 config
             )
-            
+
             # Write config to temp file
             with open(temp_file_path, 'w') as f:
                 f.write(config_with_defaults)
-            
+
             logger.info(f"Validating config for pipeline '{pipeline_name}' at {temp_file_path}")
-            
+
             # Get logstash binary path from config
             logstash_binary = AGENT_CONFIG.get('logstash_binary', '/usr/share/logstash/bin/logstash')
             logger.info(f"Using Logstash binary: {logstash_binary}")
-            
+
             # Run logstash validation
             result = subprocess.run(
                 [logstash_binary, "--config.test_and_exit", "-f", temp_file_path, "--log.format", "json"],
                 capture_output=True,
                 text=True,
-                timeout=30
+                timeout=30,
+                check=False,
             )
-            
+
             # Parse output to extract notifications by log level
             notifications_by_level = {}
             output_lines = result.stdout.strip().split('\n')
-            
+
             for line in output_lines:
                 try:
                     log_entry = json.loads(line)
@@ -2135,11 +2150,11 @@ async def validate_logstash_config(request: Request):
                         message = log_entry["logEvent"].get("message", "")
                         logger_name = log_entry.get("loggerName", "")
                         level = log_entry.get("level", "INFO")
-                        
+
                         # Filter out noise
                         if "Reflections took" in message or "pipelines.yml" in message:
                             continue
-                        
+
                         # Only include relevant log levels
                         if level in ["FATAL", "ERROR", "WARN", "INFO"]:
                             # Skip generic INFO messages unless they're important
@@ -2150,17 +2165,17 @@ async def validate_logstash_config(request: Request):
                                 # Only include specific INFO messages
                                 if not any(keyword in message.lower() for keyword in ["deprecated", "warning", "error"]):
                                     continue
-                            
+
                             # Initialize level list if not exists
                             if level not in notifications_by_level:
                                 notifications_by_level[level] = []
-                            
+
                             # Remove discussion forum text if present
                             cleaned_message = message.replace(
                                 "If you have any questions about this, please ask it on the https://discuss.elastic.co/c/logstash discussion forum",
                                 ""
                             ).strip()
-                            
+
                             # Add entry with plugin and message
                             notifications_by_level[level].append({
                                 "plugin": logger_name,
@@ -2171,7 +2186,7 @@ async def validate_logstash_config(request: Request):
                     if "Configuration OK" in line:
                         logger.info("Configuration validation passed")
                     continue
-            
+
             # Determine overall status based on log levels present
             if "FATAL" in notifications_by_level or "ERROR" in notifications_by_level:
                 status = "ERROR"
@@ -2181,9 +2196,9 @@ async def validate_logstash_config(request: Request):
                 status = "OK"
             else:
                 status = "ERROR"
-            
+
             logger.info(f"Validation result for pipeline '{pipeline_name}': {status}, levels: {list(notifications_by_level.keys())}")
-            
+
             return JSONResponse(
                 status_code=200,
                 content={
@@ -2191,13 +2206,13 @@ async def validate_logstash_config(request: Request):
                     "notifications": notifications_by_level
                 }
             )
-        
+
         finally:
             # Clean up temp file
             if os.path.exists(temp_file_path):
                 os.remove(temp_file_path)
                 logger.debug(f"Removed temp file: {temp_file_path}")
-    
+
     except subprocess.TimeoutExpired:
         logger.error(f"Validation timeout for pipeline '{pipeline_name}'")
         raise HTTPException(
@@ -2210,7 +2225,7 @@ async def validate_logstash_config(request: Request):
         logger.error(f"Error validating config: {e}")
         raise HTTPException(
             status_code=500,
-            detail=f"Error validating configuration: {str(e)}"
+            detail=f"Error validating configuration: {e!s}"
         )
 
 
@@ -2245,10 +2260,10 @@ Examples:
   logstash-agent uninstall --purge
         """
     )
-    
+
     # Create subparsers for commands
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
-    
+
     # Install command
     install_parser = subparsers.add_parser(
         'install',
@@ -2273,7 +2288,7 @@ Examples:
         action='store_true',
         help='Skip the enrollment confirmation prompt'
     )
-    
+
     # Uninstall command
     uninstall_parser = subparsers.add_parser(
         'uninstall',
@@ -2368,7 +2383,7 @@ Examples:
         action='store_true',
         help='Skip confirmation prompt'
     )
-    
+
     # Configure command
     configure_parser = subparsers.add_parser(
         'configure',
@@ -2429,7 +2444,7 @@ Examples:
         action='store_true',
         help='Skip the upgrade confirmation prompt'
     )
-    
+
     # Legacy arguments for backward compatibility
     parser.add_argument(
         '--enroll',
@@ -2437,14 +2452,14 @@ Examples:
         metavar='TOKEN',
         help='Enroll this agent with logstashui using the provided base64-encoded enrollment token'
     )
-    
+
     parser.add_argument(
         '--logstash-ui-url',
         type=str,
         metavar='URL',
         help='logstashui URL for enrollment (required with --enroll, e.g., http://localhost:8080 or https://logstashui.example.com)'
     )
-    
+
     parser.add_argument(
         '--run',
         action='store_true',
@@ -2479,7 +2494,7 @@ Examples:
 if __name__ == "__main__":
     """
     Main entry point for logstashagent
-    
+
     Supports multiple modes:
     - Install mode: install command to perform enrollment and setup
     - Enrollment mode: --enroll flag to register with logstashui
@@ -2488,7 +2503,7 @@ if __name__ == "__main__":
     - Host mode: mode=host in config, manages local Logstash instance
     """
     args = parse_arguments()
-    
+
     # Check if we're in install mode
     if args.command == 'install':
         if not args.yes:
@@ -2505,7 +2520,7 @@ if __name__ == "__main__":
             if answer != 'y':
                 print("Installation cancelled.")
                 sys.exit(0)
-        
+
         try:
             installer.perform_installation(
                 enroll_token=args.enroll,
@@ -2520,7 +2535,7 @@ if __name__ == "__main__":
         except Exception as e:
             logger.error(f"Unexpected installation error: {e}", exc_info=True)
             sys.exit(1)
-    
+
     # Check if we're in configure mode
     if args.command == 'configure':
         if not args.yes:
@@ -2650,8 +2665,8 @@ if __name__ == "__main__":
 
     if args.command == 'ensure-version':
         try:
-            from logstashagent import logstash_download as _ld
             from logstashagent import install_registry as _reg
+            from logstashagent import logstash_download as _ld
 
             root = args.download_dir or _ld.DEFAULT_DOWNLOAD_ROOT
             binary = _ld.ensure_logstash_version(
@@ -2736,8 +2751,8 @@ if __name__ == "__main__":
                         print("\nRegistered / discovered instances:")
                         for i in multi:
                             print(f"  - {i.get('id')}: {i.get('agent_unit')}  {i.get('path_root') or ''}")
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"Failed to list instances: {e!s}")
 
                 if args.purge:
                     print("\n--purge flag detected. Also removing:")
@@ -2751,13 +2766,13 @@ if __name__ == "__main__":
                     print("  - Logs: /var/log/logstash-agent")
                     print("  - multi-instance path trees (use --purge to remove)")
                     print("  (Use --purge to remove these)")
-            
+
             print()
             answer = input("Continue? [y/N]: ").strip().lower()
             if answer != 'y':
                 print("Uninstallation cancelled.")
                 sys.exit(0)
-        
+
         try:
             installer.perform_uninstallation(purge=args.purge, instance=instance)
             sys.exit(0)
@@ -2767,7 +2782,7 @@ if __name__ == "__main__":
         except Exception as e:
             logger.error(f"Unexpected uninstallation error: {e}", exc_info=True)
             sys.exit(1)
-    
+
     # Check if we're in upgrade mode
     if args.command == 'upgrade':
         if not args.yes:
@@ -2785,7 +2800,7 @@ if __name__ == "__main__":
             if answer != 'y':
                 print("Upgrade cancelled.")
                 sys.exit(0)
-        
+
         try:
             installer.perform_upgrade(version=args.version, auto=False)
             sys.exit(0)
@@ -2795,13 +2810,13 @@ if __name__ == "__main__":
         except Exception as e:
             logger.error(f"Unexpected upgrade error: {e}", exc_info=True)
             sys.exit(1)
-    
+
     # Check if we're in enrollment mode
     if args.enroll:
         logger.info("=" * 60)
         logger.info("LOGSTASH AGENT ENROLLMENT")
         logger.info("=" * 60)
-        
+
         # Validate that logstash-ui-url is provided
         if not args.logstash_ui_url:
             logger.error("--logstash-ui-url is required when using --enroll")
@@ -2832,11 +2847,11 @@ if __name__ == "__main__":
         except Exception as e:
             logger.error(f"Enrollment failed: {e}")
             sys.exit(1)
-    
+
     # Setup file logging for normal operation (not install/uninstall/upgrade)
     # This creates the log file with the correct user permissions
     setup_file_logging()
-    
+
     # CLI overrides for mode / instance
     if getattr(args, 'mode', None):
         AGENT_CONFIG['mode'] = args.mode
@@ -2936,7 +2951,7 @@ if __name__ == "__main__":
 
         controller.run_controller()
         sys.exit(0)
-    
+
     # Non-run entry: FastAPI for embedded (and legacy simulation) only
     if agent_mode in ('default', 'packaged'):
         logger.info("mode=%s requires --run after enrollment (controller only)", agent_mode)
@@ -2944,17 +2959,17 @@ if __name__ == "__main__":
     if agent_mode not in ('embedded', 'simulate', 'managed', 'simulation'):
         logger.info(f"Unrecognized mode {agent_mode}; starting embedded-style FastAPI")
         # fall through to FastAPI
-    
+
     # Start FastAPI server (simulation or host mode)
 
-    
+
     # Get host and port from config or use defaults
     host = AGENT_CONFIG.get('host', '0.0.0.0')
     port = AGENT_CONFIG.get('port', 9500)
     env_port = (os.environ.get('LOGSTASH_AGENT_PORT') or '').strip()
     if env_port.isdigit():
         port = int(env_port)
-    
+
     logger.info(f"Starting logstashagent in {agent_mode} mode on {host}:{port}")
 
     try:

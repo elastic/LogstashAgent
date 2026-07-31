@@ -1,4 +1,5 @@
 {
-  "agent_id": "ec1724f4-11b2-4a15-b55a-cb5dfbd00f35",
-  "agent_version": "0.5.1"
+  "pipelines": {},
+  "simulate_last_recovery_at": "2026-07-31T18:47:13.930308+00:00",
+  "simulate_pipelines_quarantined": true
 }
