@@ -1,3 +1,30 @@
+## [0.5.2] - Packaged / Managed modes, install registry, host coexistence - 07/30/2026
+
+### Added
+
+- First-class **`packaged`** and **`managed`** modes (alongside `simulate` / `embedded`). Legacy `default` remains accepted; `agent`/`host` map to **packaged**.
+- Systemd templates **`logstash-agent@.service`** and **`logstash-managed@.service`** for Managed instance **N** (paths under `/opt/logstash-agent/managed-N/`; ports **9600+N** / **9700+N**).
+- **Install registry** at `/var/lib/logstash-agent/install-registry.json` — package + instance inventory (units, path_root, ports).
+- CLI: `list-instances`, `list-versions`, `ensure-version <ver>`, `prune-versions` (VERSION cache; keeps pins in use).
+- Uninstall uses the registry: stop multi-instance units, optional `--instance ID`, `--purge` removes trees + state.
+- **Host coexistence**: per-instance `LOGSTASH_AGENT_STATE_DIR` / `LOGSTASH_AGENT_CONFIG` in `agent.env`; multi-instance config under the instance tree (does not clobber packaged `/etc` or `/var/lib` state). Packaged install still ships multi-instance unit templates for later enrolls.
+- VERSION apply updates **managed** as well as simulate instance `env` (`LOGSTASH_BINARY`); check-in `status_blob` reports resolved version/binary.
+- `logstash-agent-ctl` allowlist includes `logstash-agent@N` and `logstash-managed@N` (numeric ids; sudo-rs safe).
+- Offline E2E smoke suite (`tests/test_e2e_agent_modes_smoke.py`) for isolation, registry, materialize, VERSION prune.
+
+### Changed
+
+- Install config writes `mode: packaged` (or `managed` / `simulate`) instead of only `default` / `simulate`.
+- Multi-instance materialize writes isolation env vars and relocates enrollment state into the instance tree when coexisting with Packaged.
+- PyInstaller ships all four multi-instance unit templates (simulate + managed).
+
+### Upgrade notes
+
+- Pair with **LogstashUI 0.5.2** (Packaged/Managed policies, migration 0025).
+- **Existing production agents:** upgrade package and restart `logstash-agent` — **no re-enroll** required. Look for `mode=packaged` or `mode=default` in logs.
+- Adding Managed/Simulate on a host that already has Packaged: enroll the new policy token with `install --enroll` (or non-root enroll + `setup-simulate`); packaged service and state are left in place.
+- Day-2: `logstash-agent list-instances` for a host map; `sudo logstash-agent uninstall --instance managed-N` to drop one multi-instance role only.
+
 ## [0.5.1] - Agent roles (default / simulate / embedded) and pure-Python keystores
 
 ### Added

@@ -3,6 +3,8 @@
 > A control-plane agent for LogstashUI that fully manages the Logstash instance it runs alongside.
 >
 > Warning: **Beta Release** - This project is under active development. Features may change.
+>
+> **Current package version: 0.5.2** — see [CHANGELOG.md](CHANGELOG.md).
 
 ## Overview
 
