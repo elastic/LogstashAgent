@@ -382,6 +382,51 @@ class TestMainEdgeCases:
         assert response.status_code == 200
         assert response.json() == {}
 
+class TestNormalizeAgentMode:
+    def test_legacy_agent_maps_to_packaged(self):
+        from logstashagent.main import normalize_agent_mode
+
+        n = normalize_agent_mode({"mode": "agent"})
+        assert n["mode"] == "packaged"
+        assert n["_mode_legacy"] == "agent"
+
+    def test_legacy_host_maps_to_packaged(self):
+        from logstashagent.main import normalize_agent_mode
+
+        n = normalize_agent_mode({"mode": "host"})
+        assert n["mode"] == "packaged"
+        assert n["_mode_legacy"] == "host"
+
+    def test_modern_default_no_legacy(self):
+        from logstashagent.main import normalize_agent_mode
+
+        n = normalize_agent_mode({"mode": "default"})
+        assert n["mode"] == "default"
+        assert "_mode_legacy" not in n or n.get("_mode_legacy") is None
+
+    def test_packaged_and_managed_first_class(self):
+        from logstashagent.main import normalize_agent_mode
+
+        assert normalize_agent_mode({"mode": "packaged"})["mode"] == "packaged"
+        assert normalize_agent_mode({"mode": "managed"})["mode"] == "managed"
+
+    def test_simulation_host_maps_to_simulate(self):
+        from logstashagent.main import normalize_agent_mode
+
+        n = normalize_agent_mode({"mode": "simulation", "simulation_mode": "host"})
+        assert n["mode"] == "simulate"
+        assert "host" in n["_mode_legacy"]
+
+    def test_log_resolved_includes_legacy_phrase(self, caplog):
+        import logging
+        from logstashagent.main import log_resolved_agent_mode
+
+        with caplog.at_level(logging.INFO):
+            log_resolved_agent_mode("packaged", legacy="agent", source="config")
+        assert any(
+            "mode=packaged (legacy 'agent' mapped)" in r.message for r in caplog.records
+        )
+
     def test_list_pipelines_with_data(self, client, mock_dirs):
         """Test listing multiple pipelines (includes system pipelines)"""
         for i in range(2):

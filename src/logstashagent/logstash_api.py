@@ -12,6 +12,7 @@ API Documentation: https://www.elastic.co/docs/api/doc/logstash/operation/operat
 """
 
 import logging
+import os
 from typing import Dict, Any, Optional, List
 import httpx
 import time
@@ -21,8 +22,46 @@ logger = logging.getLogger(__name__)
 
 # Logstash API configuration
 LOGSTASH_API_HOST = "localhost"
-LOGSTASH_API_PORT = 9650
+# Default for embedded / simulate-style agents (package Logstash often uses 9600;
+# agent state / config / LOGSTASH_API_PORT env override per instance: 9560+N).
+LOGSTASH_API_PORT = 9560
 LOGSTASH_API_BASE_URL = f"http://{LOGSTASH_API_HOST}:{LOGSTASH_API_PORT}"
+
+
+def resolve_logstash_api_port() -> int:
+    """
+    Port for the Logstash HTTP API this agent should talk to.
+
+    Priority: LOGSTASH_API_PORT env (agent.env) → agent state → 9560.
+    """
+    env = (os.environ.get("LOGSTASH_API_PORT") or "").strip()
+    if env.isdigit():
+        return int(env)
+    try:
+        from logstashagent import agent_state
+
+        st = agent_state.get_state() or {}
+        for key in ("logstash_api_port", "api_port"):
+            if st.get(key) is not None:
+                try:
+                    return int(st[key])
+                except (TypeError, ValueError):
+                    pass
+        instance_id = st.get("instance_id")
+        mode = (st.get("mode") or "").lower()
+        if instance_id is not None:
+            n = int(instance_id)
+            if mode == "managed":
+                return 9700 + n
+            if mode in ("simulate", "simulation"):
+                return 9560 + n
+    except Exception:
+        pass
+    return LOGSTASH_API_PORT
+
+
+def default_logstash_api_base_url() -> str:
+    return f"http://{LOGSTASH_API_HOST}:{resolve_logstash_api_port()}"
 
 # Shared HTTP client for connection pooling
 # This prevents creating/destroying clients on every API call, which causes connection accumulation
@@ -84,15 +123,23 @@ class LogstashAPI:
     By default, uses a shared HTTP client for connection pooling to prevent OOM.
     """
     
-    def __init__(self, base_url: str = LOGSTASH_API_BASE_URL, timeout: float = 5.0, use_shared_client: bool = True):
+    def __init__(
+        self,
+        base_url: Optional[str] = None,
+        timeout: float = 5.0,
+        use_shared_client: bool = True,
+    ):
         """
         Initialize the Logstash API client.
         
         Args:
-            base_url: Base URL for the Logstash API (default: http://localhost:9650)
+            base_url: Base URL for the Logstash API. Default resolves from
+                LOGSTASH_API_PORT / agent state (simulate-N → 9560+N).
             timeout: Request timeout in seconds (default: 5.0)
             use_shared_client: Use shared connection pool (default: True, recommended for production)
         """
+        if not base_url:
+            base_url = default_logstash_api_base_url()
         self.base_url = base_url.rstrip('/')
         self.timeout = timeout
         self.use_shared_client = use_shared_client

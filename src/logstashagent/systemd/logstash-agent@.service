@@ -1,0 +1,24 @@
+[Unit]
+Description=LogstashAgent managed instance %i
+After=network.target
+Documentation=https://github.com/elastic/LogstashAgent
+
+[Service]
+Type=simple
+# Instance paths: /opt/logstash-agent/managed-%i/
+# agent.env sets LOGSTASH_AGENT_STATE_DIR + LOGSTASH_AGENT_CONFIG so this unit
+# does not share /opt/logstash-agent/state or /opt/logstash-agent/config with packaged.
+EnvironmentFile=-/opt/logstash-agent/managed-%i/agent.env
+# Controller + FastAPI for this managed instance (ports from state/env)
+ExecStart=/opt/logstash-agent/bin/logstash-agent --run --mode managed --instance %i
+Restart=always
+RestartSec=10
+WorkingDirectory=/opt/logstash-agent/managed-%i
+StandardOutput=journal
+StandardError=journal
+# Prefer logstash user when present (installer rewrites User= as needed)
+# User=logstash
+# Group=logstash
+
+[Install]
+WantedBy=multi-user.target

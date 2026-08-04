@@ -161,6 +161,9 @@ class TestFindKeystoreBinary:
         with patch(
             "logstashagent.ls_keystore_utils.subprocess_utils.PATTERNS", []
         ), patch(
+            "logstashagent.ls_keystore_utils.resolve.resolve_logstash_bin_from_env",
+            return_value=None,
+        ), patch(
             "subprocess.run",
             return_value=MagicMock(returncode=1, stdout=""),
         ):
@@ -176,6 +179,9 @@ class TestFindKeystoreBinary:
 
         with patch(
             "logstashagent.ls_keystore_utils.subprocess_utils.PATTERNS", []
+        ), patch(
+            "logstashagent.ls_keystore_utils.resolve.resolve_logstash_bin_from_env",
+            return_value=None,
         ), patch(
             "subprocess.run", return_value=which_result
         ):

@@ -2,12 +2,12 @@
 #or more contributor license agreements. Licensed under the Elastic License;
 #you may not use this file except in compliance with the Elastic License.
 
-import pytest
-import sys
 import os
-import tempfile
-import shutil
-from unittest.mock import patch, MagicMock, mock_open, call
+import sys
+from unittest.mock import MagicMock, mock_open, patch
+
+import pytest
+
 from logstashagent import installer
 
 
@@ -36,7 +36,7 @@ def test_install_paths_defined():
         'log_dir',
         'systemd_service'
     ]
-    
+
     for path_key in required_paths:
         assert path_key in installer.INSTALL_PATHS
         assert installer.INSTALL_PATHS[path_key].startswith('/')
@@ -57,7 +57,7 @@ def test_systemd_service_template():
     assert 'Group=logstash' in template
     assert 'ExecStart=/opt/logstash-agent/bin/logstash-agent --run' in template
     assert 'Restart=always' in template
-    assert 'WorkingDirectory=/var/lib/logstash-agent' in template
+    assert 'WorkingDirectory=/opt/logstash-agent/state' in template
 
 
 def test_github_release_url_format():
@@ -101,9 +101,12 @@ def test_uninstall_paths_match_install_paths():
 
 
 def test_cache_dir_in_install_paths():
-    """Test that cache_dir is defined in INSTALL_PATHS"""
+    """Test that cache_dir is defined in INSTALL_PATHS under /opt"""
     assert 'cache_dir' in installer.INSTALL_PATHS
-    assert installer.INSTALL_PATHS['cache_dir'] == '/var/cache/logstash-agent'
+    assert installer.INSTALL_PATHS['cache_dir'] == '/opt/logstash-agent/cache'
+    assert installer.INSTALL_PATHS['config_dir'] == '/opt/logstash-agent/config'
+    assert installer.INSTALL_PATHS['state_dir'] == '/opt/logstash-agent/state'
+    assert installer.INSTALL_PATHS['log_dir'] == '/opt/logstash-agent/logs'
 
 
 def test_backup_path_format():
@@ -121,13 +124,13 @@ def test_get_logstash_uid_gid_success(mock_pwd):
     mock_pw.pw_uid = 1000
     mock_gr = MagicMock()
     mock_gr.gr_gid = 1000
-    
+
     with patch('logstashagent.installer.grp') as mock_grp:
         mock_pwd.getpwnam.return_value = mock_pw
         mock_grp.getgrnam.return_value = mock_gr
-        
+
         uid, gid = installer.get_logstash_uid_gid()
-        
+
         assert uid == 1000
         assert gid == 1000
         mock_pwd.getpwnam.assert_called_once_with('logstash')
@@ -149,24 +152,25 @@ def test_get_logstash_uid_gid_user_not_found(mock_pwd):
 def test_verify_service_running_active(mock_run):
     """Test verify_service_running when service is active"""
     mock_run.return_value = MagicMock(returncode=0)
-    
+
     result = installer.verify_service_running()
-    
+
     assert result is True
-    mock_run.assert_called_once_with(
-        ['systemctl', 'is-active', 'logstash-agent'],
-        capture_output=True,
-        timeout=5
-    )
+    assert mock_run.call_count == 1
+    cmd = mock_run.call_args[0][0]
+    assert cmd[-2:] == ['is-active', 'logstash-agent']
+    assert cmd[0].endswith('systemctl')
+    # Host env must be passed so PyInstaller libs do not break systemctl
+    assert 'env' in mock_run.call_args.kwargs
 
 
 @patch('subprocess.run')
 def test_verify_service_running_inactive(mock_run):
     """Test verify_service_running when service is inactive"""
     mock_run.return_value = MagicMock(returncode=3)  # systemctl returns 3 for inactive
-    
+
     result = installer.verify_service_running()
-    
+
     assert result is False
 
 
@@ -175,9 +179,9 @@ def test_verify_service_running_timeout(mock_run):
     """Test verify_service_running handles timeout"""
     import subprocess
     mock_run.side_effect = subprocess.TimeoutExpired('systemctl', 5)
-    
+
     result = installer.verify_service_running()
-    
+
     assert result is False
 
 
@@ -186,11 +190,11 @@ def test_download_release_from_cache(mock_exists):
     """Test download_release uses cached tarball when available"""
     # Mock cache exists
     mock_exists.return_value = True
-    
+
     result = installer.download_release('0.1.30', '/tmp/test')
-    
+
     # Should return cached path (normalize for comparison)
-    expected = '/var/cache/logstash-agent/logstash-agent-0.1.30.tar.gz'
+    expected = '/opt/logstash-agent/cache/logstash-agent-0.1.30.tar.gz'
     assert os.path.normpath(result) == os.path.normpath(expected)
 
 
@@ -202,32 +206,32 @@ def test_download_release_downloads_when_not_cached(mock_exists, mock_makedirs, 
     """Test download_release downloads from GitHub when not cached"""
     # Mock cache doesn't exist
     mock_exists.return_value = False
-    
+
     # Mock successful download
     mock_response = MagicMock()
     mock_response.headers = {'content-length': '1000'}
     mock_response.iter_content.return_value = [b'test data']
-    
+
     # Mock pwd/grp
     mock_pw = MagicMock(pw_uid=1000)
     mock_gr = MagicMock(gr_gid=1000)
-    
+
     with patch('logstashagent.installer.pwd') as mock_pwd, \
          patch('logstashagent.installer.grp') as mock_grp, \
          patch('logstashagent.installer.os.chown', create=True) as mock_chown, \
          patch('requests.get', return_value=mock_response) as mock_get:
-        
+
         mock_pwd.getpwnam.return_value = mock_pw
         mock_grp.getgrnam.return_value = mock_gr
-        
+
         result = installer.download_release('0.1.30', '/tmp/test')
-        
+
         # Should download from GitHub
         expected_url = 'https://github.com/elastic/LogstashAgent/releases/download/v0.1.30/logstash-agent-linux-amd64.tar.gz'
         mock_get.assert_called_once_with(expected_url, stream=True, timeout=60)
-    
+
     # Should return cache path (normalize for comparison)
-    expected = '/var/cache/logstash-agent/logstash-agent-0.1.30.tar.gz'
+    expected = '/opt/logstash-agent/cache/logstash-agent-0.1.30.tar.gz'
     assert os.path.normpath(result) == os.path.normpath(expected)
 
 
@@ -237,16 +241,16 @@ def test_download_release_handles_network_error(mock_exists, mock_makedirs):
     """Test download_release handles network errors"""
     import requests
     mock_exists.return_value = False
-    
+
     # Mock pwd/grp and os.chown to avoid AttributeError on Windows
     with patch('logstashagent.installer.pwd') as mock_pwd, \
          patch('logstashagent.installer.grp') as mock_grp, \
          patch('logstashagent.installer.os.chown', create=True), \
          patch('requests.get', side_effect=requests.exceptions.ConnectionError('Network error')):
-        
+
         mock_pwd.getpwnam.return_value = MagicMock(pw_uid=1000)
         mock_grp.getgrnam.return_value = MagicMock(gr_gid=1000)
-        
+
         with pytest.raises(installer.InstallError, match="Failed to download release"):
             installer.download_release('0.1.30', '/tmp/test')
 
@@ -258,9 +262,9 @@ def test_extract_binary_success(mock_exists, mock_tarfile):
     mock_exists.return_value = True
     mock_tar = MagicMock()
     mock_tarfile.return_value.__enter__.return_value = mock_tar
-    
+
     result = installer.extract_binary('/tmp/test.tar.gz', '/tmp/extract')
-    
+
     # Normalize paths for comparison
     expected = os.path.join('/tmp/extract', 'logstash-agent', 'logstash-agent')
     assert os.path.normpath(result) == os.path.normpath(expected)
@@ -274,7 +278,7 @@ def test_extract_binary_not_found(mock_exists, mock_tarfile):
     mock_exists.return_value = False
     mock_tar = MagicMock()
     mock_tarfile.return_value.__enter__.return_value = mock_tar
-    
+
     with pytest.raises(installer.InstallError, match="Binary not found in tarball"):
         installer.extract_binary('/tmp/test.tar.gz', '/tmp/extract')
 
@@ -284,7 +288,7 @@ def test_extract_binary_handles_tar_error(mock_tarfile):
     """Test extract_binary handles tarfile errors"""
     import tarfile
     mock_tarfile.side_effect = tarfile.TarError('Corrupted tarball')
-    
+
     with pytest.raises(installer.InstallError, match="Failed to extract tarball"):
         installer.extract_binary('/tmp/test.tar.gz', '/tmp/extract')
 
@@ -295,7 +299,7 @@ def test_verify_logstash_installed_success(mock_isdir, mock_pwd):
     """Test verify_logstash_installed when Logstash is properly installed"""
     mock_pwd.getpwnam.return_value = MagicMock()
     mock_isdir.return_value = True
-    
+
     # Should not raise
     installer.verify_logstash_installed()
 
@@ -330,7 +334,7 @@ def test_perform_upgrade_rollback_on_service_failure(mock_rename, mock_chmod, mo
     """Test perform_upgrade rolls back when service fails to start"""
     # Mock exists to return True for all checks (binary, backup, etc.)
     mock_exists.return_value = True
-    
+
     # Mock the backup path exists
     with patch('logstashagent.installer.verify_root'), \
          patch('logstashagent.installer.verify_platform'), \
@@ -345,10 +349,10 @@ def test_perform_upgrade_rollback_on_service_failure(mock_rename, mock_chmod, mo
          patch('os.path.dirname', return_value='/tmp'), \
          patch('os.path.join', side_effect=lambda *args: '/'.join(args)), \
          patch('time.sleep'):
-        
+
         # Make restart fail with CalledProcessError, then rollback succeeds
         import subprocess
-        
+
         # First call: restart fails and raises exception
         # Second call: stop during rollback succeeds
         # Third call: start during rollback succeeds
@@ -357,12 +361,12 @@ def test_perform_upgrade_rollback_on_service_failure(mock_rename, mock_chmod, mo
             if 'restart' in cmd:
                 raise subprocess.CalledProcessError(1, cmd)
             return MagicMock(returncode=0)
-        
+
         mock_run.side_effect = run_side_effect
-        
+
         with pytest.raises(installer.InstallError, match="Upgrade failed and was rolled back"):
             installer.perform_upgrade('0.1.30', auto=False)
-        
+
         # Verify rollback was attempted
         assert mock_copy2.call_count >= 2  # Backup + restore
 
@@ -375,12 +379,10 @@ def test_perform_upgrade_rollback_failure_provides_manual_steps(mock_exists):
     def exists_side_effect(path):
         exists_call_count[0] += 1
         # After initial checks, when checking for backup during rollback, return False
-        if '.backup' in str(path) and exists_call_count[0] > 6:
-            return False
-        return True
-    
+        return not ('.backup' in str(path) and exists_call_count[0] > 6)
+
     mock_exists.side_effect = exists_side_effect
-    
+
     with patch('logstashagent.installer.verify_root'), \
          patch('logstashagent.installer.verify_platform'), \
          patch('tempfile.mkdtemp', return_value='/tmp/test'), \
@@ -397,28 +399,30 @@ def test_perform_upgrade_rollback_failure_provides_manual_steps(mock_exists):
          patch('os.path.dirname', return_value='/tmp'), \
          patch('os.path.join', side_effect=lambda *args: '/'.join(args)), \
          patch('time.sleep'):
-        
+
         # Make restart fail
         import subprocess
-        
+
         def run_side_effect(*args, **kwargs):
             cmd = args[0]
             if 'restart' in cmd:
                 raise subprocess.CalledProcessError(1, cmd)
             return MagicMock(returncode=0)
-        
+
         mock_run.side_effect = run_side_effect
-        
+
         with pytest.raises(installer.InstallError, match="Manual recovery required"):
             installer.perform_upgrade('0.1.30', auto=False)
 
 
+@patch('os.path.isdir')
 @patch('os.path.exists')
 @patch('shutil.rmtree')
-def test_perform_uninstallation_with_purge(mock_rmtree, mock_exists):
-    """Test perform_uninstallation removes all directories with --purge"""
+def test_perform_uninstallation_with_purge(mock_rmtree, mock_exists, mock_isdir):
+    """Test perform_uninstallation --purge wipes /opt/logstash-agent"""
     mock_exists.return_value = True
-    
+    mock_isdir.return_value = True
+
     with patch('logstashagent.installer.verify_root'), \
          patch('logstashagent.installer.verify_platform'), \
          patch('subprocess.run'), \
@@ -426,34 +430,62 @@ def test_perform_uninstallation_with_purge(mock_rmtree, mock_exists):
          patch('os.unlink'), \
          patch('os.path.islink', return_value=True), \
          patch('os.listdir', return_value=[]), \
-         patch('os.rmdir'):
-        
+         patch('os.rmdir'), \
+         patch('logstashagent.install_registry.load_registry', return_value={'instances': {}}), \
+         patch('logstashagent.install_registry.list_instances', return_value=[]), \
+         patch('logstashagent.install_registry.remove_shared_unit_files'):
+
         installer.perform_uninstallation(purge=True)
-        
-        # Verify all directories were removed (binary_dir, config_dir, state_dir, log_dir, cache_dir)
-        assert mock_rmtree.call_count >= 5
+
+        # Opt root wipe + any legacy FHS dirs that mock isdir says exist
+        removed = [str(c.args[0]) for c in mock_rmtree.call_args_list]
+        assert any('/opt/logstash-agent' == p or p.endswith('/opt/logstash-agent') for p in removed) or \
+            installer.INSTALL_PATHS['opt_root'] in removed
+        assert mock_rmtree.call_count >= 1
 
 
+@patch('os.path.isdir')
 @patch('os.path.exists')
 @patch('shutil.rmtree')
-def test_perform_uninstallation_without_purge_preserves_data(mock_rmtree, mock_exists):
-    """Test perform_uninstallation preserves state/log/cache without --purge"""
+def test_perform_uninstallation_without_purge_preserves_data(mock_rmtree, mock_exists, mock_isdir):
+    """Test soft uninstall removes bin+config only; keeps state/logs/cache under opt"""
     mock_exists.return_value = True
-    
+
+    def _isdir(path):
+        # Soft uninstall only rmtree's binary_dir and config_dir
+        return path in (
+            installer.INSTALL_PATHS['binary_dir'],
+            installer.INSTALL_PATHS['config_dir'],
+            installer.INSTALL_PATHS['state_dir'],
+            installer.INSTALL_PATHS['log_dir'],
+            installer.INSTALL_PATHS['cache_dir'],
+            installer.INSTALL_PATHS['opt_root'],
+        )
+
+    mock_isdir.side_effect = _isdir
+
     with patch('logstashagent.installer.verify_root'), \
          patch('logstashagent.installer.verify_platform'), \
          patch('subprocess.run'), \
          patch('os.remove'), \
          patch('os.unlink'), \
          patch('os.path.islink', return_value=True), \
-         patch('os.listdir', return_value=[]), \
-         patch('os.rmdir'):
-        
+         patch('os.listdir', return_value=['state', 'logs']), \
+         patch('os.rmdir'), \
+         patch('logstashagent.install_registry.load_registry', return_value={'instances': {}}), \
+         patch('logstashagent.install_registry.list_instances', return_value=[]), \
+         patch('logstashagent.install_registry.remove_shared_unit_files'), \
+         patch('logstashagent.install_registry.save_registry'):
+
         installer.perform_uninstallation(purge=False)
-        
-        # Verify only binary_dir and config_dir were removed (not state, log, cache)
-        # Should be exactly 2 calls: binary_dir and config_dir
-        assert mock_rmtree.call_count == 2
+
+        removed = [str(c.args[0]) for c in mock_rmtree.call_args_list]
+        assert installer.INSTALL_PATHS['binary_dir'] in removed
+        assert installer.INSTALL_PATHS['config_dir'] in removed
+        assert installer.INSTALL_PATHS['state_dir'] not in removed
+        assert installer.INSTALL_PATHS['log_dir'] not in removed
+        assert installer.INSTALL_PATHS['cache_dir'] not in removed
+        assert installer.INSTALL_PATHS['opt_root'] not in removed
 
 
 def test_install_paths_cache_dir_included():

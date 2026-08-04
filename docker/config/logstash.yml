@@ -12,7 +12,7 @@ xpack.management.enabled: false
 
 # API settings
 api.http.host: "0.0.0.0"
-api.http.port: 9650
+api.http.port: 9560
 
 # Logging
 #log.level: info

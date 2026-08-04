@@ -5,11 +5,12 @@
 """Subprocess utilities for Logstash keystore operations."""
 
 import glob
+import logging
 import os
 import subprocess
-import logging
 from pathlib import Path
 from typing import List, Optional, overload
+
 from .decorators import path_exists, pathify
 from .exceptions import KeystoreBinaryException, LogstashKeystoreException
 from .settings import PATTERNS
@@ -131,21 +132,33 @@ def create_keystore(
 def find_keystore_binary() -> Path:
     """Find the logstash-keystore binary.
 
-    Checks the values in PATTERNS in order (see settings.py).
-
-    If not found, uses 'which' command.
-    If still not found, raises KeystoreBinaryException.
+    Resolution order:
+      1. ``LOGSTASH_KEYSTORE_BIN`` if set and the path is a file
+      2. ``$LOGSTASH_HOME/bin/logstash-keystore`` when ``LOGSTASH_HOME`` is set
+      3. Patterns in settings.PATTERNS (package + Homebrew)
+      4. ``which logstash-keystore``
 
     Returns:
-        str: Path to the logstash-keystore binary.
+        Path to the logstash-keystore binary.
 
     Raises:
         KeystoreBinaryException: If the binary is not found or not executable.
 
     Example:
         >>> find_keystore_binary()  # doctest: +SKIP
-        '/usr/share/logstash/bin/logstash-keystore'
+        PosixPath('/usr/share/logstash/bin/logstash-keystore')
     """
+    from .resolve import resolve_logstash_bin_from_env
+
+    env_bin = resolve_logstash_bin_from_env()
+    if env_bin is not None:
+        try:
+            if executable_file(str(env_bin)):
+                logger.debug("Using logstash-keystore from env/home: %s", env_bin)
+                return env_bin
+        except FileNotFoundError:
+            pass
+
     # Crawl known patterns to find a valid logstash-keystore binary
     for pattern in PATTERNS:
         paths = glob.glob(pattern)
@@ -153,8 +166,8 @@ def find_keystore_binary() -> Path:
             try:
                 result = executable_file(path)
                 if result:
-                    logger.debug(f"Found executable logstash-keystore at {path}")
-                    return Path(path)  # path is valid and executable
+                    logger.debug("Found executable logstash-keystore at %s", path)
+                    return Path(path)
             except FileNotFoundError:
                 continue
 
@@ -168,14 +181,13 @@ def find_keystore_binary() -> Path:
         )
         if result.returncode == 0:
             candidate = result.stdout.strip()
-            logger.debug(f"Found logstash-keystore via which: {candidate}")
-            result = executable_file(candidate)
-            if result:
+            logger.debug("Found logstash-keystore via which: %s", candidate)
+            if executable_file(candidate):
                 return Path(candidate)
     except (OSError, subprocess.SubprocessError):
         logger.error("Error occurred while trying to find logstash-keystore with which")
 
     raise KeystoreBinaryException(
         "logstash-keystore binary not found, or not executable. "
-        "Please install Logstash or specify the path."
+        "Set LOGSTASH_KEYSTORE_BIN or LOGSTASH_HOME, install Logstash, or pass exepath."
     )

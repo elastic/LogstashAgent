@@ -177,28 +177,36 @@ def executable_file(binary_path: str) -> bool:
 def find_path_settings(binary_path: Optional[Path] = None) -> Path:
     """Find or validate the path.settings directory.
 
-    If path_settings is provided, validates it exists, is a directory, and is writable.
-    If not provided, attempts to find a suitable directory:
-    - /etc/logstash
-    - /usr/share/logstash/config
-    - Whatever is added to settings.ALTERNATE_LS_PATHS that matches binary_path
-      - Homebrew's /opt/homebrew/etc/logstash
+    Resolution order:
+      1. ``LOGSTASH_PATH_SETTINGS`` or ``PATH_SETTINGS`` (if a writable directory)
+      2. ``$LOGSTASH_HOME/config`` when ``LOGSTASH_HOME`` is set
+      3. ``/etc/logstash`` (package installs)
+      4. ``/usr/share/logstash/config``
+      5. Homebrew alternate config when binary path matches Homebrew layout
 
     Args:
-        binary_path (Optional[Path]): Path to the keystore binary detection.
+        binary_path: Optional path to the keystore binary (used for Homebrew
+            layout hints).
 
     Returns:
-        str: The path to the config directory.
+        The path to the config directory.
 
     Raises:
         LogstashKeystoreException: If no valid path is found.
 
     Example:
         >>> find_path_settings()  # doctest: +SKIP
-        '/etc/logstash'
+        PosixPath('/etc/logstash')
     """
+    from .resolve import resolve_path_settings_from_env
+
+    env_path = resolve_path_settings_from_env(require_writable=True)
+    if env_path is not None:
+        logger.debug("Using --path.settings from env/home: %s", env_path)
+        return env_path
+
     candidates = CANDIDATES.copy()
-    name = binary_path.name if binary_path else ""
+    name = str(binary_path) if binary_path else ""
     for alt_path, alt_cfg in ALTERNATE_LS_PATHS.items():
         if binary_path and alt_path in name:
             candidates.append(alt_cfg)
@@ -206,11 +214,12 @@ def find_path_settings(binary_path: Optional[Path] = None) -> Path:
     for path in candidates:
         p = Path(path)
         if p.exists() and p.is_dir() and os.access(p, os.W_OK):
-            logger.debug(f"Using --path.settings {path}")
+            logger.debug("Using --path.settings %s", path)
             return p
 
     raise LogstashKeystoreException(
-        "No valid path.settings directory found. Please specify --path.settings."
+        "No valid path.settings directory found. Set LOGSTASH_PATH_SETTINGS "
+        "(or PATH_SETTINGS), LOGSTASH_HOME, or pass path_settings explicitly."
     )
 
 

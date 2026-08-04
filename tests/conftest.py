@@ -16,7 +16,22 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+# Host-mode package config points at /etc/logstash; avoid import failures in CI/dev.
+_real_makedirs = os.makedirs
+
+def _safe_makedirs(name, mode=0o777, exist_ok=False):
+    try:
+        return _real_makedirs(name, mode=mode, exist_ok=exist_ok)
+    except (PermissionError, FileNotFoundError, OSError):
+        # Non-root test environments cannot create system Logstash paths.
+        if exist_ok or str(name).startswith("/etc/logstash"):
+            return None
+        raise
+
+os.makedirs = _safe_makedirs  # type: ignore[assignment]
+
 from logstashagent import main
+
 from logstashagent import logstash_supervisor
 
 

@@ -3,6 +3,8 @@
 > A control-plane agent for LogstashUI that fully manages the Logstash instance it runs alongside.
 >
 > Warning: **Beta Release** - This project is under active development. Features may change.
+>
+> **Current package version: 0.5.1** — see [CHANGELOG.md](CHANGELOG.md).
 
 ## Overview
 
@@ -10,14 +12,45 @@ LogstashAgent is the host-side runtime for LogstashUI-managed instances.
 
 It enrolls with LogstashUI, persists local agent state, checks in for policy and configuration changes, and applies those changes directly to the local Logstash installation.
 
+Product documentation (roles, ports, coexistence, VERSION CLI) lives in the LogstashUI docs tree:
+
+- **[Agent roles, ports, coexistence, and VERSION](https://github.com/elastic/LogstashUI/blob/main/docs/docs/logstashagent/general/roles.md)** (or your local `LogstashUI/docs/docs/logstashagent/general/roles.md`)
+
+## Agent roles
+
+| Mode | Policy type | Role |
+|------|-------------|------|
+| `packaged` | PACKAGED | Production agent (enrolled). Manages package Logstash via `systemctl` (`logstash` + `logstash-agent`). |
+| `managed` | MANAGED | Multi-instance agent **N**. Tree under `/opt/logstash-agent/managed-N/`; units `logstash-agent@N` / `logstash-managed@N`. Ports **9600+N** / **9700+N**. |
+| `simulate` | SIMULATE | Simulation agent **N**. Isolated under `/opt/logstash-agent/simulate-N/`; units `lsagent-simulate@N` / `ls-simulate@N`. Ports **9500+N** / **9560+N**. |
+| `embedded` | EMBEDDED | Docker/local sim without enrollment (FastAPI + supervisor). Ports **9500** / **9560**. |
+| `default` | (legacy) | Alias of packaged (still accepted). |
+
+Legacy `mode: agent|host` maps to **packaged** at startup (see logs: `mode=packaged (legacy '…' mapped)`).
+
+**Host coexistence:** Packaged + Managed + Simulate can share one machine. Multi-instance state/config live under the instance tree (`LOGSTASH_AGENT_STATE_DIR` / `LOGSTASH_AGENT_CONFIG` in `agent.env`), not under packaged `/var/lib` or `/etc`.
+
+**Upgrade:** Existing production agents keep working **without re-enroll** after package upgrade. Use a **Simulate** or **Managed** policy token when adding multi-instance roles.
+
 ## Features
 
 <details>
 <summary><b>Enrollment + Reconciliation Loop</b> - Enroll with LogstashUI and continuously reconcile desired state to the local Logstash instance.</summary>
 
-- Enrollment mode: `python src/logstashagent/main.py --enroll=<TOKEN> --logstash-ui-url=<URL>`
-- Controller mode: `python src/logstashagent/main.py --run`
-- Agent state includes enrollment identity, policy assignment, and revision tracking.
+- Install + enroll (root): `sudo logstash-agent install --enroll=<TOKEN> --logstash-ui-url=<URL>`
+- Non-root enroll (token only): `logstash-agent --enroll=<TOKEN> --logstash-ui-url=<URL>` — enrollment always succeeds; for multi-instance policies the agent tries passwordless sudo, then a partial tree write, otherwise leaves setup pending and prints `sudo logstash-agent setup-simulate`
+- Finish multi-instance host setup: `sudo logstash-agent setup-simulate` (materialize tree, install units)
+- Controller: `logstash-agent --run` (or systemd unit for the role)
+- Host map: `logstash-agent list-instances`
+
+</details>
+
+<details>
+<summary><b>VERSION Logstash pins</b> - Download Elastic distributions for Managed/Simulate policies.</summary>
+
+- Policy source `VERSION` + `logstash_version` (e.g. `9.4.3`) → download under `/opt/logstash-agent/logstash-versions/`
+- Applied on check-in (binary-only changes do not require Deploy)
+- CLI: `list-versions`, `ensure-version <ver>`, `prune-versions`
 
 </details>
 
@@ -38,11 +71,15 @@ It enrolls with LogstashUI, persists local agent state, checks in for policy and
 </details>
 
 <details>
-<summary><b>Local State + Credential Protection</b> - Persist agent identity and encrypted sensitive fields under package-local data storage.</summary>
+<summary><b>Local State + Credential Protection</b> - Persist agent identity and encrypted sensitive fields.</summary>
 
-- State file: `src/logstashagent/data/state.json`
-- Encryption key file: `src/logstashagent/data/.secret_key`
-- Log file: `src/logstashagent/data/logs/logstashagent.log`
+- Packaged state: `/opt/logstash-agent/state/state.json`
+- Packaged config: `/opt/logstash-agent/config/logstash-agent.yml`
+- Packaged logs: `/opt/logstash-agent/logs/`
+- CLI symlink (only path outside `/opt`): `/usr/local/bin/logstash-agent`
+- Multi-instance state: `/opt/logstash-agent/{managed,simulate}-N/state/state.json`
+- Dev/source default: `src/logstashagent/data/state.json`
+- Encryption key and logs under the same state parent (or package log dir)
 
 </details>
 
@@ -50,16 +87,13 @@ It enrolls with LogstashUI, persists local agent state, checks in for policy and
 
 ### Software
 
-#### For Managed Agent mode
-- [Python 3.12+](https://www.python.org/downloads/)
-- [Logstash 8.x, 9.x](https://www.elastic.co/docs/reference/logstash/installing-logstash)
-
-#### For Enrolled Controller mode (`--run`)
-- [Python 3.12+](https://www.python.org/downloads/)
-- Access to managed Logstash settings/log paths
+#### For Packaged / Managed / Simulate (enrolled)
+- Linux (x86-64) for the installer
+- [Logstash 8.x, 9.x](https://www.elastic.co/docs/reference/logstash/installing-logstash) for **SYSTEM** source, or network access for **VERSION** download
+- Root / sudo for install and systemd
 - Network reachability to your LogstashUI instance
 
-### For Local Development
+#### For local development
 - [Python 3.12+](https://www.python.org/downloads/)
 - `uv` (recommended) or `pip`
 
@@ -67,7 +101,7 @@ It enrolls with LogstashUI, persists local agent state, checks in for policy and
 > [!TIP]
 > Use `--run` only after successful enrollment, because controller mode requires persisted enrollment state.
 
-### Install
+### Install (from source for development)
 ```bash
 cd LogstashAgent
 uv sync
@@ -94,14 +128,50 @@ By default this starts the agent service (including management API) on `0.0.0.0:
 python src/logstashagent/main.py --enroll=<BASE64_TOKEN> --logstash-ui-url=http://localhost:8080
 ```
 
+Prefer root install for production:
+```bash
+sudo logstash-agent install --enroll=<BASE64_TOKEN> --logstash-ui-url=https://logstashui.example
+```
+
+### Simulate / Managed policy, non-root enroll
+If you enroll without root, enrollment still saves state. Finish privileged setup with:
+```bash
+sudo logstash-agent setup-simulate
+# then (example):
+sudo systemctl start lsagent-simulate@N
+# or managed:
+sudo systemctl start logstash-agent@N
+```
+
 ### 2. Start controller mode
 ```bash
 python src/logstashagent/main.py --run
+# multi-instance:
+python src/logstashagent/main.py --run --mode managed --instance 1
 ```
 
-### 3. Verify state files
-- `src/logstashagent/data/state.json`
-- `src/logstashagent/data/.secret_key`
+### 3. Host inventory
+```bash
+logstash-agent list-instances
+logstash-agent list-versions
+```
+
+## Day-2 operations (by role)
+
+```bash
+# Packaged
+sudo systemctl status logstash-agent
+
+# Managed N
+sudo systemctl status logstash-agent@N
+sudo logstash-agent-ctl status logstash-agent@N
+
+# Simulate N
+sudo systemctl status lsagent-simulate@N
+
+# Drop one multi-instance role only
+sudo logstash-agent uninstall --instance managed-1
+```
 
 ## Updating
 
@@ -112,17 +182,12 @@ git pull
 uv sync
 ```
 
-Then restart the running agent process.
+Then restart the running agent process (or the appropriate systemd unit).
 
 ## Limitations
-- Controller behavior depends on available host service managers (`systemctl` or `service`) for restart operations.
+- Controller behavior depends on available host service managers (`systemctl`) for restart operations.
 - Host filesystem permissions must allow managed writes to Logstash settings and metadata paths.
-
-## Roadmap
-- Hardened host-mode lifecycle and service integration
-- Expanded policy diff/apply visibility and diagnostics
-- Additional keystore and secret-management workflows
-- Broader automated test coverage around simulation and controller reconciliation paths
+- Installer is Linux-only.
 
 ## Reporting Issues
 

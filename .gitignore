@@ -220,3 +220,10 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 /data/
+
+# Local analysis / packaging artifacts (do not ship)
+CODEBASE_ANALYSIS.md
+*.tar.gz
+LogstashAgent.tar.gz
+src/logstashagent/data/
+src/logstashagent/data/state.json

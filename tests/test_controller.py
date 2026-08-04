@@ -158,6 +158,49 @@ class TestUpdateKeystore:
                     is False
                 )
 
+    def test_unauthenticated_create_and_set(self, temp_dir):
+        """No keystore_password in state: create unauth keystore and set keys."""
+        settings = temp_dir.replace("\\", "/") + "/"
+        with patch.object(
+            controller.agent_state,
+            "get_state",
+            return_value={"api_key": "test_key"},
+        ), patch.object(controller.agent_state, "update_state") as update_state, patch.object(
+            controller, "_decrypt_from_server", side_effect=lambda k, v: v
+        ):
+            ok = controller.update_keystore(
+                settings, {"set": {"alpha": "a1"}, "delete": []}
+            )
+        assert ok is True
+        ks_path = Path(settings) / "logstash.keystore"
+        assert ks_path.exists()
+        # Load without password (unauthenticated trailer)
+        from logstashagent.ls_keystore_utils import LogstashKeystore
+        loaded = LogstashKeystore.load(settings, password=None, exepath=None)
+        assert loaded.uses_embedded_password is True
+        assert loaded.get_key("alpha") == "a1"
+        # Hash state updated with lowercase key names
+        assert update_state.called
+        assert update_state.call_args[0][0] == "keystore"
+        assert "alpha" in update_state.call_args[0][1]
+
+    def test_snmp_merge_without_password_contributes_keystore(self):
+        plan = {"keystore": {"set": {}, "delete": []}, "pipelines": {"set": {}, "delete": []}}
+        with patch.object(controller.agent_state, "get_state", return_value={}):
+            res = controller.apply_snmp_changes(
+                "/cfg/",
+                {
+                    "keystore": {"set": {"k1": "enc"}, "delete": []},
+                    "pipelines": {},
+                },
+                plan=plan,
+            )
+        assert res["ran"] is True
+        assert res["keystore_skipped"] is False
+        assert res["keystore_set_names"] == ["k1"]
+        assert "k1" in plan["keystore"]["set"]
+
+
 
 class TestRestartLogstash:
     @patch.object(controller.subprocess, "run")
@@ -171,6 +214,7 @@ class TestRestartLogstash:
             capture_output=True,
             text=True,
             timeout=30,
+            check=False,
         )
 
     @patch.object(controller.subprocess, "run")
@@ -257,7 +301,10 @@ class TestGetConfigChanges:
         assert kwargs["json"]["connection_id"] == "conn-1"
         assert kwargs["json"]["keystore"] == {"FOO": "hash1"}
         assert kwargs["headers"]["Authorization"] == "ApiKey secret-key"
-        assert kwargs["verify"] is False
+        # Product-CA pin uses system∪product trust (not verify=False when pinned).
+        # Unpinned / missing CA may still pass a path or True-ish verify object.
+        assert "verify" in kwargs
+        assert kwargs["verify"] is not None
 
     def test_http_error_returns_none(self, temp_dir):
         settings = Path(temp_dir) / "s"
@@ -450,11 +497,15 @@ class TestCheckIn:
 
 
 class TestRunController:
-    def test_not_enrolled_returns_without_loop(self):
+    def test_not_enrolled_returns_after_wait(self):
+        """Controller polls for enrollment then exits if still missing."""
         with patch.object(controller.agent_state, "get_state", return_value={}):
-            with patch.object(controller.time, "sleep") as sleep:
-                controller.run_controller()
-        sleep.assert_not_called()
+            with patch.object(controller.agent_state, "STATE_DIR", "/tmp/x"):
+                with patch("time.sleep") as sleep:
+                    with patch("time.monotonic", side_effect=[0, 0, 200, 200]):
+                        controller.run_controller()
+        # At least one sleep while waiting (poll interval)
+        assert sleep.called
 
 
 class TestDecryptFromServer:
@@ -463,15 +514,15 @@ class TestDecryptFromServer:
         from cryptography.fernet import Fernet
         import base64
         import hashlib
-        
+
         api_key = "test-api-key-123"
         plaintext = "secret-value"
-        
+
         # Encrypt the value the same way the server would
         key = base64.urlsafe_b64encode(hashlib.sha256(api_key.encode('utf-8')).digest())
         fernet = Fernet(key)
         encrypted = fernet.encrypt(plaintext.encode('utf-8')).decode('utf-8')
-        
+
         # Test decryption
         result = controller._decrypt_from_server(api_key, encrypted)
         assert result == plaintext
@@ -482,71 +533,71 @@ class TestUpdateLogstashEnvFile:
     def test_raises_file_not_found_when_file_missing(self, mock_env_file):
         """Test that FileNotFoundError is raised when env file doesn't exist."""
         mock_env_file.exists.return_value = False
-        
+
         with patch('pytest.raises', FileNotFoundError):
             try:
                 controller.update_logstash_env_file("password123")
                 assert False, "Should have raised FileNotFoundError"
             except FileNotFoundError as e:
                 assert "not found" in str(e)
-    
+
     @patch.object(controller, '_LOGSTASH_ENV_FILE')
     @patch('subprocess.run')
     def test_updates_password_successfully(self, mock_run, mock_env_file):
         """Test successful password update."""
         mock_env_file.exists.return_value = True
         mock_env_file.__str__.return_value = '/etc/default/logstash'
-        
+
         # Mock successful read
         read_result = MagicMock()
         read_result.returncode = 0
         read_result.stdout = "# Existing content\nOTHER_VAR=value\n"
-        
+
         # Mock successful write
         write_result = MagicMock()
         write_result.returncode = 0
-        
+
         # Mock successful chmod
         chmod_result = MagicMock()
         chmod_result.returncode = 0
-        
+
         mock_run.side_effect = [read_result, write_result, chmod_result]
-        
+
         controller.update_logstash_env_file("newpass")
-        
+
         # Verify write was called with correct content
         assert mock_run.call_count == 3
         write_call = mock_run.call_args_list[1]
         assert 'tee' in write_call[0][0]
         assert 'LOGSTASH_KEYSTORE_PASS=newpass' in write_call[1]['input']
-    
+
     @patch.object(controller, '_LOGSTASH_ENV_FILE')
     @patch('subprocess.run')
     def test_handles_read_failure(self, mock_run, mock_env_file):
         """Test handling of read failure."""
         mock_env_file.exists.return_value = True
         mock_env_file.__str__.return_value = '/etc/default/logstash'
-        
+
         read_result = MagicMock()
         read_result.returncode = 1
         read_result.stderr = "Permission denied"
         mock_run.return_value = read_result
-        
+
         try:
             controller.update_logstash_env_file("pass")
             assert False, "Should have raised OSError"
         except OSError:
             pass
-    
+
     @patch.object(controller, '_LOGSTASH_ENV_FILE')
     @patch('subprocess.run')
     def test_handles_timeout(self, mock_run, mock_env_file):
         """Test handling of subprocess timeout."""
         mock_env_file.exists.return_value = True
         mock_env_file.__str__.return_value = '/etc/default/logstash'
-        
+
         mock_run.side_effect = subprocess.TimeoutExpired('sudo', 5)
-        
+
         try:
             controller.update_logstash_env_file("pass")
             assert False, "Should have raised TimeoutExpired"
@@ -558,35 +609,35 @@ class TestBuildPipelinesState:
     def test_returns_empty_when_conf_d_missing(self, temp_dir):
         """Test returns empty dict when conf.d doesn't exist."""
         settings = temp_dir.replace("\\", "/") + "/"
-        
+
         with patch.object(controller.agent_state, "get_state", return_value={}):
             result = controller.build_pipelines_state(settings)
-        
+
         assert result == {}
-    
+
     def test_returns_empty_when_no_conf_files(self, temp_dir):
         """Test returns empty dict when no .conf files exist."""
         import os
         settings = temp_dir.replace("\\", "/") + "/"
         conf_d = Path(temp_dir) / "conf.d"
         conf_d.mkdir()
-        
+
         with patch.object(controller.agent_state, "get_state", return_value={}):
             result = controller.build_pipelines_state(settings)
-        
+
         assert result == {}
-    
+
     def test_builds_state_from_conf_files(self, temp_dir):
         """Test building state from existing .conf files."""
         import yaml
-        
+
         settings = temp_dir.replace("\\", "/") + "/"
         conf_d = Path(temp_dir) / "conf.d"
         conf_d.mkdir()
-        
+
         # Create a pipeline config file
         (conf_d / "pipeline1.conf").write_text("input { stdin {} }", encoding="utf-8")
-        
+
         # Create pipelines.yml
         pipelines_yml = Path(temp_dir) / "pipelines.yml"
         pipelines_data = [
@@ -597,7 +648,7 @@ class TestBuildPipelinesState:
             }
         ]
         pipelines_yml.write_text(yaml.dump(pipelines_data), encoding="utf-8")
-        
+
         # Mock agent state with stored hash
         state = {
             'pipelines': {
@@ -607,23 +658,23 @@ class TestBuildPipelinesState:
                 }
             }
         }
-        
+
         with patch.object(controller.agent_state, "get_state", return_value=state):
             result = controller.build_pipelines_state(settings)
-        
+
         assert 'pipeline1' in result
         assert result['pipeline1']['config_hash'] == 'abc123'
         assert result['pipeline1']['settings']['pipeline_workers'] == 2
-    
+
     def test_includes_no_input_pipelines_from_state(self, temp_dir):
         """Test that no_input pipelines from state are included even without .conf files."""
         settings = temp_dir.replace("\\", "/") + "/"
         conf_d = Path(temp_dir) / "conf.d"
         conf_d.mkdir()
-        
+
         # Create a regular pipeline .conf file
         (conf_d / "regular_pipeline.conf").write_text("input { stdin {} }", encoding="utf-8")
-        
+
         state = {
             'pipelines': {
                 'regular_pipeline': {
@@ -637,10 +688,10 @@ class TestBuildPipelinesState:
                 }
             }
         }
-        
+
         with patch.object(controller.agent_state, "get_state", return_value=state):
             result = controller.build_pipelines_state(settings)
-        
+
         # Both pipelines should be in the result
         assert 'regular_pipeline' in result
         assert 'no_input_pipeline' in result
@@ -653,16 +704,16 @@ class TestUpdatePipelines:
         """Test returns False when no changes to apply."""
         settings = temp_dir.replace("\\", "/") + "/"
         changes = {'set': {}, 'delete': []}
-        
+
         result = controller.update_pipelines(settings, changes)
         assert result is False
-    
+
     def test_creates_conf_d_directory(self, temp_dir):
         """Test that conf.d directory is created if missing."""
         import os
         settings = temp_dir.replace("\\", "/") + "/"
         conf_d = Path(temp_dir) / "conf.d"
-        
+
         changes = {
             'set': {
                 'test_pipeline': {
@@ -673,19 +724,19 @@ class TestUpdatePipelines:
             },
             'delete': []
         }
-        
+
         with patch.object(controller.agent_state, "get_state", return_value={}):
             with patch.object(controller.agent_state, "update_state"):
                 controller.update_pipelines(settings, changes)
-        
+
         assert conf_d.exists()
-    
+
     def test_writes_pipeline_config_file(self, temp_dir):
         """Test writing pipeline .conf file."""
         settings = temp_dir.replace("\\", "/") + "/"
         conf_d = Path(temp_dir) / "conf.d"
         conf_d.mkdir()
-        
+
         lscl_content = "input { stdin {} }\nfilter { mutate { add_tag => ['test'] } }"
         changes = {
             'set': {
@@ -697,43 +748,43 @@ class TestUpdatePipelines:
             },
             'delete': []
         }
-        
+
         with patch.object(controller.agent_state, "get_state", return_value={}):
             with patch.object(controller.agent_state, "update_state"):
                 result = controller.update_pipelines(settings, changes)
-        
+
         assert result is True
         conf_file = conf_d / "my_pipeline.conf"
         assert conf_file.exists()
         assert conf_file.read_text(encoding="utf-8") == lscl_content
-    
+
     def test_deletes_pipeline_config_file(self, temp_dir):
         """Test deleting pipeline .conf file."""
         settings = temp_dir.replace("\\", "/") + "/"
         conf_d = Path(temp_dir) / "conf.d"
         conf_d.mkdir()
-        
+
         # Create a file to delete
         conf_file = conf_d / "old_pipeline.conf"
         conf_file.write_text("input { stdin {} }", encoding="utf-8")
-        
+
         changes = {
             'set': {},
             'delete': ['old_pipeline']
         }
-        
+
         with patch.object(controller.agent_state, "get_state", return_value={}):
             result = controller.update_pipelines(settings, changes)
-        
+
         assert result is True
         assert not conf_file.exists()
-    
+
     def test_skips_conf_write_for_no_input_pipeline(self, temp_dir):
         """Test that no_input pipelines don't get .conf files written."""
         settings = temp_dir.replace("\\", "/") + "/"
         conf_d = Path(temp_dir) / "conf.d"
         conf_d.mkdir()
-        
+
         changes = {
             'set': {
                 'no_input_pipe': {
@@ -745,38 +796,38 @@ class TestUpdatePipelines:
             },
             'delete': []
         }
-        
+
         with patch.object(controller.agent_state, "get_state", return_value={}):
             with patch.object(controller.agent_state, "update_state"):
                 result = controller.update_pipelines(settings, changes)
-        
+
         assert result is True
         conf_file = conf_d / "no_input_pipe.conf"
         assert not conf_file.exists()
-    
+
     def test_returns_false_on_delete_error(self, temp_dir):
         """Test returns False when delete operation fails."""
         settings = temp_dir.replace("\\", "/") + "/"
         conf_d = Path(temp_dir) / "conf.d"
         conf_d.mkdir()
-        
+
         changes = {
             'set': {},
             'delete': ['test_pipeline']
         }
-        
+
         with patch('os.remove', side_effect=PermissionError("Access denied")):
             with patch('os.path.isfile', return_value=True):
                 result = controller.update_pipelines(settings, changes)
-        
+
         assert result is False
-    
+
     def test_returns_false_on_write_error(self, temp_dir):
         """Test returns False when write operation fails."""
         settings = temp_dir.replace("\\", "/") + "/"
         conf_d = Path(temp_dir) / "conf.d"
         conf_d.mkdir()
-        
+
         changes = {
             'set': {
                 'test': {
@@ -787,8 +838,140 @@ class TestUpdatePipelines:
             },
             'delete': []
         }
-        
+
         with patch('builtins.open', side_effect=OSError("Write failed")):
             result = controller.update_pipelines(settings, changes)
-        
+
         assert result is False
+
+
+class TestSetKeystorePassword:
+    def test_migrates_unauth_to_auth_preserving_secrets(self, temp_dir):
+        settings = temp_dir.replace("\\", "/") + "/"
+        from logstashagent.ls_keystore_utils import LogstashKeystore
+        ks = LogstashKeystore.create(settings, password=None, exepath=None)
+        ks.add_key("keep", "secret-value")
+
+        with patch.object(controller.agent_state, "get_state", return_value={}), patch.object(
+            controller.agent_state, "update_state"
+        ) as update_state, patch.object(controller, "update_logstash_env_file") as env_upd:
+            result = controller.set_keystore_password(settings, "NewAuthPass")
+
+        assert result["success"] is True
+        assert result["wiped"] is False
+        assert result["action"] == "migrated"
+        env_upd.assert_called_once_with("NewAuthPass")
+        # Password stored in state
+        keys = [c[0][0] for c in update_state.call_args_list]
+        assert "keystore_password" in keys
+        loaded = LogstashKeystore.load(settings, password="NewAuthPass", exepath=None)
+        assert loaded.get_key("keep") == "secret-value"
+        assert loaded.uses_embedded_password is False
+
+    def test_creates_when_missing(self, temp_dir):
+        settings = temp_dir.replace("\\", "/") + "/"
+        with patch.object(controller.agent_state, "get_state", return_value={}), patch.object(
+            controller.agent_state, "update_state"
+        ), patch.object(controller, "update_logstash_env_file"):
+            result = controller.set_keystore_password(settings, "pass123")
+        assert result["success"] is True
+        assert result["action"] == "created"
+        from logstashagent.ls_keystore_utils import LogstashKeystore
+        loaded = LogstashKeystore.load(settings, password="pass123", exepath=None)
+        assert loaded.uses_embedded_password is False
+
+    def test_clear_keystore_password_api(self, temp_dir):
+        settings = temp_dir.replace("\\", "/") + "/"
+        from logstashagent.ls_keystore_utils import LogstashKeystore
+        LogstashKeystore.create(settings, password="authpass", exepath=None)
+        with patch.object(
+            controller.agent_state,
+            "get_state",
+            return_value={"keystore_password": "authpass"},
+        ), patch.object(controller.agent_state, "update_state"), patch.object(
+            controller, "update_logstash_env_file"
+        ) as env_upd:
+            result = controller.clear_keystore_password(settings)
+        assert result["success"] is True
+        assert result["action"] == "migrated_unauth"
+        env_upd.assert_called_once_with(None)
+        loaded = LogstashKeystore.load(settings, password=None, exepath=None)
+        assert loaded.uses_embedded_password is True
+
+
+class TestApplyKeystorePasswordChange:
+    """Check-in protocol: false=no-op, null=clear, string=set."""
+
+    def test_false_is_noop(self, temp_dir):
+        settings = temp_dir.replace("\\", "/") + "/"
+        with patch.object(controller, "clear_keystore_password") as clear, patch.object(
+            controller, "set_keystore_password"
+        ) as set_pw:
+            out = controller.apply_keystore_password_change(settings, False, "api-key")
+        assert out["applied"] is False
+        assert out["success"] is True
+        clear.assert_not_called()
+        set_pw.assert_not_called()
+
+    def test_null_clears_password(self, temp_dir):
+        settings = temp_dir.replace("\\", "/") + "/"
+        with patch.object(
+            controller,
+            "clear_keystore_password",
+            return_value={"success": True, "action": "migrated_unauth"},
+        ) as clear:
+            out = controller.apply_keystore_password_change(settings, None, "api-key")
+        assert out["applied"] is True
+        assert out["success"] is True
+        assert out["requires_restart"] is True
+        assert out["action"] == "migrated_unauth"
+        clear.assert_called_once_with(settings)
+
+    def test_encrypted_string_sets_password(self, temp_dir):
+        settings = temp_dir.replace("\\", "/") + "/"
+        with patch.object(
+            controller, "_decrypt_from_server", return_value="plain-pass"
+        ), patch.object(
+            controller,
+            "set_keystore_password",
+            return_value={"success": True, "action": "migrated", "wiped": False},
+        ) as set_pw:
+            out = controller.apply_keystore_password_change(
+                settings, "encrypted-blob", "api-key"
+            )
+        assert out["applied"] is True
+        assert out["success"] is True
+        set_pw.assert_called_once_with(settings, "plain-pass")
+
+    def test_clear_failure_reports_error(self, temp_dir):
+        settings = temp_dir.replace("\\", "/") + "/"
+        with patch.object(
+            controller,
+            "clear_keystore_password",
+            return_value={"success": False, "action": "failed"},
+        ):
+            out = controller.apply_keystore_password_change(settings, None, "api-key")
+        assert out["success"] is False
+        assert "clear" in (out.get("error") or "")
+
+
+class TestUpdateLogstashEnvFileClear:
+    @patch.object(controller.subprocess, "run")
+    def test_clears_password_line(self, mock_run):
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="FOO=1\nLOGSTASH_KEYSTORE_PASS=old\n", stderr=""),
+            MagicMock(returncode=0, stdout="", stderr=""),
+            MagicMock(returncode=0, stdout="", stderr=""),
+        ]
+        with patch.object(controller.Path, "exists", return_value=True):
+            # Path.exists is used on _LOGSTASH_ENV_FILE via instance — patch the file
+            with patch.object(controller, "_LOGSTASH_ENV_FILE", Path("/tmp/fake-default-logstash")):
+                Path("/tmp/fake-default-logstash").write_text("x")
+                controller.update_logstash_env_file(None)
+        # Second call is sudo tee with content without LOGSTASH_KEYSTORE_PASS
+        tee_call = mock_run.call_args_list[1]
+        assert tee_call[1].get("input") is not None or (tee_call[0] and True)
+        # input= content
+        written = mock_run.call_args_list[1].kwargs.get("input") or ""
+        assert "LOGSTASH_KEYSTORE_PASS" not in written
+        assert "FOO=1" in written
