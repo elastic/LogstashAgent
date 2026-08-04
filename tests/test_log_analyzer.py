@@ -14,6 +14,98 @@ def _line(obj: dict) -> str:
     return json.dumps(obj) + "\n"
 
 
+class TestPipelineBusUnavailable:
+    MSG = (
+        "Attempted to send event to 'slot1-filter1' but that address was unavailable. "
+        "Maybe the destination pipeline is down or stopping? Will Retry."
+    )
+
+    def test_extract_destination(self):
+        assert (
+            log_analyzer.extract_pipeline_bus_unavailable_destination(self.MSG)
+            == "slot1-filter1"
+        )
+
+    def test_extract_ignores_unrelated(self):
+        assert log_analyzer.extract_pipeline_bus_unavailable_destination(
+            "Pipeline started successfully"
+        ) is None
+        assert log_analyzer.extract_pipeline_bus_unavailable_destination("") is None
+        assert log_analyzer.extract_pipeline_bus_unavailable_destination(None) is None  # type: ignore[arg-type]
+
+    def test_detect_storm_groups_by_destination(self):
+        base = 1_700_000_000_000
+        logs = []
+        for i in range(10):
+            logs.append(
+                {
+                    "level": "WARN",
+                    "loggerName": "org.logstash.plugins.pipeline.AbstractPipelineBus",
+                    "timeMillis": base + i * 1000,
+                    "pipeline.id": "simulate-start",
+                    "logEvent": {
+                        "message": (
+                            "Attempted to send event to 'slot1-filter1' but that "
+                            "address was unavailable. Will Retry."
+                        )
+                    },
+                }
+            )
+        # Below threshold for slot2
+        for i in range(3):
+            logs.append(
+                {
+                    "level": "WARN",
+                    "timeMillis": base + i * 1000,
+                    "pipeline.id": "simulate-start",
+                    "logEvent": {
+                        "message": (
+                            "Attempted to send event to 'slot2-filter1' but that "
+                            "address was unavailable. Will Retry."
+                        )
+                    },
+                }
+            )
+
+        with patch.object(log_analyzer, "_read_json_logs", return_value=logs):
+            storms = log_analyzer.detect_pipeline_bus_retry_storms(
+                log_dir="/tmp",
+                window_seconds=30,
+                min_count=8,  # lower for this fixture (10 warns)
+                now_ms=base + 15_000,
+            )
+
+        assert len(storms) == 1
+        assert storms[0]["destination"] == "slot1-filter1"
+        assert storms[0]["count"] == 10
+        assert storms[0]["source_pipeline"] == "simulate-start"
+        assert storms[0]["span_seconds"] == 9.0
+
+    def test_detect_storm_respects_window(self):
+        base = 1_700_000_000_000
+        logs = [
+            {
+                "level": "WARN",
+                "timeMillis": base - 60_000,  # outside window
+                "logEvent": {
+                    "message": (
+                        "Attempted to send event to 'slot1-filter1' but that "
+                        "address was unavailable. Will Retry."
+                    )
+                },
+            }
+            for _ in range(20)
+        ]
+        with patch.object(log_analyzer, "_read_json_logs", return_value=logs):
+            storms = log_analyzer.detect_pipeline_bus_retry_storms(
+                log_dir="/tmp",
+                window_seconds=30,
+                min_count=15,
+                now_ms=base,
+            )
+        assert storms == []
+
+
 class TestResolveLogstashLogDir:
     """Multi-instance agents must not default to /var/log/logstash blindly."""
 

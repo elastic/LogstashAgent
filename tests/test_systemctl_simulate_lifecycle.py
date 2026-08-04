@@ -198,3 +198,156 @@ class TestStartupSkipsSupervisor:
 
         shut = asyncio.run(_run())
         shut.assert_not_called()
+
+
+class TestPipelineBusRetryStormRecovery:
+    """Stuck send_to retries leave API healthy; simulate instance may restart."""
+
+    STORM = {
+        "destination": "slot1-filter1",
+        "count": 15,
+        "span_seconds": 14.0,
+        "source_pipeline": "simulate-start",
+    }
+
+    def _mock_api(self, listed):
+        mock_api = MagicMock()
+        mock_api.__enter__.return_value = mock_api
+        mock_api.__exit__.return_value = False
+        mock_api.list_pipelines.return_value = listed
+        return mock_api
+
+    def test_escalates_only_after_configured_confirmations(self):
+        """Default policy: 3 confirmations then hard-restart this sim Logstash."""
+        hits: dict = {}
+        mock_api = self._mock_api([])
+        with patch.object(
+            main.log_analyzer,
+            "detect_pipeline_bus_retry_storms",
+            return_value=[self.STORM],
+        ), patch.object(main, "LogstashAPI", return_value=mock_api), patch.object(
+            main, "trigger_sim_logstash_hard_restart", return_value=True
+        ) as hard_restart, patch.object(
+            main, "_is_simulate_instance_for_bus_recovery", return_value=True
+        ), patch.object(
+            main.slots, "get_slot_state", return_value={}
+        ), patch.object(main.slots, "release_slot", return_value=False):
+            # Confirmations 1 and 2: detect only, no restart
+            for expected in (1, 2):
+                assert (
+                    main.handle_pipeline_bus_retry_storms(
+                        _hits=hits, min_consecutive=3
+                    )
+                    is False
+                )
+                assert hits.get("slot1-filter1") == expected
+                hard_restart.assert_not_called()
+
+            # Confirmation 3: course of correction = kill -9 + systemctl restart
+            assert (
+                main.handle_pipeline_bus_retry_storms(
+                    _hits=hits, min_consecutive=3
+                )
+                is True
+            )
+            hard_restart.assert_called_once()
+            assert "pipeline bus retry storm" in hard_restart.call_args[0][0]
+            assert hits == {}
+
+    def test_listed_destination_still_actionable_workers_never_drain(self):
+        """list_pipelines membership must NOT hold forever — stuck send_to never drains."""
+        hits: dict = {}
+        mock_api = self._mock_api(["slot1-filter1"])  # listed but bus unavailable
+        with patch.object(
+            main.log_analyzer,
+            "detect_pipeline_bus_retry_storms",
+            return_value=[self.STORM],
+        ), patch.object(main, "LogstashAPI", return_value=mock_api), patch.object(
+            main, "trigger_sim_logstash_hard_restart", return_value=True
+        ) as hard_restart, patch.object(
+            main, "_is_simulate_instance_for_bus_recovery", return_value=True
+        ), patch.object(
+            main.slots, "get_slot_state", return_value={}
+        ), patch.object(main.slots, "release_slot", return_value=False):
+            assert (
+                main.handle_pipeline_bus_retry_storms(
+                    _hits=hits, min_consecutive=1
+                )
+                is True
+            )
+            hard_restart.assert_called_once()
+
+    def test_grace_for_young_booked_slot(self):
+        from datetime import datetime, timezone
+
+        hits: dict = {}
+        mock_api = self._mock_api(["slot1-filter1"])
+        young = {
+            1: {
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "content_hash": "abc",
+            }
+        }
+        with patch.object(
+            main.log_analyzer,
+            "detect_pipeline_bus_retry_storms",
+            return_value=[self.STORM],
+        ), patch.object(main, "LogstashAPI", return_value=mock_api), patch.object(
+            main, "trigger_sim_logstash_hard_restart", return_value=True
+        ) as hard_restart, patch.object(
+            main, "_is_simulate_instance_for_bus_recovery", return_value=True
+        ), patch.object(
+            main.slots, "get_slot_state", return_value=young
+        ):
+            assert (
+                main.handle_pipeline_bus_retry_storms(
+                    _hits=hits, min_consecutive=1
+                )
+                is False
+            )
+            hard_restart.assert_not_called()
+
+    def test_withholds_restart_when_not_simulate_instance(self):
+        hits: dict = {}
+        mock_api = self._mock_api([])
+        with patch.object(
+            main.log_analyzer,
+            "detect_pipeline_bus_retry_storms",
+            return_value=[self.STORM],
+        ), patch.object(main, "LogstashAPI", return_value=mock_api), patch.object(
+            main, "trigger_sim_logstash_hard_restart", return_value=True
+        ) as hard_restart, patch.object(
+            main, "_is_simulate_instance_for_bus_recovery", return_value=False
+        ), patch.object(
+            main.slots, "get_slot_state", return_value={}
+        ):
+            # Even after confirmations, non-simulate must not hard-restart
+            for _ in range(3):
+                main.handle_pipeline_bus_retry_storms(
+                    _hits=hits, min_consecutive=2
+                )
+            hard_restart.assert_not_called()
+
+    def test_force_kill_uses_mainpid_and_kill_9(self):
+        with patch.object(
+            main.controller, "_logstash_unit_name", return_value="ls-simulate@1"
+        ), patch("subprocess.run") as run_mock:
+            # show MainPID, then kill -9
+            show = MagicMock()
+            show.returncode = 0
+            show.stdout = "12345\n"
+            show.stderr = ""
+            kill = MagicMock()
+            kill.returncode = 0
+            kill.stdout = ""
+            kill.stderr = ""
+            run_mock.side_effect = [show, kill]
+
+            out = main.force_kill_simulate_logstash_jvm(reason="test")
+
+        assert out["unit"] == "ls-simulate@1"
+        assert out["pids_killed"] == [12345]
+        assert run_mock.call_count == 2
+        kill_cmd = run_mock.call_args_list[1][0][0]
+        assert kill_cmd[:3] == ["sudo", "kill", "-9"]
+        assert kill_cmd[3] == "12345"

@@ -488,15 +488,538 @@ def trigger_sim_logstash_restart(reason: str = 'Manual restart') -> bool:
     return True
 
 
+def force_kill_simulate_logstash_jvm(*, reason: str = "") -> dict:
+    """
+    SIGKILL the Logstash JVM for this simulate unit (stuck bus workers never drain).
+
+    Uses ``systemctl show -p MainPID`` for ``ls-simulate@N`` / managed unit, then
+    ``kill -9``. Graceful stop is useless once AbstractPipelineBus is retrying
+    forever on simulate-start.
+
+    Returns:
+        dict with unit, pid(s) killed, and any errors (best-effort).
+    """
+    import subprocess
+
+    out: dict[str, Any] = {
+        "unit": None,
+        "pids_killed": [],
+        "errors": [],
+        "reason": reason,
+    }
+    try:
+        unit = controller._logstash_unit_name()
+        out["unit"] = unit
+    except Exception as e:
+        out["errors"].append(f"unit name: {e}")
+        logger.error("force_kill: cannot resolve logstash unit: %s", e)
+        return out
+
+    try:
+        from logstashagent.installer import host_subprocess_env, _systemctl_bin
+
+        env = host_subprocess_env()
+        systemctl = _systemctl_bin()
+    except Exception:
+        env = os.environ.copy()
+        systemctl = "systemctl"
+
+    pid = 0
+    try:
+        show = subprocess.run(
+            ["sudo", systemctl, "show", unit, "-p", "MainPID", "--value"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+            env=env,
+        )
+        raw = (show.stdout or "").strip()
+        if show.returncode != 0:
+            out["errors"].append(
+                f"systemctl show MainPID failed: {(show.stderr or show.stdout or '')[:200]}"
+            )
+        elif raw.isdigit():
+            pid = int(raw)
+    except Exception as e:
+        out["errors"].append(f"MainPID lookup: {e}")
+        logger.error("force_kill: MainPID lookup failed for %s: %s", unit, e)
+
+    if pid > 1:
+        logger.error(
+            "Bus storm CORRECTION: kill -9 Logstash JVM pid=%s unit=%s reason=%s",
+            pid,
+            unit,
+            reason or "unspecified",
+        )
+        try:
+            kill = subprocess.run(
+                ["sudo", "kill", "-9", str(pid)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+                env=env,
+            )
+            if kill.returncode == 0:
+                out["pids_killed"].append(pid)
+            else:
+                # Process may already be gone
+                err = (kill.stderr or kill.stdout or "").strip()
+                out["errors"].append(f"kill -9 {pid}: rc={kill.returncode} {err[:120]}")
+                logger.warning(
+                    "kill -9 %s returned rc=%s (%s)", pid, kill.returncode, err[:120]
+                )
+                # Still record as attempted
+                out["pids_killed"].append(pid)
+        except Exception as e:
+            out["errors"].append(f"kill -9 {pid}: {e}")
+            logger.error("force_kill: kill -9 %s failed: %s", pid, e)
+    else:
+        msg = f"no live MainPID for {unit} (got {pid!r})"
+        out["errors"].append(msg)
+        logger.warning("force_kill: %s — will still systemctl restart", msg)
+
+    return out
+
+
+def trigger_sim_logstash_hard_restart(reason: str = "bus storm hard restart") -> bool:
+    """
+    Clear stuck simulate-start send_to workers: kill -9 JVM, then bare recovery
+    + systemctl restart (or supervisor restart for embedded).
+
+    Stuck AbstractPipelineBus retries do not drain even when the destination
+    pipeline is listed — only killing the process clears them.
+    """
+    global _sim_systemctl_restart_count
+
+    logger.error(
+        "Simulate HARD restart (kill -9 JVM + recovery/restart): %s", reason
+    )
+
+    if is_systemctl_managed_simulate():
+        kill_info = force_kill_simulate_logstash_jvm(reason=reason)
+        logger.error(
+            "force_kill result: unit=%s pids=%s errors=%s",
+            kill_info.get("unit"),
+            kill_info.get("pids_killed"),
+            kill_info.get("errors"),
+        )
+        # Brief pause so systemd notices the dead MainPID before restart
+        time.sleep(1.0)
+        from logstashagent import simulate_recovery
+
+        result = simulate_recovery.recover_simulate_logstash(
+            reason=reason,
+            restart=True,
+            agent_config=AGENT_CONFIG,
+        )
+        ok = bool(result.get("success") and result.get("restarted"))
+        if ok:
+            _sim_systemctl_restart_count += 1
+            logger.error(
+                "Simulate HARD restart complete (unit=%s killed=%s)",
+                kill_info.get("unit"),
+                kill_info.get("pids_killed"),
+            )
+        elif result.get("denied"):
+            logger.error(
+                "Simulate HARD restart recovery denied: %s", result.get("error")
+            )
+        else:
+            logger.error(
+                "Simulate HARD restart incomplete: %s",
+                result.get("error") or result,
+            )
+        return ok
+
+    # Embedded supervisor: force-kill process group if we have a live process
+    try:
+        supervisor = logstash_supervisor.get_supervisor()
+        if supervisor and getattr(supervisor, "process", None):
+            proc = supervisor.process
+            if proc.poll() is None:
+                pid = proc.pid
+                logger.error(
+                    "Embedded HARD restart: kill -9 supervisor Logstash pid=%s", pid
+                )
+                try:
+                    os.kill(pid, 9)
+                except ProcessLookupError:
+                    pass
+                except Exception as e:
+                    logger.warning("Embedded kill -9 %s failed: %s", pid, e)
+    except Exception as e:
+        logger.warning("Embedded hard-kill path failed: %s", e)
+
+    try:
+        if not _SKIP_SIMULATION_IMPORTS:
+            slots.evict_all_slots_and_cleanup()
+    except Exception as e:
+        logger.warning("Slot cleanup before embedded hard restart failed: %s", e)
+    logstash_supervisor.trigger_restart(reason)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Pipeline-bus retry storm policy (simulate instances only)
+#
+# simulate-start send_to => slotN-filterM. When the bus address is unavailable,
+# Logstash WARNs ~1/s and retries *forever* — even if list_pipelines() still
+# shows the dest. Stuck workers do NOT drain. For simulate instances we
+# kill -9 the Logstash JVM + systemctl restart after deliberate confirmation.
+# ---------------------------------------------------------------------------
+# How many identical "address was unavailable" WARNs in the lookback window
+# count as a storm (not a brief cold-start blip).
+BUS_STORM_MIN_WARN_COUNT = 15
+# Lookback window for those WARNs (seconds).
+BUS_STORM_WINDOW_SECONDS = 30.0
+# How many successive watchdog/cleanup scans must still see an *actionable*
+# storm before we hard-restart (~3 × 10s watchdog ≈ 30s of confirmed stuck).
+BUS_STORM_CONFIRMATIONS = 3
+# Do not hard-restart while a slot is mid cold-allocate (brief bus WARNs expected).
+BUS_STORM_ALLOCATE_GRACE_SECONDS = 90.0
+# Post-restart cool-down inside the watchdog loop.
+BUS_STORM_POST_RESTART_COOLDOWN_SECONDS = 60.0
+
+# consecutive actionable confirmations per destination
+_bus_storm_hits: dict[str, int] = {}
+
+
+def _sim_log_dir() -> str:
+    """Logstash JSON log directory for this agent instance."""
+    try:
+        st = agent_state.get_state() or {}
+    except Exception:
+        st = {}
+    return log_analyzer.resolve_logstash_log_dir(
+        logstash_log_path=(AGENT_CONFIG or {}).get("logstash_log_path"),
+        logs_path=st.get("logs_path"),
+    )
+
+
+def _is_simulate_instance_for_bus_recovery() -> bool:
+    """
+    True when hard-restarting *this* Logstash for a bus storm is acceptable.
+
+    Simulate (and embedded sim) instances are disposable for this purpose.
+    Packaged / managed production units are not restarted for bus storms.
+    """
+    if is_systemctl_managed_simulate():
+        return True
+    mode = str((AGENT_CONFIG or {}).get("mode") or "").lower()
+    if mode in ("simulate", "simulation", "embedded"):
+        return True
+    try:
+        st = agent_state.get_state() or {}
+        if str(st.get("mode") or "").lower() in ("simulate", "simulation", "embedded"):
+            return True
+        if str(st.get("policy_type") or "").upper() == "SIMULATE":
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _bus_storm_actionable(storm: dict) -> tuple[bool, str]:
+    """
+    Decide whether a detected storm should escalate toward hard restart.
+
+    IMPORTANT: Do **not** hold because the destination is ``list_pipelines()``
+    membership. Stuck simulate-start workers retry forever even when the dest
+    appears listed (bus address unavailable). Holding "until drain" never ends.
+
+    Only hold for cold-allocate races:
+    - young booked slot (allocate grace)
+    - allocate single-flight still in progress for that slot
+    """
+    dest = storm.get("destination") or ""
+    if not dest:
+        return False, "empty destination"
+
+    listed = False
+    try:
+        with LogstashAPI(timeout=2.0) as api:
+            listed = dest in api.list_pipelines()
+    except Exception as e:
+        logger.debug("bus storm list_pipelines failed: %s", e)
+        listed = False
+
+    # slotN-filterM → slot id for grace against mid-allocate races only
+    m = re.match(r"^slot(\d+)-filter", dest)
+    if not m:
+        return True, (
+            f"non-slot destination {dest} bus unavailable "
+            f"(listed={listed}; workers never drain — hard restart)"
+        )
+
+    slot_id = int(m.group(1))
+    state = None
+    if not _SKIP_SIMULATION_IMPORTS:
+        try:
+            state = slots.get_slot_state().get(slot_id)
+        except Exception:
+            state = None
+
+    if state:
+        age_s: float | None = None
+        created = state.get("created_at")
+        if created:
+            try:
+                created_dt = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
+                age_s = (datetime.now(UTC) - created_dt).total_seconds()
+            except Exception:
+                age_s = None
+
+        content_hash = state.get("content_hash") or ""
+        if content_hash and slots.allocate_flight_in_progress(content_hash):
+            return False, f"allocate in flight for slot {slot_id}"
+
+        if age_s is not None and age_s < BUS_STORM_ALLOCATE_GRACE_SECONDS:
+            return (
+                False,
+                f"slot {slot_id} still in allocate grace "
+                f"(age={age_s:.0f}s < {BUS_STORM_ALLOCATE_GRACE_SECONDS:.0f}s)",
+            )
+
+        return True, (
+            f"stuck send_to {dest} (listed={listed}, slot {slot_id} booked"
+            + (f", age={age_s:.0f}s" if age_s is not None else "")
+            + "; workers never drain — hard restart)"
+        )
+
+    return True, (
+        f"stuck send_to {dest} (listed={listed}, slot not booked; "
+        "workers never drain — hard restart)"
+    )
+
+
+def handle_pipeline_bus_retry_storms(
+    *,
+    log_dir: str | None = None,
+    min_consecutive: int | None = None,
+    min_warn_count: int | None = None,
+    window_seconds: float | None = None,
+    _hits: dict | None = None,
+) -> bool:
+    """
+    Detect pipeline-bus retry storms and, on a *simulate* instance, hard-restart
+    this Logstash after enough consecutive confirmations.
+
+    Policy (deliberate, not hair-trigger):
+      1. DETECT — ≥ BUS_STORM_MIN_WARN_COUNT identical "address was unavailable"
+         WARNs in BUS_STORM_WINDOW_SECONDS (default 15 in 30s).
+      2. CONFIRM — same dest still storming / not mid-allocate for
+         BUS_STORM_CONFIRMATIONS successive scans (default 3 ≈ 30s watchdog).
+         Destination being ``list_pipelines()``-listed does **not** clear the
+         storm (stuck workers never drain).
+      3. CORRECT — release orphan slots, ``kill -9`` Logstash JVM, bare recovery
+         + ``systemctl restart`` of *this* simulate unit.
+
+    Logs each step: detection, confirmation progress, and course of correction.
+
+    Returns:
+        True if hard restart was triggered.
+    """
+    confirmations_needed = (
+        BUS_STORM_CONFIRMATIONS if min_consecutive is None else min_consecutive
+    )
+    warn_threshold = (
+        BUS_STORM_MIN_WARN_COUNT if min_warn_count is None else min_warn_count
+    )
+    lookback_s = (
+        BUS_STORM_WINDOW_SECONDS if window_seconds is None else window_seconds
+    )
+
+    if _hits is None:
+        global _bus_storm_hits
+        hits_map = _bus_storm_hits
+    else:
+        hits_map = _hits
+
+    directory = log_dir or _sim_log_dir()
+    try:
+        storms = log_analyzer.detect_pipeline_bus_retry_storms(
+            log_dir=directory,
+            window_seconds=lookback_s,
+            min_count=warn_threshold,
+        )
+    except Exception as e:
+        logger.debug("bus storm scan failed: %s", e)
+        return False
+
+    if not storms:
+        if hits_map:
+            logger.info(
+                "Bus storm: cleared — no sustained 'address was unavailable' "
+                "loop in last %.0fs (was tracking %s)",
+                lookback_s,
+                ", ".join(sorted(hits_map.keys())),
+            )
+        hits_map.clear()
+        return False
+
+    simulate_ok = _is_simulate_instance_for_bus_recovery()
+    actionable: list[tuple[dict, str]] = []
+    seen_dests: set[str] = set()
+
+    for storm in storms:
+        dest = storm.get("destination") or ""
+        seen_dests.add(dest)
+        count = storm.get("count") or 0
+        span = float(storm.get("span_seconds") or 0.0)
+        source = storm.get("source_pipeline") or "?"
+
+        # --- DETECTION (always log; this is the signal we watch for) ---
+        logger.warning(
+            "Bus storm DETECTED: dest=%s warn_count=%s (threshold=%s) "
+            "span=%.1fs window=%.0fs source=%s — AbstractPipelineBus is "
+            "retrying send_to forever while destination is unavailable",
+            dest,
+            count,
+            warn_threshold,
+            span,
+            lookback_s,
+            source,
+        )
+
+        ok, why = _bus_storm_actionable(storm)
+        if not ok:
+            hits_map.pop(dest, None)
+            logger.info(
+                "Bus storm HOLD (no restart yet): dest=%s — %s",
+                dest,
+                why,
+            )
+            continue
+
+        hits_map[dest] = hits_map.get(dest, 0) + 1
+        conf = hits_map[dest]
+        actionable.append((storm, why))
+
+        if conf < confirmations_needed:
+            logger.warning(
+                "Bus storm CONFIRMING: dest=%s confirmation=%s/%s reason=%s — "
+                "will kill -9 + systemctl restart this simulate Logstash after "
+                "%s consecutive confirmations (avoids thrash on allocate races)",
+                dest,
+                conf,
+                confirmations_needed,
+                why,
+                confirmations_needed,
+            )
+        else:
+            logger.error(
+                "Bus storm CONFIRMED stuck: dest=%s confirmation=%s/%s reason=%s",
+                dest,
+                conf,
+                confirmations_needed,
+                why,
+            )
+
+    # Drop counters for destinations no longer storming
+    for dest in list(hits_map.keys()):
+        if dest not in seen_dests:
+            logger.info(
+                "Bus storm cleared for dest=%s (no longer in log window)", dest
+            )
+            del hits_map[dest]
+
+    ready = [
+        (storm, why)
+        for storm, why in actionable
+        if hits_map.get(storm.get("destination") or "", 0) >= confirmations_needed
+    ]
+    if not ready:
+        return False
+
+    summary = "; ".join(
+        f"{s.get('destination')}×{s.get('count')} warns ({why})" for s, why in ready
+    )
+
+    if not simulate_ok:
+        logger.error(
+            "Bus storm CORRECTION withheld: not a simulate instance — "
+            "manual intervention required for: %s",
+            summary,
+        )
+        # Do not keep ratcheting forever on non-sim
+        for storm, _ in ready:
+            hits_map.pop(storm.get("destination") or "", None)
+        return False
+
+    # --- CORRECTION: kill -9 JVM (workers never drain) + bare recovery + restart ---
+    logger.error(
+        "Bus storm CORRECTION: kill -9 Logstash JVM + systemctl restart on *this* "
+        "simulate instance (stuck send_to workers never drain, listed or not). "
+        "detail=%s confirmations_required=%s warn_threshold=%s/%.0fs",
+        summary,
+        confirmations_needed,
+        warn_threshold,
+        lookback_s,
+    )
+
+    if not _SKIP_SIMULATION_IMPORTS:
+        for storm, _why in ready:
+            dest = storm.get("destination") or ""
+            m = re.match(r"^slot(\d+)-filter", dest)
+            if not m:
+                continue
+            try:
+                released = slots.release_slot(int(m.group(1)), cleanup_pipelines=True)
+                logger.info(
+                    "Bus storm CORRECTION: released slot %s for dest=%s (existed=%s)",
+                    m.group(1),
+                    dest,
+                    released,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Bus storm CORRECTION: could not release slot for %s: %s",
+                    dest,
+                    e,
+                )
+
+    ok = trigger_sim_logstash_hard_restart(f"pipeline bus retry storm: {summary}")
+    if ok:
+        logger.error(
+            "Bus storm CORRECTION complete: hard-restarted simulate Logstash "
+            "for stuck send_to loop (%s)",
+            summary,
+        )
+    else:
+        logger.error(
+            "Bus storm CORRECTION failed: hard restart did not complete for "
+            "stuck send_to loop (%s) — will re-detect on next scan "
+            "(recovery may be rate-limited)",
+            summary,
+        )
+    hits_map.clear()
+    return ok
+
+
 def _simulate_watchdog_loop():
     """
-    Background probe for enrolled simulate: after consecutive unhealthy
-    checks, run bare recovery + systemctl restart.
+    Background probe for simulate Logstash.
+
+    1. Pipeline-bus retry storms (API can stay healthy while send_to loops)
+    2. Systemctl-managed: consecutive HTTP unhealthy → bare recovery + restart
     """
     failures = 0
     while True:
         try:
             time.sleep(10)
+
+            # Stuck send_to loops do not fail HTTP health — scan logs and, after
+            # deliberate confirmations, restart *this* simulate Logstash unit.
+            try:
+                if handle_pipeline_bus_retry_storms():
+                    failures = 0
+                    time.sleep(BUS_STORM_POST_RESTART_COOLDOWN_SECONDS)
+                    continue
+            except Exception as e:
+                logger.error("Bus storm watchdog check failed: %s", e, exc_info=True)
+
             if not is_systemctl_managed_simulate():
                 failures = 0
                 continue
@@ -512,7 +1035,8 @@ def _simulate_watchdog_loop():
             )
             if failures >= 3:
                 logger.error(
-                    "Simulate watchdog: triggering bare recovery after %s failures",
+                    "Simulate watchdog CORRECTION: bare recovery after %s "
+                    "consecutive unhealthy checks",
                     failures,
                 )
                 trigger_sim_logstash_restart(
@@ -1210,25 +1734,50 @@ async def simulate_log(request: Request):
                 }
             )
 
-        # If a slot is specified, ensure that filter pipeline is loaded before
-        # forwarding. Otherwise simulate-start posts the "original" event and then
-        # hangs on pipeline-to-pipeline send_to (no instrumentation / empty snapshots).
+        # If a slot is specified, ensure the filter pipeline is on the pipeline bus
+        # before forwarding. list_pipelines() alone is not enough — simulate-start
+        # send_to fails with "address was unavailable" until the bus registers it.
         if slot_id is not None:
             target = f"slot{slot_id}-filter1"
             ready = False
-            for _ in range(20):  # up to ~10s
+            last_state = "unknown"
+            ready_since: float | None = None
+            bus_hold_s = 1.0  # continuous idle/running before we forward
+            for _ in range(40):  # up to ~20s
                 try:
                     with LogstashAPI(timeout=2.0) as api:
-                        if target in api.list_pipelines():
-                            ready = True
-                            break
+                        if target not in api.list_pipelines():
+                            last_state = "not_listed"
+                            ready_since = None
+                        else:
+                            try:
+                                last_state = api.detect_pipeline_state(target)
+                            except Exception:
+                                last_state = "listed"
+                            if last_state in ("idle", "running"):
+                                if ready_since is None:
+                                    ready_since = time.time()
+                                elif time.time() - ready_since >= bus_hold_s:
+                                    ready = True
+                                    break
+                            else:
+                                # listed but not idle/running yet
+                                ready_since = None
                 except Exception:
-                    pass
+                    ready_since = None
                 await asyncio.sleep(0.5)
             if not ready:
                 logger.warning(
-                    "Slot pipeline %s not ready; forwarding anyway (may yield empty snapshots)",
+                    "Slot pipeline %s not bus-ready (last_state=%s); "
+                    "forwarding anyway (may log address unavailable / empty snapshots)",
                     target,
+                    last_state,
+                )
+            else:
+                logger.info(
+                    "Slot pipeline %s ready for simulate (state=%s)",
+                    target,
+                    last_state,
                 )
 
         # Logstash is healthy - forward immediately with retry logic
@@ -1561,10 +2110,88 @@ async def delete_pipeline(pipeline_id: str = FastAPIPath(..., description="Pipel
     return {"acknowledged": True}
 
 
+def _ms_since(start: float) -> int:
+    """Elapsed milliseconds since ``start`` (from time.perf_counter())."""
+    return int(round((time.perf_counter() - start) * 1000))
+
+
+async def _adaptive_bus_settle(
+    pipeline_name: str,
+    min_seconds: float = 1.25,
+    max_seconds: float = 3.0,
+    poll_seconds: float = 0.25,
+) -> None:
+    """
+    Post-verify settle until the pipeline-to-pipeline bus address is usable.
+
+    Logstash can list a pipeline as loaded/idle before ``pipeline { send_to => … }``
+    destinations are registered on the bus. simulate-start then logs:
+      Attempted to send event to 'slotN-filter1' but that address was unavailable
+
+    Require the pipeline to be present and in idle/running for at least
+    ``min_seconds`` continuously (reset if it drops), up to ``max_seconds``.
+    """
+    t0 = time.perf_counter()
+    ready_since: float | None = None
+    last_state = "unknown"
+
+    while True:
+        elapsed = time.perf_counter() - t0
+        present = False
+        state = "unknown"
+        try:
+            with LogstashAPI(timeout=2.0) as api:
+                present = pipeline_name in api.list_pipelines()
+                if present:
+                    try:
+                        state = api.detect_pipeline_state(pipeline_name)
+                    except Exception as e:
+                        logger.debug("bus settle detect_pipeline_state: %s", e)
+                        state = "unknown"
+        except Exception as e:
+            logger.debug("bus settle list_pipelines: %s", e)
+            present = False
+            state = "unknown"
+
+        last_state = state
+        bus_ready = present and state in ("idle", "running")
+        if bus_ready:
+            if ready_since is None:
+                ready_since = time.perf_counter()
+            ready_for = time.perf_counter() - ready_since
+            if ready_for >= min_seconds:
+                logger.info(
+                    "bus settle OK for %s after %.0fms (state=%s, stable=%.0fms)",
+                    pipeline_name,
+                    elapsed * 1000,
+                    state,
+                    ready_for * 1000,
+                )
+                return
+        else:
+            ready_since = None
+
+        if elapsed >= max_seconds:
+            logger.warning(
+                "bus settle max %.0fms for %s (present=%s state=%s) — "
+                "simulate may retry send_to until address is up",
+                max_seconds * 1000,
+                pipeline_name,
+                present,
+                last_state,
+            )
+            return
+        await asyncio.sleep(poll_seconds)
+
+
 @app.post("/_logstash/slots/allocate")
 async def allocate_simulation_slot(body: dict[str, Any]):
     """
     Allocate a slot for simulation pipelines.
+
+    Concurrent requests for the same pipeline content hash are single-flighted:
+    followers await the leader and receive the same slot (avoids double-create 500s
+    when the UI aborts/retries or warm-on-hover races with select).
 
     Request body:
     {
@@ -1579,7 +2206,10 @@ async def allocate_simulation_slot(body: dict[str, Any]):
     Returns:
     {
         "slot_id": 1-10,
-        "reused": true/false (whether an existing slot was reused)
+        "reused": true/false (whether an existing slot was reused),
+        "pipeline_count": N,
+        "coalesced": true if this response joined an in-flight allocate,
+        "timings_ms": { ... }
     }
     """
     pipeline_name = body.get('pipeline_name')
@@ -1591,16 +2221,105 @@ async def allocate_simulation_slot(body: dict[str, Any]):
     if not pipelines:
         raise HTTPException(status_code=400, detail="Missing 'pipelines' field or empty pipeline list")
 
-    # Check if a slot with this exact configuration already exists
     content_hash = slots._compute_pipeline_hash(pipelines)
+
+    # Single-flight: one leader create/verify per content hash; others join.
+    # If the leader fails, followers retry as leaders (up to 2 more attempts).
+    last_error: Exception | None = None
+    for flight_attempt in range(3):
+        fut, is_leader = await slots.begin_allocate_flight(content_hash)
+        if not is_leader:
+            try:
+                result = await fut
+                if isinstance(result, dict):
+                    out = dict(result)
+                    out["coalesced"] = True
+                    # Joiner always "reuses" the leader's work from the client's POV
+                    out["reused"] = True
+                    if isinstance(out.get("timings_ms"), dict):
+                        out["timings_ms"] = dict(out["timings_ms"])
+                        out["timings_ms"]["path"] = out["timings_ms"].get("path", "pure_reuse")
+                        out["timings_ms"]["coalesced"] = True
+                    logger.info(
+                        "allocate_slot COALESCED slot=%s hash=%s… (joined in-flight)",
+                        out.get("slot_id"),
+                        content_hash[:8],
+                    )
+                    return out
+            except Exception as e:
+                last_error = e if isinstance(e, Exception) else Exception(str(e))
+                logger.warning(
+                    "allocate single-flight leader failed (attempt %s): %s — retrying as leader",
+                    flight_attempt + 1,
+                    e,
+                )
+                continue
+
+        # Leader path
+        try:
+            result = await _allocate_simulation_slot_impl(
+                pipeline_name=pipeline_name,
+                pipelines=pipelines,
+                content_hash=content_hash,
+            )
+            await slots.complete_allocate_flight(content_hash, fut, result=result)
+            return result
+        except Exception as e:
+            last_error = e if isinstance(e, Exception) else Exception(str(e))
+            await slots.complete_allocate_flight(content_hash, fut, error=e)
+            # Only re-raise immediately for client errors; transient 500s may be
+            # retried by the next loop iteration if we re-enter as leader.
+            if isinstance(e, HTTPException) and e.status_code < 500:
+                raise
+            if flight_attempt >= 2:
+                raise
+            logger.warning(
+                "allocate leader failed attempt %s for hash %s…: %s",
+                flight_attempt + 1,
+                content_hash[:8],
+                e,
+            )
+            await asyncio.sleep(0.25 * (flight_attempt + 1))
+            continue
+
+    if last_error:
+        raise last_error
+    raise HTTPException(status_code=500, detail="Failed to allocate slot")
+
+
+async def _allocate_simulation_slot_impl(
+    *,
+    pipeline_name: str,
+    pipelines: list[dict[str, Any]],
+    content_hash: str,
+) -> dict[str, Any]:
+    """Core allocate/create/verify path (runs under single-flight leadership)."""
+    t_total = time.perf_counter()
+    timings_ms: dict[str, Any] = {
+        "total": 0,
+        "hash_lookup": 0,
+        "slot_book": 0,
+        "reuse_probe": 0,
+        "evict_wait": 0,
+        "create": 0,
+        "verify": 0,
+        "settle": 0,
+        "path": "unknown",
+    }
+
+    # Check if a slot with this exact configuration already exists
+    t0 = time.perf_counter()
     existing_slots = slots.get_slot_state()
     slot_existed_before = any(
         slot_data.get('content_hash') == content_hash
         for slot_data in existing_slots.values()
     )
+    timings_ms["hash_lookup"] = _ms_since(t0)
 
     # Allocate or reuse slot (allocate_slot handles hash checking internally)
+    t0 = time.perf_counter()
     slot_id = slots.allocate_slot(pipeline_name, pipelines)
+    timings_ms["slot_book"] = _ms_since(t0)
 
     if slot_id is None:
         raise HTTPException(status_code=500, detail="Failed to allocate slot")
@@ -1610,114 +2329,164 @@ async def allocate_simulation_slot(body: dict[str, Any]):
 
     logger.info(f"Slot {slot_id} - reused: {reused}, hash: {content_hash[:8]}...")
 
-    # Check if pipelines actually exist when reusing a slot
-    # They may have been deleted during previous failure cleanup or eviction
-    pipelines_exist = False
-    if reused:
-        # Check if the first pipeline exists in Logstash using API
+    # Serialize pipeline create/verify per slot (guards hash-mismatch eviction races)
+    create_lock = await slots.get_slot_create_lock(slot_id)
+    async with create_lock:
+        # Re-probe under the lock: a coalesced peer may have finished create
+        pipelines_exist = False
         first_pipeline_name = f"slot{slot_id}-filter1"
+        t0 = time.perf_counter()
         try:
             with LogstashAPI(timeout=3.0) as api:
                 all_pipelines = api.list_pipelines()
                 pipelines_exist = first_pipeline_name in all_pipelines
-                logger.info(f"Slot {slot_id} reused - pipelines exist: {pipelines_exist}")
         except Exception as e:
-            logger.warning(f"Failed to check pipeline existence via API: {e}. Assuming pipelines don't exist.")
-            pipelines_exist = False
-
-    # If this is a new (evicted) slot, wait for old pipeline to disappear from Logstash
-    # before creating the new one. _delete_slot_pipelines runs in a background thread
-    # concurrently with this function, so we must wait or the old pipeline may process
-    # the first simulation event before the new one is loaded.
-    if not reused:
-        first_pipeline_name = f"slot{slot_id}-filter1"
-        max_wait = 30.0
-        start_wait = time.time()
-        logger.info(f"Waiting for old pipeline {first_pipeline_name} to be removed before creating new one...")
-        while time.time() - start_wait < max_wait:
-            try:
-                with LogstashAPI(timeout=3.0) as api:
-                    all_pipelines = api.list_pipelines()
-                    if first_pipeline_name not in all_pipelines:
-                        logger.info(f"Old pipeline {first_pipeline_name} is gone, proceeding with new pipeline creation")
-                        break
-            except Exception as e:
-                logger.warning(f"Error checking pipeline removal: {e}")
-            await asyncio.sleep(0.5)
-        else:
-            # Force-delete stale pipeline so create does not race with a hung delete
             logger.warning(
-                "Old pipeline %s still present after %.0fs — forcing delete",
+                "Failed to check pipeline existence via API: %s. Assuming pipelines don't exist.",
+                e,
+            )
+            pipelines_exist = False
+        timings_ms["reuse_probe"] = _ms_since(t0)
+        if reused:
+            logger.info(
+                "Slot %s reused - pipelines exist: %s",
+                slot_id,
+                pipelines_exist,
+            )
+
+        # If this is a new (evicted) slot, wait for old pipeline to disappear from Logstash
+        # before creating the new one. Empty slots: first check usually finds nothing.
+        if not reused and not pipelines_exist:
+            t0 = time.perf_counter()
+            max_wait = 15.0
+            poll_s = 0.25
+            start_wait = time.time()
+            logger.info(
+                "Waiting for old pipeline %s to be removed before creating new one...",
                 first_pipeline_name,
-                max_wait,
             )
+            while time.time() - start_wait < max_wait:
+                try:
+                    with LogstashAPI(timeout=3.0) as api:
+                        all_pipelines = api.list_pipelines()
+                        if first_pipeline_name not in all_pipelines:
+                            logger.info(
+                                "Old pipeline %s is gone (%.2fs), proceeding with create",
+                                first_pipeline_name,
+                                time.time() - start_wait,
+                            )
+                            break
+                except Exception as e:
+                    logger.warning(f"Error checking pipeline removal: {e}")
+                await asyncio.sleep(poll_s)
+            else:
+                logger.warning(
+                    "Old pipeline %s still present after %.0fs — forcing delete",
+                    first_pipeline_name,
+                    max_wait,
+                )
+                try:
+                    delete_pipeline_internal(first_pipeline_name)
+                    await asyncio.sleep(0.5)
+                except Exception as e:
+                    logger.warning("Force-delete %s failed: %s", first_pipeline_name, e)
+            timings_ms["evict_wait"] = _ms_since(t0)
+
+        # Create pipelines if they don't exist (new slot or reused slot with deleted pipelines)
+        created_or_rebuilt = False
+        if not pipelines_exist:
+            created_or_rebuilt = True
             try:
-                delete_pipeline_internal(first_pipeline_name)
-                await asyncio.sleep(1.0)
+                create_timings = await _create_slot_pipelines(slot_id, pipelines)
+                timings_ms["create"] = int(create_timings.get("create_ms", 0))
+                timings_ms["verify"] = int(create_timings.get("verify_ms", 0))
+            except HTTPException:
+                # Only release if we still own this hash (don't wipe a peer's success)
+                slots.release_slot_if_hash(slot_id, content_hash)
+                timings_ms["total"] = _ms_since(t_total)
+                logger.error(
+                    "allocate_slot FAILED slot=%s reused=%s hash=%s timings_ms=%s",
+                    slot_id,
+                    reused,
+                    content_hash[:8],
+                    timings_ms,
+                )
+                raise
             except Exception as e:
-                logger.warning("Force-delete %s failed: %s", first_pipeline_name, e)
+                slots.release_slot_if_hash(slot_id, content_hash)
+                timings_ms["total"] = _ms_since(t_total)
+                logger.error(
+                    "allocate_slot FAILED slot=%s reused=%s hash=%s timings_ms=%s err=%s",
+                    slot_id,
+                    reused,
+                    content_hash[:8],
+                    timings_ms,
+                    e,
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "message": f"Failed to create slot pipelines: {e!s}",
+                        "slot_id": slot_id,
+                        "timings_ms": timings_ms,
+                    }
+                )
+        else:
+            # Another request (or prior run) already has pipelines loaded
+            if reused:
+                logger.info(
+                    "Slot %s pipelines already present under create lock — skip create",
+                    slot_id,
+                )
 
-    # Create pipelines if they don't exist (new slot or reused slot with deleted pipelines)
-    created_or_rebuilt = False
-    if not reused or not pipelines_exist:
-        created_or_rebuilt = True
-        try:
-            await _create_slot_pipelines(slot_id, pipelines)
-        except HTTPException:
-            # Release the slot if pipeline creation fails
-            slots.release_slot(slot_id)
-            # Re-raise HTTPException as-is to preserve detail structure (may contain slot_id dict)
-            raise
-        except Exception as e:
-            # Release the slot if pipeline creation fails
-            slots.release_slot(slot_id)
-            # For non-HTTP exceptions, include slot_id in detail for error tracking
-            raise HTTPException(
-                status_code=500,
-                detail={
-                    "message": f"Failed to create slot pipelines: {e!s}",
-                    "slot_id": slot_id
-                }
-            )
-
-    # Pipeline API "running" is not enough: the pipeline-to-pipeline bus address
-    # (slotN-filter1) can lag a beat after create. Pure reuse of an already-running
-    # pipeline skips the settle sleep so page-load warm / Run stay snappy.
+    # After create+verify the pipeline is loaded; pipeline-to-pipeline bus can lag
+    # briefly. Adaptive settle: short min hold while pipeline remains listed, cap
+    # max (was fixed 1.5s). Pure reuse skips settle entirely.
     if created_or_rebuilt:
-        await asyncio.sleep(1.5)
+        timings_ms["path"] = "rebuild" if reused else "new"
+        t0 = time.perf_counter()
         first_pipeline_name = f"slot{slot_id}-filter1"
-        try:
-            with LogstashAPI(timeout=3.0) as api:
-                all_pipelines = api.list_pipelines()
-                if first_pipeline_name not in all_pipelines:
-                    logger.warning(
-                        "Slot pipeline %s not listed after create+settle; UI may race",
-                        first_pipeline_name,
-                    )
-        except Exception as e:
-            logger.debug("Post-allocate pipeline list check: %s", e)
+        await _adaptive_bus_settle(first_pipeline_name)
+        timings_ms["settle"] = _ms_since(t0)
     else:
+        timings_ms["path"] = "pure_reuse"
         logger.info(
             "Slot %s pure reuse (pipelines already running) — skip bus settle wait",
             slot_id,
         )
 
-    logger.info(f"Returning HTTP response for slot {slot_id}")
+    timings_ms["total"] = _ms_since(t_total)
+    logger.info(
+        "allocate_slot OK slot=%s reused=%s path=%s hash=%s pipelines=%s timings_ms=%s",
+        slot_id,
+        reused,
+        timings_ms["path"],
+        content_hash[:8],
+        len(pipelines),
+        timings_ms,
+    )
     return {
         "slot_id": slot_id,
         "reused": reused,
-        "pipeline_count": len(pipelines)
+        "pipeline_count": len(pipelines),
+        "coalesced": False,
+        "timings_ms": timings_ms,
+        "content_hash_prefix": content_hash[:8],
     }
 
 
-async def _create_slot_pipelines(slot_id: int, pipelines: list[dict[str, Any]]):
+async def _create_slot_pipelines(slot_id: int, pipelines: list[dict[str, Any]]) -> dict[str, int]:
     """
     Create the filter pipelines for a specific slot.
 
     Args:
         slot_id: Slot ID (1-10)
         pipelines: List of pipeline configurations
+
+    Returns:
+        Timing breakdown in ms: create_ms (put_pipeline writes), verify_ms (load poll).
     """
+    t_create = time.perf_counter()
     for pipeline_data in pipelines:
         idx = pipeline_data.get('index', 1)
         filter_config = pipeline_data.get('filter_config', '')
@@ -1763,15 +2532,24 @@ output {{
         # Use the existing put_pipeline logic
         await put_pipeline(pipeline_name, pipeline_body)
 
-    # Verify all slot pipelines loaded successfully
-    # Uses adaptive timing based on pipeline count (default: 20 retries, 2s delay)
-    verify_start = time.time()
+    create_ms = _ms_since(t_create)
+
+    # Verify all slot pipelines loaded successfully (fast poll + short idle stability)
+    t_verify = time.perf_counter()
     verification_success = await slots.verify_slot_pipelines_loaded(
         slot_id,
-        len(pipelines)
+        len(pipelines),
+        max_wait_seconds=15.0,
+        poll_interval=0.25,
     )
-    verify_end = time.time()
-    logger.info(f"Verification completed in {verify_end - verify_start:.2f}s")
+    verify_ms = _ms_since(t_verify)
+    logger.info(
+        "Slot %s create+verify: create_ms=%s verify_ms=%s success=%s",
+        slot_id,
+        create_ms,
+        verify_ms,
+        verification_success,
+    )
 
     if not verification_success:
         # Delete the failed pipelines from Logstash to prevent log pollution
@@ -1809,9 +2587,12 @@ output {{
             status_code=500,
             detail={
                 "message": f"Slot {slot_id} pipelines created but failed to load in Logstash. Check logs for errors.",
-                "slot_id": slot_id
+                "slot_id": slot_id,
+                "timings_ms": {"create_ms": create_ms, "verify_ms": verify_ms},
             }
         )
+
+    return {"create_ms": create_ms, "verify_ms": verify_ms}
 
 
 @app.get("/_logstash/slots")
@@ -1822,13 +2603,21 @@ async def get_slots():
 
 @app.delete("/_logstash/slots/{slot_id}")
 async def release_slot(slot_id: int = FastAPIPath(..., description="Slot ID", ge=1, le=10)):
-    """Release a specific slot."""
-    success = slots.release_slot(slot_id)
+    """
+    Release a specific slot and remove its named Logstash pipelines
+    (``slotN-filter*`` from pipelines.yml / conf.d so the bus address goes away).
+    """
+    # Always attempt pipeline cleanup; 404 only if slot was unknown *and* nothing to clean
+    existed = slots.release_slot(slot_id, cleanup_pipelines=True)
+    if not existed:
+        # Orphan cleanup still ran inside release_slot; report soft success so callers
+        # that retry delete do not error — bus address should be cleared either way.
+        logger.info(
+            "DELETE slot %s: not in slot table; orphan pipeline cleanup still attempted",
+            slot_id,
+        )
 
-    if not success:
-        raise HTTPException(status_code=404, detail=f"Slot {slot_id} not found")
-
-    return {"acknowledged": True, "slot_id": slot_id}
+    return {"acknowledged": True, "slot_id": slot_id, "existed": existed}
 
 
 @app.get("/_logstash/pipeline/{pipeline_id}/logs")

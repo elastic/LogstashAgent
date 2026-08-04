@@ -531,6 +531,130 @@ def find_related_logs(pipeline_id: str, log_dir: str = LOG_DIR,
     return related_logs
 
 
+# Pipeline-to-pipeline bus: simulate-start send_to => "slotN-filterM".
+# When the destination is missing/stopping, AbstractPipelineBus WARNs and
+# retries forever — API health stays green; only a Logstash restart (or the
+# destination coming back) clears stuck workers.
+_BUS_UNAVAILABLE_RE = re.compile(
+    r"Attempted to send event to '([^']+)' but that address was unavailable",
+    re.IGNORECASE,
+)
+_BUS_UNAVAILABLE_SUBSTR = "address was unavailable"
+
+
+def extract_pipeline_bus_unavailable_destination(message: str) -> Optional[str]:
+    """
+    Parse destination pipeline id from an AbstractPipelineBus WARN message.
+
+    Example message::
+
+        Attempted to send event to 'slot1-filter1' but that address was
+        unavailable. Maybe the destination pipeline is down or stopping?
+        Will Retry.
+    """
+    if not message or not isinstance(message, str):
+        return None
+    if _BUS_UNAVAILABLE_SUBSTR not in message.lower():
+        return None
+    match = _BUS_UNAVAILABLE_RE.search(message)
+    if not match:
+        return None
+    dest = (match.group(1) or "").strip()
+    return dest or None
+
+
+def detect_pipeline_bus_retry_storms(
+    log_dir: str = LOG_DIR,
+    *,
+    window_seconds: float = 30.0,
+    min_count: int = 15,
+    max_lines: int = 3000,
+    now_ms: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Detect sustained pipeline-bus ``send_to`` retry loops in recent logs.
+
+    Brief blips during cold allocate (destination not on the bus yet) are
+    normal. A *storm* — many identical WARNs for the same destination within
+    ``window_seconds`` (default 15 in 30s) — means workers are stuck retrying
+    and will not clear until the destination registers or Logstash restarts.
+
+    Callers (simulate watchdog) layer consecutive confirmations on top of this
+    before restarting a simulate instance.
+
+    Returns:
+        List of storm dicts (one per destination), sorted by count desc::
+
+            {
+              "destination": "slot1-filter1",
+              "count": 15,
+              "first_ms": 1785806651040,
+              "last_ms": 1785806665040,
+              "span_seconds": 14.0,
+              "source_pipeline": "simulate-start",  # when present on log lines
+            }
+    """
+    if window_seconds <= 0 or min_count <= 0:
+        return []
+
+    logs = _read_json_logs(log_dir=log_dir, max_lines=max_lines, reverse=True)
+    if not logs:
+        return []
+
+    if now_ms is None:
+        # Prefer wall clock so empty/stale clocks still work; fall back to newest log ts
+        now_ms = int(_time.time() * 1000)
+        newest = max((e.get("timeMillis") or 0) for e in logs)
+        # If logs are from a far-future/past clock skew test, anchor to log time
+        if newest and abs(newest - now_ms) > 3600_000:
+            now_ms = newest
+
+    window_ms = int(window_seconds * 1000)
+    cutoff = now_ms - window_ms
+
+    # destination -> list of (ts, source_pipeline)
+    by_dest: Dict[str, List[tuple]] = {}
+    for entry in logs:
+        ts = entry.get("timeMillis") or 0
+        if ts and ts < cutoff:
+            continue
+        log_event = entry.get("logEvent") or {}
+        if not isinstance(log_event, dict):
+            continue
+        message = log_event.get("message") or ""
+        dest = extract_pipeline_bus_unavailable_destination(message)
+        if not dest:
+            continue
+        source = entry.get("pipeline.id") or None
+        by_dest.setdefault(dest, []).append((ts or now_ms, source))
+
+    storms: List[Dict[str, Any]] = []
+    for dest, hits in by_dest.items():
+        if len(hits) < min_count:
+            continue
+        timestamps = [h[0] for h in hits]
+        first_ms = min(timestamps)
+        last_ms = max(timestamps)
+        sources = [h[1] for h in hits if h[1]]
+        # Most common source pipeline id (usually simulate-start)
+        source_pipeline = None
+        if sources:
+            source_pipeline = max(set(sources), key=sources.count)
+        storms.append(
+            {
+                "destination": dest,
+                "count": len(hits),
+                "first_ms": first_ms,
+                "last_ms": last_ms,
+                "span_seconds": max(0.0, (last_ms - first_ms) / 1000.0),
+                "source_pipeline": source_pipeline,
+            }
+        )
+
+    storms.sort(key=lambda s: (-s["count"], s["destination"]))
+    return storms
+
+
 # Process-level shutdown keywords — only messages emitted by the Logstash
 # process itself as it exits. Pipeline-level messages ("Pipeline terminated",
 # "Stopping all pipelines") are intentionally excluded: they fire on config
