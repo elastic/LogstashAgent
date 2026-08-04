@@ -226,3 +226,4 @@ CODEBASE_ANALYSIS.md
 *.tar.gz
 LogstashAgent.tar.gz
 src/logstashagent/data/
+src/logstashagent/data/state.json
