@@ -14,6 +14,42 @@ def _line(obj: dict) -> str:
     return json.dumps(obj) + "\n"
 
 
+class TestResolveLogstashLogDir:
+    """Multi-instance agents must not default to /var/log/logstash blindly."""
+
+    def test_prefers_yml_logstash_log_path(self):
+        path = log_analyzer.resolve_logstash_log_dir(
+            logstash_log_path="/opt/logstash-agent/simulate-1/logs/",
+            logs_path="/ignored",
+            env={"LOGSTASH_PATH_LOGS": "/also-ignored"},
+        )
+        assert path == "/opt/logstash-agent/simulate-1/logs"
+
+    def test_falls_back_to_state_logs_path(self):
+        path = log_analyzer.resolve_logstash_log_dir(
+            logstash_log_path=None,
+            logs_path="/opt/logstash-agent/managed-2/logs",
+            env={},
+        )
+        assert path == "/opt/logstash-agent/managed-2/logs"
+
+    def test_falls_back_to_env_path_logs(self):
+        path = log_analyzer.resolve_logstash_log_dir(
+            logstash_log_path="",
+            logs_path=None,
+            env={"LOGSTASH_PATH_LOGS": "/opt/logstash-agent/simulate-3/logs"},
+        )
+        assert path == "/opt/logstash-agent/simulate-3/logs"
+
+    def test_package_default(self):
+        path = log_analyzer.resolve_logstash_log_dir(
+            logstash_log_path=None,
+            logs_path=None,
+            env={},
+        )
+        assert path == log_analyzer.LOG_DIR
+
+
 class TestReadJsonLogs:
     """Tests for _read_json_logs using a temporary log directory."""
 

@@ -21,7 +21,9 @@ def test_default_state_dir_is_package_local():
     # Clear env override that may leak from other tests
     os.environ.pop("LOGSTASH_AGENT_STATE_DIR", None)
     resolved = agent_state.resolve_state_dir([])
-    if os.path.exists("/var/lib/logstash-agent"):
+    if os.path.isdir("/opt/logstash-agent/state"):
+        assert resolved == Path("/opt/logstash-agent/state")
+    elif os.path.isdir("/var/lib/logstash-agent"):
         assert resolved == Path("/var/lib/logstash-agent")
     else:
         expected = Path(agent_state.__file__).resolve().parent / "data"
@@ -73,7 +75,7 @@ class TestGetOrCreateAgentId:
     def test_regenerates_when_file_has_no_agent_id(self, isolated_state):
         f = isolated_state["state_file"]
         f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_text(json.dumps({"other": "value"}), encoding="utf-8")
+        f.write_text(json.dumps({"other": "value", "enrolled": True}), encoding="utf-8")
         fixed = "99999999-aaaa-bbbb-cccc-dddddddddddd"
 
         with patch.object(agent_state.uuid, "uuid4", return_value=MagicMock(__str__=lambda _: fixed)):
@@ -82,6 +84,9 @@ class TestGetOrCreateAgentId:
         assert result == fixed
         data = json.loads(f.read_text(encoding="utf-8"))
         assert data["agent_id"] == fixed
+        # Must not wipe existing enrollment fields when injecting agent_id
+        assert data["other"] == "value"
+        assert data["enrolled"] is True
 
     def test_regenerates_on_invalid_json(self, isolated_state):
         f = isolated_state["state_file"]

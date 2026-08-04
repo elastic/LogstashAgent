@@ -5,8 +5,9 @@
 """
 Host install registry — tracks package install + multi-instance deployments.
 
-Stored at ``/var/lib/logstash-agent/install-registry.json`` so uninstall can
-stop the right units and (with --purge) remove managed-/simulate- trees.
+Stored at ``/opt/logstash-agent/state/install-registry.json`` so uninstall can
+stop the right units and remove managed-/simulate- trees (per-instance or
+``--purge`` for a full wipe).
 """
 
 from __future__ import annotations
@@ -41,7 +42,7 @@ def registry_path(state_dir: Optional[str] = None) -> Path:
 
             state_dir = INSTALL_PATHS["state_dir"]
         except Exception:
-            state_dir = "/var/lib/logstash-agent"
+            state_dir = "/opt/logstash-agent/state"
     return Path(state_dir) / REGISTRY_FILENAME
 
 
@@ -326,8 +327,11 @@ def format_instances_table(instances: list[dict[str, Any]]) -> str:
         )
     lines.append("")
     lines.append("Day-2: sudo systemctl status <AGENT UNIT>   # or logstash-agent-ctl status …")
-    lines.append("State: packaged → /var/lib/logstash-agent ; multi → {path}/state")
-    lines.append("Config: packaged → /etc/logstash-agent/logstash-agent.yml ; multi → {path}/logstash-agent.yml")
+    lines.append("Remove one role:  sudo logstash-agent uninstall --instance <ID>")
+    lines.append("  e.g. sudo logstash-agent uninstall --instance simulate-1")
+    lines.append("State: packaged → /opt/logstash-agent/state ; multi → {path}/state")
+    lines.append("Config: packaged → /opt/logstash-agent/config/logstash-agent.yml ; multi → {path}/logstash-agent.yml")
+    lines.append("Logs:   packaged → /opt/logstash-agent/logs")
     return "\n".join(lines)
 
 
@@ -337,14 +341,24 @@ def stop_disable_unit(unit: str) -> None:
         return
     import subprocess
 
+    try:
+        from logstashagent.installer import host_subprocess_env, _systemctl_bin
+
+        env = host_subprocess_env()
+        systemctl = _systemctl_bin()
+    except Exception:
+        env = None
+        systemctl = "systemctl"
+
     for action in ("stop", "disable"):
         try:
             subprocess.run(
-                ["systemctl", action, unit],
+                [systemctl, action, unit],
                 check=False,
                 capture_output=True,
                 text=True,
                 timeout=60,
+                env=env,
             )
         except Exception as e:
             logger.warning("systemctl %s %s failed: %s", action, unit, e)

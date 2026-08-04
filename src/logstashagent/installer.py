@@ -2,6 +2,7 @@
 #or more contributor license agreements. Licensed under the Elastic License;
 #you may not use this file except in compliance with the Elastic License.
 
+import json
 import logging
 import os
 import re
@@ -21,23 +22,38 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# All agent-owned data lives under /opt/logstash-agent.
+# The only intentional runtime path outside that tree is the CLI symlink
+# (/usr/local/bin/logstash-agent). Systemd unit files and sudoers must remain
+# under /etc (systemd/sudo requirements).
+OPT_ROOT = '/opt/logstash-agent'
+
 INSTALL_PATHS = {
-    'binary_dir': '/opt/logstash-agent/bin',
-    'binary': '/opt/logstash-agent/bin/logstash-agent',
+    'opt_root': OPT_ROOT,
+    'binary_dir': f'{OPT_ROOT}/bin',
+    'binary': f'{OPT_ROOT}/bin/logstash-agent',
     'symlink': '/usr/local/bin/logstash-agent',
     # Validated systemctl wrapper (sudo-rs compatible — no wildcards in sudoers args)
-    'systemctl_ctl': '/opt/logstash-agent/bin/logstash-agent-ctl',
-    'config_dir': '/etc/logstash-agent',
-    'state_dir': '/var/lib/logstash-agent',
-    'log_dir': '/var/log/logstash-agent',
-    'cache_dir': '/var/cache/logstash-agent',
+    'systemctl_ctl': f'{OPT_ROOT}/bin/logstash-agent-ctl',
+    'config_dir': f'{OPT_ROOT}/config',
+    'state_dir': f'{OPT_ROOT}/state',
+    'log_dir': f'{OPT_ROOT}/logs',
+    'cache_dir': f'{OPT_ROOT}/cache',
+    'simulate_root': OPT_ROOT,
     'systemd_service': '/etc/systemd/system/logstash-agent.service',
-    'simulate_root': '/opt/logstash-agent',
     'lsagent_simulate_unit': '/etc/systemd/system/lsagent-simulate@.service',
     'ls_simulate_unit': '/etc/systemd/system/ls-simulate@.service',
     # Managed multi-instance (agent-owned Logstash trees)
     'logstash_agent_template_unit': '/etc/systemd/system/logstash-agent@.service',
     'logstash_managed_unit': '/etc/systemd/system/logstash-managed@.service',
+}
+
+# Pre-consolidation FHS paths — read/migrate, never write for new installs
+LEGACY_INSTALL_PATHS = {
+    'config_dir': '/etc/logstash-agent',
+    'state_dir': '/var/lib/logstash-agent',
+    'log_dir': '/var/log/logstash-agent',
+    'cache_dir': '/var/cache/logstash-agent',
 }
 
 # Legacy root from early simulate work — never recreate; rewrite inbound policy paths
@@ -83,14 +99,28 @@ if ! echo "$UNIT" | grep -Eq '^(logstash|logstash-agent|((ls-simulate|lsagent-si
   echo "logstash-agent-ctl: disallowed unit: $UNIT" >&2
   exit 2
 fi
-SYSTEMCTL="$(command -v systemctl 2>/dev/null || true)"
-if [ -z "$SYSTEMCTL" ]; then
-  if [ -x /usr/bin/systemctl ]; then
-    SYSTEMCTL=/usr/bin/systemctl
-  else
-    echo "logstash-agent-ctl: systemctl not found" >&2
-    exit 127
+# Drop PyInstaller/frozen LD_LIBRARY_PATH so host systemctl uses distro OpenSSL
+# (bundled libcrypto under _internal breaks systemd linked to OPENSSL_3.4+).
+unset LD_LIBRARY_PATH
+unset DYLD_LIBRARY_PATH
+unset DYLD_FALLBACK_LIBRARY_PATH
+if [ -n "${LD_LIBRARY_PATH_ORIG+x}" ]; then
+  if [ -n "$LD_LIBRARY_PATH_ORIG" ]; then
+    export LD_LIBRARY_PATH="$LD_LIBRARY_PATH_ORIG"
   fi
+  unset LD_LIBRARY_PATH_ORIG
+fi
+SYSTEMCTL=""
+if [ -x /usr/bin/systemctl ]; then
+  SYSTEMCTL=/usr/bin/systemctl
+elif [ -x /bin/systemctl ]; then
+  SYSTEMCTL=/bin/systemctl
+else
+  SYSTEMCTL="$(command -v systemctl 2>/dev/null || true)"
+fi
+if [ -z "$SYSTEMCTL" ]; then
+  echo "logstash-agent-ctl: systemctl not found" >&2
+  exit 127
 fi
 exec "$SYSTEMCTL" "$ACTION" "$UNIT"
 '''
@@ -161,7 +191,7 @@ Type=simple
 {user_lines}ExecStart=/opt/logstash-agent/bin/logstash-agent --run
 Restart=always
 RestartSec=10
-WorkingDirectory=/var/lib/logstash-agent
+WorkingDirectory=/opt/logstash-agent/state
 StandardOutput=journal
 StandardError=journal
 
@@ -232,7 +262,7 @@ def verify_logstash_installed() -> bool:
         logger.warning("   Installation will continue, but LogstashAgent will NOT be")
         logger.warning("   functional until Logstash is installed.")
         logger.warning("   After installing Logstash, update the paths in")
-        logger.warning("   /etc/logstash-agent/logstash-agent.yml and restart the service.")
+        logger.warning("   /opt/logstash-agent/config/logstash-agent.yml and restart the service.")
         return False
 
     logger.info("✓ Logstash installation verified")
@@ -257,11 +287,48 @@ def get_logstash_uid_gid():
         return 0, 0
 
 
+def migrate_legacy_fhs_paths() -> None:
+    """
+    One-time best-effort move of pre-consolidation dirs into /opt/logstash-agent.
+
+    Old layout used /etc, /var/lib, /var/log, /var/cache. New installs never
+    create those; upgrades copy content when the new location is empty.
+    """
+    for key, legacy in LEGACY_INSTALL_PATHS.items():
+        new = INSTALL_PATHS[key]
+        if not os.path.isdir(legacy):
+            continue
+        if os.path.isdir(new) and os.listdir(new):
+            logger.info(
+                "Legacy %s present but %s already populated — leaving legacy in place",
+                legacy,
+                new,
+            )
+            continue
+        try:
+            os.makedirs(os.path.dirname(new), mode=0o755, exist_ok=True)
+            if os.path.isdir(new) and not os.listdir(new):
+                os.rmdir(new)
+            shutil.move(legacy, new)
+            logger.info("✓ Migrated %s → %s", legacy, new)
+        except OSError as e:
+            try:
+                if not os.path.isdir(new):
+                    shutil.copytree(legacy, new, dirs_exist_ok=True)
+                    logger.info("✓ Copied legacy %s → %s (%s)", legacy, new, e)
+                else:
+                    logger.warning("Could not migrate %s → %s: %s", legacy, new, e)
+            except OSError as e2:
+                logger.warning("Could not migrate %s → %s: %s", legacy, new, e2)
+
+
 def create_directories():
-    """Create all required directories for LogstashAgent"""
-    logger.info("Creating installation directories...")
+    """Create all required directories for LogstashAgent under /opt/logstash-agent."""
+    logger.info("Creating installation directories under %s ...", INSTALL_PATHS['opt_root'])
 
     uid, gid = get_logstash_uid_gid()
+
+    migrate_legacy_fhs_paths()
 
     # Create binary directory (owned by root)
     os.makedirs(INSTALL_PATHS['binary_dir'], mode=0o755, exist_ok=True)
@@ -281,6 +348,20 @@ def create_directories():
     os.makedirs(INSTALL_PATHS['log_dir'], mode=0o755, exist_ok=True)
     os.chown(INSTALL_PATHS['log_dir'], uid, gid)
     logger.info(f"✓ Created {INSTALL_PATHS['log_dir']} (owned by logstash)")
+
+    # VERSION download cache — owned by logstash so Logstash can read its tree
+    versions_dir = os.path.join(INSTALL_PATHS['opt_root'], 'logstash-versions')
+    os.makedirs(versions_dir, mode=0o755, exist_ok=True)
+    try:
+        from logstashagent.logstash_download import chown_tree_to_logstash
+
+        chown_tree_to_logstash(versions_dir)
+    except Exception:
+        try:
+            os.chown(versions_dir, uid, gid)
+        except OSError:
+            pass
+    logger.info(f"✓ Ensured {versions_dir} (owned by logstash)")
 
     # Create cache directory (owned by logstash)
     os.makedirs(INSTALL_PATHS['cache_dir'], mode=0o755, exist_ok=True)
@@ -401,7 +482,7 @@ def write_config_file(
     """
     Write the initial agent config file (packaged / managed / simulate).
 
-    Packaged → ``/etc/logstash-agent/logstash-agent.yml`` (shared host default).
+    Packaged → ``/opt/logstash-agent/config/logstash-agent.yml`` (shared host default).
     Multi-instance → ``{path_root}/logstash-agent.yml`` so it does not clobber
     packaged config when roles coexist on one host.
 
@@ -586,10 +667,7 @@ def install_multi_instance_unit_templates() -> None:
         logger.info(f"✓ Installed {dest}")
 
     try:
-        subprocess.run(
-            ['systemctl', 'daemon-reload'],
-            check=True, capture_output=True, text=True,
-        )
+        _systemctl_cmd('daemon-reload', check=True)
         logger.info("✓ Reloaded systemd daemon")
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         logger.warning(f"daemon-reload failed (non-fatal): {e}")
@@ -598,6 +676,67 @@ def install_multi_instance_unit_templates() -> None:
 def install_simulate_unit_templates() -> None:
     """Backward-compatible alias for install_multi_instance_unit_templates()."""
     install_multi_instance_unit_templates()
+
+
+def _materialize_instance_logstash_yml(
+    template: str,
+    logstash_api_port: int,
+    *,
+    instance_id: int | None = None,
+) -> str:
+    """
+    Rewrite Logstash yml so api.http.port matches *logstash_api_port*.
+
+    Handles nested UI editor form (api.http.port) and flat api.http.port keys.
+    Also expands ``{instance_id}`` path placeholders.
+    """
+    text = template or ""
+    if instance_id is not None:
+        text = text.replace("{instance_id}", str(instance_id))
+    port = int(logstash_api_port)
+    try:
+        import yaml
+
+        data = yaml.safe_load(text)
+        if isinstance(data, dict):
+            api = data.get("api")
+            if not isinstance(api, dict):
+                api = {}
+                data["api"] = api
+            http = api.get("http")
+            if not isinstance(http, dict):
+                http = {}
+                api["http"] = http
+            http["port"] = port
+            if "host" not in http:
+                http["host"] = "0.0.0.0"
+            if "api.http.port" in data:
+                data["api.http.port"] = port
+            if "http.port" in data:
+                data["http.port"] = port
+            out = yaml.safe_dump(
+                data,
+                default_flow_style=False,
+                sort_keys=False,
+                allow_unicode=True,
+            )
+            return out if out.endswith("\n") else out + "\n"
+    except Exception:
+        pass
+    lines: list[str] = []
+    port_set = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("api.http.port:") or stripped.startswith("http.port:"):
+            lines.append(f"api.http.port: {port}")
+            port_set = True
+        else:
+            lines.append(line)
+    if not port_set:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.append(f"api.http.port: {port}")
+    return "\n".join(lines) + ("\n" if lines else "")
 
 
 def materialize_simulate_instance(policy_config: dict) -> dict:
@@ -664,11 +803,20 @@ def materialize_simulate_instance(policy_config: dict) -> dict:
     agent_env = root / 'agent.env'
     state_dir = root / 'state'
 
-    for d in (settings, config_dir, logs, data, state_dir, settings / 'conf.d', settings / 'config'):
+    # Pipeline .conf files live under settings/config/ (and settings/conf.d/ for
+    # dynamic slots). Logstash is started with --path.settings only; each pipeline
+    # path is listed in settings/pipelines.yml (no CLI --path.config).
+    pipeline_config_dir = settings / 'config'
+    for d in (settings, config_dir, logs, data, state_dir, settings / 'conf.d', pipeline_config_dir):
         d.mkdir(parents=True, exist_ok=True)
         logger.info(f"✓ Ensured directory {d}")
 
-    # Seed config files from policy when provided
+    # Seed config files from policy when provided.
+    # Re-materialize logstash.yml so nested api.http.port matches instance port
+    # even if the UI sent a template with port 9560 / {instance_id} paths.
+    ls_port_for_yml = policy_config.get('logstash_api_port')
+    if ls_port_for_yml is None:
+        ls_port_for_yml = (9700 if pt == 'MANAGED' else 9560) + instance_id
     for name, key in (
         ('logstash.yml', 'logstash_yml'),
         ('jvm.options', 'jvm_options'),
@@ -676,6 +824,10 @@ def materialize_simulate_instance(policy_config: dict) -> dict:
     ):
         content = policy_config.get(key)
         if content:
+            if key == 'logstash_yml':
+                content = _materialize_instance_logstash_yml(
+                    content, int(ls_port_for_yml), instance_id=instance_id
+                )
             target = settings / name
             target.write_text(content if content.endswith('\n') else content + '\n', encoding='utf-8')
             logger.info(f"✓ Wrote {target}")
@@ -688,11 +840,12 @@ def materialize_simulate_instance(policy_config: dict) -> dict:
 
             seed = simulate_recovery.seed_static_harness(settings, force=False)
             if seed.get('ok'):
-                if not (settings / 'pipelines.yml').is_file():
-                    simulate_recovery.write_bare_pipelines_yml(settings)
-                    logger.info("✓ Wrote bare simulate pipelines.yml (harness only)")
-                else:
-                    logger.info("✓ Simulate harness confs ready (pipelines.yml already present)")
+                # Always (re)write bare pipelines.yml so path.config entries match seed location
+                simulate_recovery.write_bare_pipelines_yml(settings)
+                logger.info(
+                    "✓ Wrote bare simulate pipelines.yml (harness confs under %s)",
+                    pipeline_config_dir,
+                )
             else:
                 logger.warning(
                     "Could not seed full simulate harness: %s",
@@ -733,22 +886,55 @@ def materialize_simulate_instance(policy_config: dict) -> dict:
         logstash_unit = policy_config.get('logstash_unit') or f'ls-simulate@{instance_id}'
 
     # EnvironmentFile for logstash-managed@N / ls-simulate@N
+    # Only path.settings (+ logs/data) are passed to Logstash. Pipeline conf
+    # locations are exclusively in settings/pipelines.yml.
+    # LOGSTASH_URL: base for simulate_start/end StreamSimulate HTTP outputs
+    # (must be real UI URL on host simulate — not host.docker.internal:8080).
+    stream_base = (
+        (policy_config.get('logstash_ui_url') or '').strip()
+        or (os.environ.get('LOGSTASH_URL') or '').strip()
+        or (os.environ.get('LOGSTASH_UI_URL') or '').strip()
+    )
+    if not stream_base:
+        try:
+            from logstashagent import agent_state as _as_env
+
+            stream_base = (_as_env.get_state() or {}).get('logstash_ui_url') or ''
+        except Exception:
+            stream_base = ''
+    stream_base = str(stream_base).rstrip('/')
+
     env_lines = [
         f"LOGSTASH_BINARY={binary}",
         f"LOGSTASH_PATH_SETTINGS={settings}",
-        f"LOGSTASH_PATH_CONFIG={config_dir}",
         f"LOGSTASH_PATH_LOGS={logs}",
         f"LOGSTASH_PATH_DATA={data}",
         # LOGSTASH_KEYSTORE_PASS added later when keystore password is set
     ]
-    # Preserve existing keystore pass if re-materializing
+    if stream_base:
+        env_lines.append(f"LOGSTASH_URL={stream_base}")
+        env_lines.append(f"LOGSTASH_UI_URL={stream_base}")
+    # Preserve existing keystore pass / URL if re-materializing
     if env_file.exists():
         for line in env_file.read_text(encoding='utf-8').splitlines():
             if line.startswith('LOGSTASH_KEYSTORE_PASS='):
                 env_lines.append(line)
+            elif line.startswith('LOGSTASH_URL=') and not stream_base:
+                env_lines.append(line)
+            elif line.startswith('LOGSTASH_UI_URL=') and not stream_base:
+                env_lines.append(line)
     env_file.write_text('\n'.join(env_lines) + '\n', encoding='utf-8')
     os.chmod(env_file, 0o640)
     logger.info(f"✓ Wrote {env_file}")
+    if stream_base:
+        logger.info(f"✓ StreamSimulate base LOGSTASH_URL={stream_base}")
+    elif pt == 'SIMULATE':
+        logger.warning(
+            "LOGSTASH_URL not set in %s — simulate harness will fall back to "
+            "host.docker.internal:8080 (broken on bare metal). Set after enroll "
+            "from logstash_ui_url.",
+            env_file,
+        )
 
     # Per-instance state + config so packaged /var/lib and /etc are not shared
     state_dir_path = str(state_dir)
@@ -792,7 +978,7 @@ def materialize_simulate_instance(policy_config: dict) -> dict:
         'root': str(root),
         'binary': binary,
         'settings_path': str(settings),
-        'config_path': str(config_dir),
+        'config_path': str(pipeline_config_dir),
         'logs_path': str(logs),
         'data_path': str(data),
         'env_file': str(env_file),
@@ -809,12 +995,74 @@ def materialize_simulate_instance(policy_config: dict) -> dict:
     }
 
 
+def host_subprocess_env(base: dict | None = None) -> dict:
+    """
+    Environment for host OS tools (systemctl, restorecon, sudo, …).
+
+    PyInstaller freezes the agent with its own OpenSSL under ``_internal/`` and
+    sets ``LD_LIBRARY_PATH`` so the agent finds those libs. Child processes
+    inherit that path and break distro tools linked against a newer system
+    libcrypto (e.g. systemd requiring OPENSSL_3.4.0)::
+
+        systemctl: …/_internal/libcrypto.so.3: version `OPENSSL_3.4.0' not found
+
+    Strip frozen library paths so host binaries use system libraries.
+    """
+    env = dict(os.environ if base is None else base)
+
+    # Bootloader sometimes preserves the pre-launch path here
+    orig = env.pop('LD_LIBRARY_PATH_ORIG', None)
+    if orig is not None:
+        if orig:
+            env['LD_LIBRARY_PATH'] = orig
+        else:
+            env.pop('LD_LIBRARY_PATH', None)
+    else:
+        env.pop('LD_LIBRARY_PATH', None)
+
+    for key in (
+        'DYLD_LIBRARY_PATH',
+        'DYLD_FALLBACK_LIBRARY_PATH',
+        'DYLD_LIBRARY_PATH_ORIG',
+    ):
+        env.pop(key, None)
+
+    # Drop SSL cert overrides that point into the frozen tree (if any)
+    meipass = getattr(sys, '_MEIPASS', None) or ''
+    frozen_roots: list[str] = []
+    if meipass:
+        frozen_roots.append(str(Path(meipass).resolve()))
+    try:
+        exe_parent = str(Path(sys.executable).resolve().parent)
+        frozen_roots.append(exe_parent)
+        frozen_roots.append(str(Path(exe_parent) / '_internal'))
+    except Exception:
+        pass
+    for key in ('SSL_CERT_FILE', 'SSL_CERT_DIR', 'REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE'):
+        val = env.get(key) or ''
+        if not val or not frozen_roots:
+            continue
+        if any(val.startswith(root) for root in frozen_roots if root):
+            env.pop(key, None)
+
+    return env
+
+
+def _systemctl_bin() -> str:
+    """Absolute path to host systemctl (avoid PATH/library pollution)."""
+    for candidate in ('/usr/bin/systemctl', '/bin/systemctl'):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return 'systemctl'
+
+
 def _systemctl_cmd(*args: str, check: bool = False) -> subprocess.CompletedProcess:
     return subprocess.run(
-        ['systemctl', *args],
+        [_systemctl_bin(), *args],
         check=check,
         capture_output=True,
         text=True,
+        env=host_subprocess_env(),
     )
 
 
@@ -893,19 +1141,40 @@ def resolve_multi_instance_units(
     )
 
 
+def _systemctl_ok(*args: str) -> tuple[bool, str]:
+    """Run systemctl; return (ok, stderr_or_stdout)."""
+    try:
+        r = _systemctl_cmd(*args)
+    except FileNotFoundError:
+        return False, "systemctl not found"
+    detail = (r.stderr or r.stdout or "").strip()
+    return r.returncode == 0, detail
+
+
+def _systemctl_is_enabled(unit: str) -> bool:
+    ok, _ = _systemctl_ok('is-enabled', unit)
+    return ok
+
+
+def _systemctl_is_active(unit: str) -> bool:
+    ok, _ = _systemctl_ok('is-active', unit)
+    return ok
+
+
 def enable_multi_instance_services(
     instance_id: int,
     *,
     agent_unit: str | None = None,
     logstash_unit: str | None = None,
     policy_type: str | None = None,
-) -> None:
+) -> dict:
     """
     Enable multi-instance units and start the agent instance.
 
     Logstash unit is enabled only (not started) so the controller can apply
-    config and restart via logstash-agent-ctl when ready — same live-safety
-    idea as Packaged, even for new instance trees.
+    config and restart via logstash-agent-ctl when ready.
+
+    Returns a status dict. Raises InstallError if enable/start fails.
     """
     agent_unit, ls_unit = resolve_multi_instance_units(
         instance_id,
@@ -913,34 +1182,112 @@ def enable_multi_instance_services(
         agent_unit=agent_unit,
         logstash_unit=logstash_unit,
     )
+    status = {
+        'agent_unit': agent_unit,
+        'logstash_unit': ls_unit,
+        'ls_enabled': False,
+        'agent_enabled': False,
+        'agent_active': False,
+        'errors': [],
+    }
     try:
-        _systemctl_cmd('daemon-reload')
-        _systemctl_cmd('enable', ls_unit)
-        r = _systemctl_cmd('enable', '--now', agent_unit)
-        if r.returncode != 0:
-            _systemctl_cmd('enable', agent_unit)
-            r2 = _systemctl_cmd('start', agent_unit)
-            if r2.returncode != 0:
-                logger.warning(
-                    "Could not start %s: %s",
-                    agent_unit,
-                    (r2.stderr or r.stderr or "").strip(),
-                )
-            else:
-                logger.info("✓ Enabled %s; enabled and started %s", ls_unit, agent_unit)
+        ok, detail = _systemctl_ok('daemon-reload')
+        if not ok:
+            logger.warning("daemon-reload failed (continuing): %s", detail)
+
+        ok, detail = _systemctl_ok('enable', ls_unit)
+        if not ok:
+            ok, detail = _systemctl_ok('enable', f'{ls_unit}.service')
+        if not ok:
+            msg = f"systemctl enable {ls_unit} failed: {detail or 'unknown error'}"
+            status['errors'].append(msg)
+            logger.error(msg)
         else:
-            logger.info("✓ Enabled %s; enabled and started %s", ls_unit, agent_unit)
+            status['ls_enabled'] = _systemctl_is_enabled(ls_unit) or _systemctl_is_enabled(
+                f'{ls_unit}.service'
+            )
+            if status['ls_enabled']:
+                logger.info("✓ Enabled %s (not started)", ls_unit)
+            else:
+                msg = f"systemctl enable {ls_unit} reported success but is-enabled is false"
+                status['errors'].append(msg)
+                logger.error(msg)
+
+        ok, detail = _systemctl_ok('enable', '--now', agent_unit)
+        if not ok:
+            ok_en, detail_en = _systemctl_ok('enable', agent_unit)
+            if not ok_en:
+                ok_en, detail_en = _systemctl_ok('enable', f'{agent_unit}.service')
+            ok_st, detail_st = _systemctl_ok('start', agent_unit)
+            if not ok_st:
+                ok_st, detail_st = _systemctl_ok('start', f'{agent_unit}.service')
+            if not ok_en:
+                msg = f"systemctl enable {agent_unit} failed: {detail_en or detail or 'unknown error'}"
+                status['errors'].append(msg)
+                logger.error(msg)
+            if not ok_st:
+                msg = f"systemctl start {agent_unit} failed: {detail_st or detail or 'unknown error'}"
+                status['errors'].append(msg)
+                logger.error(msg)
+
+        status['agent_enabled'] = _systemctl_is_enabled(agent_unit) or _systemctl_is_enabled(
+            f'{agent_unit}.service'
+        )
+        status['agent_active'] = _systemctl_is_active(agent_unit) or _systemctl_is_active(
+            f'{agent_unit}.service'
+        )
+
+        if status['agent_enabled'] and status['agent_active']:
+            logger.info("✓ Enabled and started %s", agent_unit)
+        elif status['agent_enabled'] and not status['agent_active']:
+            msg = (
+                f"{agent_unit} is enabled but not active "
+                f"(check: journalctl -u {agent_unit} -e)"
+            )
+            status['errors'].append(msg)
+            logger.error(msg)
+        elif not status['agent_enabled']:
+            if not any('enable' in e and agent_unit in e for e in status['errors']):
+                status['errors'].append(f"{agent_unit} is not enabled after systemctl enable")
+            logger.error("%s is not enabled", agent_unit)
+
+        if status['errors']:
+            raise InstallError(
+                "Failed to enable/start multi-instance units:\n  - "
+                + "\n  - ".join(status['errors'])
+                + f"\n\nTemplates may still be installed under /etc/systemd/system/.\n"
+                f"Retry manually:\n"
+                f"  sudo systemctl daemon-reload\n"
+                f"  sudo systemctl enable {ls_unit}\n"
+                f"  sudo systemctl enable --now {agent_unit}\n"
+                f"  sudo systemctl status {agent_unit}"
+            )
+        return status
+    except InstallError:
+        raise
     except FileNotFoundError:
-        logger.warning("systemctl not available — skip enable of multi-instance units")
+        msg = "systemctl not available — cannot enable multi-instance units"
+        logger.error(msg)
+        raise InstallError(msg) from None
 
 
-def enable_simulate_services(instance_id: int) -> None:
+def enable_simulate_services(instance_id: int) -> dict:
     """Backward-compatible simulate-only enable (numeric N)."""
-    enable_multi_instance_services(instance_id, policy_type='SIMULATE')
+    return enable_multi_instance_services(instance_id, policy_type='SIMULATE')
 
 
-def setup_simulate_from_policy(policy_config: dict) -> dict:
-    """Full multi-instance post-enroll setup: templates, tree, enable units."""
+def setup_simulate_from_policy(
+    policy_config: dict,
+    *,
+    start_services: bool = True,
+) -> dict:
+    """
+    Full multi-instance post-enroll setup: templates, tree, optionally enable units.
+
+    ``start_services=False`` is used by ``perform_installation`` so enrollment
+    state can be relocated and ``.secret_key`` ownership fixed *before* the
+    agent unit is started as the logstash user.
+    """
     install_multi_instance_unit_templates()
     result = materialize_simulate_instance(policy_config)
     pt = (policy_config.get('policy_type') or result.get('policy_type') or 'SIMULATE').upper()
@@ -948,12 +1295,23 @@ def setup_simulate_from_policy(policy_config: dict) -> dict:
         pt = 'PACKAGED'
     agent_unit = policy_config.get('agent_unit') or result.get('agent_unit')
     logstash_unit = policy_config.get('logstash_unit') or result.get('logstash_unit')
-    enable_multi_instance_services(
-        result['instance_id'],
-        agent_unit=agent_unit,
-        logstash_unit=logstash_unit,
-        policy_type=pt,
-    )
+    if start_services:
+        svc = enable_multi_instance_services(
+            result['instance_id'],
+            agent_unit=agent_unit,
+            logstash_unit=logstash_unit,
+            policy_type=pt,
+        )
+        result['service_status'] = svc
+        try:
+            from logstashagent.encryption import ensure_secret_key_ownership
+
+            ensure_secret_key_ownership(result.get('state_dir'))
+            ensure_secret_key_ownership(None)
+        except Exception as e:
+            logger.warning("ensure_secret_key_ownership after start: %s", e)
+    else:
+        result['service_status'] = {'deferred': True}
     # Track in host install registry
     try:
         from logstashagent import agent_state as _as
@@ -1306,10 +1664,10 @@ def configure_logstash() -> None:
     # Fix ownership on the agent's own directories.  These may have been created
     # with root:root during installation if the logstash user didn't exist yet.
     for agent_dir in [
-        INSTALL_PATHS['log_dir'],    # /var/log/logstash-agent
-        INSTALL_PATHS['state_dir'],  # /var/lib/logstash-agent
-        INSTALL_PATHS['config_dir'], # /etc/logstash-agent
-        INSTALL_PATHS['cache_dir'],  # /var/cache/logstash-agent
+        INSTALL_PATHS['log_dir'],    # /opt/logstash-agent/logs
+        INSTALL_PATHS['state_dir'],  # /opt/logstash-agent/state
+        INSTALL_PATHS['config_dir'], # /opt/logstash-agent/config
+        INSTALL_PATHS['cache_dir'],  # /opt/logstash-agent/cache
     ]:
         if os.path.exists(agent_dir):
             try:
@@ -1445,8 +1803,7 @@ logstash ALL=(ALL) NOPASSWD: /usr/bin/chmod 640 /etc/default/logstash
             os.chmod(INSTALL_PATHS['systemd_service'], 0o644)
             logger.info("✓ Updated systemd service unit (User=logstash)")
 
-            subprocess.run(['systemctl', 'daemon-reload'],
-                           check=True, capture_output=True, text=True)
+            _systemctl_cmd('daemon-reload', check=True)
             logger.info("✓ Reloaded systemd daemon")
         except Exception as e:
             logger.warning(f"Could not update systemd service: {e}")
@@ -1517,12 +1874,7 @@ def install_systemd_service():
 
     # Reload systemd
     try:
-        _ = subprocess.run(
-            ['systemctl', 'daemon-reload'],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        _ = _systemctl_cmd('daemon-reload', check=True)
         logger.info("✓ Reloaded systemd daemon")
     except subprocess.CalledProcessError as e:
         logger.warning(f"Failed to reload systemd: {e}")
@@ -1564,7 +1916,7 @@ def perform_installation(
                 "\n⚠  Continuing installation without Logstash.\n"
                 "   The agent will be enrolled and the service registered,\n"
                 "   but pipeline management will not work until Logstash is\n"
-                "   installed and /etc/logstash-agent/logstash-agent.yml is\n"
+                "   installed and /opt/logstash-agent/config/logstash-agent.yml is\n"
                 "   updated with the correct binary and settings paths.\n"
             )
 
@@ -1582,7 +1934,7 @@ def perform_installation(
 
         # Host coexistence: if a packaged agent is already registered, protect its
         # state.json before multi-instance enroll writes temporary enrollment state
-        # into /var/lib/logstash-agent.
+        # into /opt/logstash-agent/state.
         from logstashagent import agent_state as _as
         from logstashagent import install_registry as _reg
 
@@ -1630,7 +1982,9 @@ def perform_installation(
             logger.warning("Multi-instance unit templates install: %s", e)
 
         if is_multi:
-            setup_simulate_from_policy(policy_config)
+            # Materialize tree only — do NOT start units until state is relocated
+            # and .secret_key is owned by logstash (service runs as logstash).
+            setup_simulate_from_policy(policy_config, start_services=False)
             # Relocate enrollment state into instance tree; restore packaged state
             path_root = (
                 policy_config.get('path_root')
@@ -1640,7 +1994,8 @@ def perform_installation(
                     else f"{INSTALL_PATHS['simulate_root']}/simulate-{policy_config.get('instance_id')}"
                 )
             )
-            inst_state = Path(normalize_opt_path(path_root)) / 'state'
+            path_root = normalize_opt_path(path_root)
+            inst_state = Path(path_root) / 'state'
             try:
                 # Enrollment wrote into packaged STATE_DIR; move secrets to instance
                 _as.configure_state_dir(INSTALL_PATHS['state_dir'])
@@ -1663,12 +2018,60 @@ def perform_installation(
                     logstash_ui_url,
                     policy_config={
                         **policy_config,
-                        'path_root': normalize_opt_path(path_root),
+                        'path_root': path_root,
                     },
-                    config_path=str(Path(normalize_opt_path(path_root)) / 'logstash-agent.yml'),
+                    config_path=str(Path(path_root) / 'logstash-agent.yml'),
                 )
             except Exception as e:
                 logger.warning("State relocate for multi-instance: %s", e)
+
+            # Fix secret key ownership before the agent unit starts
+            try:
+                from logstashagent.encryption import ensure_secret_key_ownership
+
+                ensure_secret_key_ownership(inst_state)
+                ensure_secret_key_ownership(INSTALL_PATHS['state_dir'])
+            except Exception as e:
+                logger.warning("Pre-start ensure_secret_key_ownership: %s", e)
+
+            # Refuse to start until instance state has enrollment (avoids Offline forever)
+            inst_state_file = Path(inst_state) / 'state.json'
+            try:
+                if not inst_state_file.is_file():
+                    raise InstallError(
+                        f"Instance state missing after enroll relocate: {inst_state_file}"
+                    )
+                with open(inst_state_file, 'r', encoding='utf-8') as fh:
+                    inst_blob = json.load(fh)
+                if not inst_blob.get('enrolled') or not inst_blob.get('api_key'):
+                    raise InstallError(
+                        f"Instance state at {inst_state_file} is not enrolled "
+                        f"(enrolled={inst_blob.get('enrolled')!r}). "
+                        "Enrollment secrets were not relocated; not starting units."
+                    )
+                logger.info(
+                    "✓ Instance enrollment present (connection_id=%s) before unit start",
+                    inst_blob.get('connection_id'),
+                )
+            except InstallError:
+                raise
+            except Exception as e:
+                raise InstallError(
+                    f"Failed to verify enrolled instance state at {inst_state_file}: {e}"
+                ) from e
+
+            # Now enable + start agent (logstash user must be able to read .secret_key)
+            try:
+                enable_multi_instance_services(
+                    int(policy_config.get('instance_id') or 0),
+                    agent_unit=policy_config.get('agent_unit'),
+                    logstash_unit=policy_config.get('logstash_unit'),
+                    policy_type=policy_type,
+                )
+            except InstallError:
+                raise
+            except Exception as e:
+                raise InstallError(f"Failed to enable multi-instance services: {e}") from e
 
             # Do not enable packaged logstash-agent.service for pure multi-instance
             if policy_type == 'MANAGED':
@@ -1690,14 +2093,58 @@ def perform_installation(
         logger.info("\nStep 8: Setting ownership on state files...")
         uid, gid = get_logstash_uid_gid()
 
-        # Find and chown all files in state directory
-        for root, dirs, files in os.walk(INSTALL_PATHS['state_dir']):
-            for d in dirs:
-                os.chown(os.path.join(root, d), uid, gid)
-            for f in files:
-                os.chown(os.path.join(root, f), uid, gid)
+        def _chown_tree(path: str | Path) -> None:
+            path = Path(path)
+            if not path.exists():
+                return
+            for walk_root, dirs, files in os.walk(path):
+                try:
+                    os.chown(walk_root, uid, gid)
+                except OSError:
+                    pass
+                for name in dirs + files:
+                    try:
+                        os.chown(os.path.join(walk_root, name), uid, gid)
+                    except OSError:
+                        pass
+            # Explicitly fix .secret_key under this path and path/state/
+            candidates = []
+            if path.is_dir():
+                candidates.append(path / '.secret_key')
+                candidates.append(path / 'state' / '.secret_key')
+            else:
+                candidates.append(path.parent / '.secret_key')
+            for secret in candidates:
+                if secret.is_file():
+                    try:
+                        os.chown(secret, uid, gid)
+                        os.chmod(secret, 0o600)
+                    except OSError:
+                        pass
 
+        # Packaged state dir
+        _chown_tree(INSTALL_PATHS['state_dir'])
         logger.info(f"✓ Set ownership on {INSTALL_PATHS['state_dir']}")
+
+        # Multi-instance trees (state/.secret_key created after materialize chown)
+        if is_multi:
+            path_root = normalize_opt_path(
+                policy_config.get('path_root')
+                or (
+                    f"{INSTALL_PATHS['simulate_root']}/managed-{policy_config.get('instance_id')}"
+                    if policy_type == 'MANAGED'
+                    else f"{INSTALL_PATHS['simulate_root']}/simulate-{policy_config.get('instance_id')}"
+                )
+            )
+            _chown_tree(path_root)
+            logger.info(f"✓ Set ownership on {path_root} (incl. state/.secret_key)")
+            try:
+                from logstashagent.encryption import ensure_secret_key_ownership
+
+                ensure_secret_key_ownership(Path(path_root) / 'state')
+                ensure_secret_key_ownership(INSTALL_PATHS['state_dir'])
+            except Exception as e:
+                logger.warning("ensure_secret_key_ownership: %s", e)
 
         # Clean up any root-owned log files that may have been created during install
         log_file = os.path.join(INSTALL_PATHS['log_dir'], 'logstashagent.log')
@@ -1723,20 +2170,44 @@ def perform_installation(
             logger.info("\nStep 9: Skipping Logstash configuration (Logstash not installed)")
 
         # Step 10: Final ownership fix for state files
-        # This ensures state.json has correct ownership even if it was updated
-        # during module initialization (agent_id, agent_version)
+        # This ensures state.json / .secret_key have correct ownership even if
+        # updated during module init or multi-instance relocate after earlier chown.
         logger.info("\nStep 10: Final ownership verification...")
-        for root, dirs, files in os.walk(INSTALL_PATHS['state_dir']):
-            for d in dirs:
-                os.chown(os.path.join(root, d), uid, gid)
-            for f in files:
-                os.chown(os.path.join(root, f), uid, gid)
+        _chown_tree(INSTALL_PATHS['state_dir'])
         logger.info(f"✓ Verified ownership on {INSTALL_PATHS['state_dir']}")
+        if is_multi:
+            path_root = normalize_opt_path(
+                policy_config.get('path_root')
+                or (
+                    f"{INSTALL_PATHS['simulate_root']}/managed-{policy_config.get('instance_id')}"
+                    if policy_type == 'MANAGED'
+                    else f"{INSTALL_PATHS['simulate_root']}/simulate-{policy_config.get('instance_id')}"
+                )
+            )
+            _chown_tree(path_root)
+            logger.info(f"✓ Verified ownership on {path_root}")
+            try:
+                from logstashagent.encryption import ensure_secret_key_ownership
+
+                # Catch keys created during relocate / late enroll writes as root
+                ensure_secret_key_ownership(None)  # all instance trees under /opt
+            except Exception as e:
+                logger.warning("Final ensure_secret_key_ownership: %s", e)
+
+        # VERSION trees must be readable by the logstash service user
+        versions_dir = os.path.join(INSTALL_PATHS['opt_root'], 'logstash-versions')
+        if os.path.isdir(versions_dir):
+            try:
+                from logstashagent.logstash_download import chown_tree_to_logstash
+
+                chown_tree_to_logstash(versions_dir)
+            except Exception as e:
+                logger.warning("Could not chown logstash-versions: %s", e)
 
         # Step 11: Enable/start services (full deploy — no extra cut-paste for enable/start)
         logger.info("\nStep 11: Enabling and starting services...")
         if is_multi:
-            # enable_simulate_services already ran inside setup_simulate_from_policy
+            # Multi-instance units were enabled after state relocate (see Step 7)
             pass
         else:
             enable_and_start_default_agent()
@@ -1867,8 +2338,9 @@ def perform_installation(
                 logger.warning("!" * 60)
 
             logger.info("\nAgent service logstash-agent enabled and started.")
-            logger.info("  State:  /var/lib/logstash-agent/")
-            logger.info("  Config: /etc/logstash-agent/logstash-agent.yml")
+            logger.info("  State:  /opt/logstash-agent/state/")
+            logger.info("  Config: /opt/logstash-agent/config/logstash-agent.yml")
+            logger.info("  Logs:   /opt/logstash-agent/logs/")
             if logstash_present:
                 logger.info(
                     "Distro logstash unit enabled only (not started/restarted — "
@@ -1876,7 +2348,7 @@ def perform_installation(
                 )
             if not logstash_present:
                 logger.info("\nAfter installing Logstash:")
-                logger.info("  1. Update paths in /etc/logstash-agent/logstash-agent.yml if needed")
+                logger.info("  1. Update paths in /opt/logstash-agent/config/logstash-agent.yml if needed")
                 logger.info("  2. sudo logstash-agent configure")
                 logger.info("  3. sudo systemctl restart logstash-agent")
             logger.info("\nDay-2 operations (packaged agent only):")
@@ -1915,28 +2387,54 @@ def perform_installation(
         raise InstallError(f"Installation failed: {e}")
 
 
+def _remove_cli_symlinks() -> None:
+    """Remove /usr/local/bin and /usr/bin logstash-agent symlinks if present."""
+    for link in (INSTALL_PATHS['symlink'], '/usr/bin/logstash-agent'):
+        try:
+            if os.path.islink(link):
+                os.unlink(link)
+                logger.info("✓ Removed %s", link)
+            elif os.path.exists(link):
+                logger.warning("%s exists but is not a symlink, skipping", link)
+        except OSError as e:
+            logger.warning("Could not remove %s: %s", link, e)
+
+
+def _opt_root_remaining() -> list[str]:
+    root = INSTALL_PATHS['opt_root']
+    if not os.path.isdir(root):
+        return []
+    try:
+        return sorted(os.listdir(root))
+    except OSError:
+        return ['?']
+
+
 def perform_uninstallation(
     purge: bool = False,
     *,
     instance: str | None = None,
+    keep_data: bool = False,
 ) -> None:
     """
     Perform uninstallation using the host install registry.
 
     Args:
-        purge: If True, also remove state/log/cache and multi-instance path trees
-        instance: If set (e.g. ``managed-1``, ``simulate-2``, ``packaged``),
-            tear down only that instance and leave the package installed.
-            When omitted, full package uninstall is performed.
+        purge: Full uninstall only — wipe all of ``/opt/logstash-agent`` and the CLI
+            symlink (and legacy FHS leftovers).
+        instance: If set (e.g. ``managed-1``, ``simulate-2``), tear down only that
+            multi-instance role and leave the package installed. Path tree is
+            removed unless ``keep_data`` is True.
+        keep_data: With ``--instance``, stop/disable units but keep the instance
+            path tree. Default for ``--instance`` is to delete the tree.
     """
     from logstashagent import install_registry as _reg
 
-    logger.info("="*60)
+    logger.info("=" * 60)
     logger.info("LOGSTASH AGENT UNINSTALLATION")
-    logger.info("="*60)
+    logger.info("=" * 60)
 
     try:
-        # Step 1: Verify prerequisites
         logger.info("\nStep 1: Verifying prerequisites...")
         verify_root()
         verify_platform()
@@ -1948,39 +2446,73 @@ def perform_uninstallation(
         if instance:
             key = instance.strip().lower()
             entry = next((e for e in all_instances if (e.get('id') or '').lower() == key), None)
-            if not entry and key in ('default', 'package'):
-                # Allow role aliases
-                key = 'packaged'
-                entry = next((e for e in all_instances if e.get('id') == 'packaged'), None)
-            if not entry:
+            if not entry and key.isdigit():
+                matches = [
+                    e for e in all_instances
+                    if (e.get('id') or '') in (f'simulate-{key}', f'managed-{key}')
+                ]
+                if len(matches) == 1:
+                    entry = matches[0]
+                elif len(matches) > 1:
+                    raise InstallError(
+                        f"Ambiguous instance id '{instance}' matches both managed and "
+                        f"simulate. Use --instance managed-{key} or simulate-{key}."
+                    )
+            if not entry and key in ('default', 'package', 'packaged'):
                 raise InstallError(
-                    f"Instance '{instance}' not found in install registry. "
+                    "Packaged role cannot be removed with --instance "
+                    "(that is the shared host agent). Use full "
+                    "`sudo logstash-agent uninstall` instead, or "
+                    "`uninstall --instance simulate-N` / `managed-N` for multi-instance roles."
+                )
+            if not entry:
+                known = ", ".join(
+                    sorted(
+                        e.get('id') or '?'
+                        for e in all_instances
+                        if (e.get('role') or '') in ('managed', 'simulate')
+                    )
+                ) or "(none)"
+                raise InstallError(
+                    f"Instance '{instance}' not found.\n"
+                    f"Known multi-instance ids: {known}\n"
                     f"Run: logstash-agent list-instances"
                 )
-            logger.info("\nStep 2: Tearing down instance %s only...", entry.get('id'))
-            _reg.teardown_instance(entry, purge_paths=purge, unregister=True)
-            try:
-                subprocess.run(
-                    ['systemctl', 'daemon-reload'],
-                    check=False, capture_output=True, text=True,
+            role = (entry.get('role') or '').lower()
+            if role not in ('managed', 'simulate'):
+                raise InstallError(
+                    f"Instance '{entry.get('id')}' is role={role!r}; "
+                    f"--instance only removes managed-N or simulate-N."
                 )
+
+            purge_paths = not keep_data
+            logger.info(
+                "\nStep 2: Removing instance %s only (path tree %s)...",
+                entry.get('id'),
+                "deleted" if purge_paths else "preserved (--keep-data)",
+            )
+            _reg.teardown_instance(entry, purge_paths=purge_paths, unregister=True)
+            try:
+                _systemctl_cmd('daemon-reload')
             except Exception as e:
-                logger.warning(f"Failed to reload systemd: {e}")
-            logger.info("\n" + "="*60)
+                logger.warning("Failed to reload systemd: %s", e)
+            logger.info("\n" + "=" * 60)
             logger.info("INSTANCE UNINSTALL COMPLETE: %s", entry.get('id'))
-            if purge:
-                logger.info("Instance path tree removed (--purge).")
+            if purge_paths:
+                logger.info("Units stopped/disabled and path tree removed.")
             else:
                 logger.info(
-                    "Units stopped/disabled. Use --purge with --instance to also "
-                    "delete the instance path tree."
+                    "Units stopped/disabled; path tree kept "
+                    "(%s). Re-run without --keep-data to delete it.",
+                    entry.get('path_root') or '(unknown)',
                 )
-            logger.info("Package install left in place.")
-            logger.info("="*60)
+            logger.info("Package install and other instances left in place.")
+            logger.info("  Remaining: logstash-agent list-instances")
+            logger.info("=" * 60)
             return
 
         # ---- Full package uninstall ----
-        logger.info("\nStep 2: Stopping registered multi-instance agents...")
+        logger.info("\nStep 2: Stopping multi-instance agents...")
         multi = [
             e for e in all_instances
             if (e.get('role') or '').lower() in ('managed', 'simulate')
@@ -2006,146 +2538,106 @@ def perform_uninstallation(
             for entry in packaged:
                 _reg.teardown_instance(entry, purge_paths=False, unregister=True)
         else:
-            # Fallback if registry empty
             if os.path.exists(INSTALL_PATHS['systemd_service']):
                 try:
-                    subprocess.run(
-                        ['systemctl', 'stop', 'logstash-agent'],
-                        check=False, capture_output=True,
-                    )
-                    subprocess.run(
-                        ['systemctl', 'disable', 'logstash-agent'],
-                        check=False, capture_output=True,
-                    )
+                    _systemctl_cmd('stop', 'logstash-agent')
+                    _systemctl_cmd('disable', 'logstash-agent')
                     logger.info("✓ Stopped/disabled logstash-agent service")
                 except Exception as e:
-                    logger.warning(f"Failed to stop/disable service: {e}")
+                    logger.warning("Failed to stop/disable service: %s", e)
             else:
                 logger.info("Packaged service unit not found, skipping")
 
-        # Step 4: Remove all shared systemd unit files (templates + packaged)
         logger.info("\nStep 4: Removing systemd unit files...")
         _reg.remove_shared_unit_files(reg)
-        # Also remove packaged unit if still present
         if os.path.exists(INSTALL_PATHS['systemd_service']):
             try:
                 os.remove(INSTALL_PATHS['systemd_service'])
-                logger.info(f"✓ Removed {INSTALL_PATHS['systemd_service']}")
+                logger.info("✓ Removed %s", INSTALL_PATHS['systemd_service'])
             except OSError as e:
                 logger.warning("Could not remove packaged unit: %s", e)
         try:
-            _ = subprocess.run(
-                ['systemctl', 'daemon-reload'],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
+            _systemctl_cmd('daemon-reload', check=True)
             logger.info("✓ Reloaded systemd daemon")
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            logger.warning(f"Failed to reload systemd: {e}")
-            logger.info("Continuing (daemon will reload eventually)")
+            logger.warning("Failed to reload systemd: %s", e)
 
-        # Step 5: Remove sudoers drop-in
         logger.info("\nStep 5: Removing sudoers configuration...")
         sudoers_file = '/etc/sudoers.d/logstash-agent'
         if os.path.exists(sudoers_file):
             try:
                 os.remove(sudoers_file)
-                logger.info(f"✓ Removed {sudoers_file}")
+                logger.info("✓ Removed %s", sudoers_file)
             except Exception as e:
-                logger.warning(f"Could not remove sudoers file: {e}")
+                logger.warning("Could not remove sudoers file: %s", e)
         else:
             logger.info("Sudoers file not found, skipping")
 
-        # Step 6: Remove symlink (check both /usr/local/bin and /usr/bin for RHEL)
-        logger.info("\nStep 6: Removing symlink...")
-        symlink_removed = False
-
-        # Check /usr/local/bin (default location)
-        if os.path.islink(INSTALL_PATHS['symlink']):
-            os.unlink(INSTALL_PATHS['symlink'])
-            logger.info(f"✓ Removed {INSTALL_PATHS['symlink']}")
-            symlink_removed = True
-        elif os.path.exists(INSTALL_PATHS['symlink']):
-            logger.warning(f"{INSTALL_PATHS['symlink']} exists but is not a symlink, skipping")
-
-        # Check /usr/bin (RHEL location)
-        rhel_symlink = '/usr/bin/logstash-agent'
-        if os.path.islink(rhel_symlink):
-            os.unlink(rhel_symlink)
-            logger.info(f"✓ Removed {rhel_symlink}")
-            symlink_removed = True
-        elif os.path.exists(rhel_symlink):
-            logger.warning(f"{rhel_symlink} exists but is not a symlink, skipping")
-
-        if not symlink_removed:
-            logger.info("Symlink not found, skipping")
-
-        # Step 7: Remove binary directory
-        logger.info("\nStep 7: Removing binary...")
-        if os.path.exists(INSTALL_PATHS['binary_dir']):
-            shutil.rmtree(INSTALL_PATHS['binary_dir'])
-            logger.info(f"✓ Removed {INSTALL_PATHS['binary_dir']}")
-
-            # Remove parent directory if empty (only when no remaining instance trees)
-            parent_dir = os.path.dirname(INSTALL_PATHS['binary_dir'])
-            if os.path.exists(parent_dir):
-                try:
-                    remaining = os.listdir(parent_dir)
-                except OSError:
-                    remaining = ['?']
-                if not remaining:
-                    os.rmdir(parent_dir)
-                    logger.info(f"✓ Removed {parent_dir}")
-                elif purge:
-                    # With purge, remove leftover managed-/simulate- under opt root
-                    for name in remaining:
-                        if re.match(r'^(managed|simulate)-[0-9]+$', name):
-                            _reg.remove_path_tree(os.path.join(parent_dir, name))
-                    try:
-                        remaining = os.listdir(parent_dir)
-                    except OSError:
-                        remaining = ['?']
-                    # Also drop logstash-versions download cache under opt root if empty-ish
-                    if not remaining:
-                        try:
-                            os.rmdir(parent_dir)
-                            logger.info(f"✓ Removed {parent_dir}")
-                        except OSError:
-                            pass
-                else:
-                    logger.info(
-                        "Left %s (instance trees or downloads remain; use --purge to remove)",
-                        parent_dir,
-                    )
-        else:
-            logger.info("Binary directory not found, skipping")
-
-        # Step 8: Remove config directory
-        logger.info("\nStep 8: Removing configuration...")
-        if os.path.exists(INSTALL_PATHS['config_dir']):
-            shutil.rmtree(INSTALL_PATHS['config_dir'])
-            logger.info(f"✓ Removed {INSTALL_PATHS['config_dir']}")
-        else:
-            logger.info("Config directory not found, skipping")
-
-        # Step 9: Optionally remove state directory (includes install-registry.json)
         if purge:
-            logger.info("\nStep 9: Removing state directory (--purge)...")
-            if os.path.exists(INSTALL_PATHS['state_dir']):
-                shutil.rmtree(INSTALL_PATHS['state_dir'])
-                logger.info(f"✓ Removed {INSTALL_PATHS['state_dir']}")
+            logger.info("\nStep 6: Purging /opt/logstash-agent and CLI symlink...")
+            opt = INSTALL_PATHS['opt_root']
+            if os.path.isdir(opt):
+                shutil.rmtree(opt)
+                logger.info("✓ Removed %s", opt)
             else:
-                logger.info("State directory not found, skipping")
+                logger.info("%s not found, skipping", opt)
+            _remove_cli_symlinks()
+            for legacy in LEGACY_INSTALL_PATHS.values():
+                if os.path.isdir(legacy):
+                    try:
+                        shutil.rmtree(legacy)
+                        logger.info("✓ Removed legacy %s", legacy)
+                    except OSError as e:
+                        logger.warning("Could not remove legacy %s: %s", legacy, e)
         else:
-            logger.info("\nStep 9: Preserving state directory...")
-            logger.info(f"State directory preserved: {INSTALL_PATHS['state_dir']}")
-            logger.info("(includes install-registry.json; use --purge to remove)")
-            # Clear package section but keep instance records if trees remain
+            logger.info(
+                "\nStep 6: Removing binary (preserving data under %s)...",
+                INSTALL_PATHS['opt_root'],
+            )
+            if os.path.isdir(INSTALL_PATHS['binary_dir']):
+                shutil.rmtree(INSTALL_PATHS['binary_dir'])
+                logger.info("✓ Removed %s", INSTALL_PATHS['binary_dir'])
+            else:
+                logger.info("Binary directory not found, skipping")
+
+            logger.info("\nStep 7: Removing packaged configuration...")
+            if os.path.isdir(INSTALL_PATHS['config_dir']):
+                shutil.rmtree(INSTALL_PATHS['config_dir'])
+                logger.info("✓ Removed %s", INSTALL_PATHS['config_dir'])
+            else:
+                legacy_cfg = LEGACY_INSTALL_PATHS['config_dir']
+                if os.path.isdir(legacy_cfg):
+                    try:
+                        shutil.rmtree(legacy_cfg)
+                        logger.info("✓ Removed legacy %s", legacy_cfg)
+                    except OSError as e:
+                        logger.warning("Could not remove %s: %s", legacy_cfg, e)
+                else:
+                    logger.info("Config directory not found, skipping")
+
+            logger.info(
+                "\nStep 8: Preserving data directories under %s ...",
+                INSTALL_PATHS['opt_root'],
+            )
+            for key in ('state_dir', 'log_dir', 'cache_dir'):
+                path = INSTALL_PATHS[key]
+                if os.path.isdir(path):
+                    logger.info("  kept %s", path)
+            remaining = _opt_root_remaining()
+            if remaining:
+                logger.info(
+                    "  also under %s: %s",
+                    INSTALL_PATHS['opt_root'],
+                    ", ".join(remaining),
+                )
+            logger.info(
+                "  CLI symlink %s kept while agent data remains "
+                "(remove with: sudo logstash-agent uninstall --purge)",
+                INSTALL_PATHS['symlink'],
+            )
             try:
                 reg2 = _reg.load_registry()
                 reg2['package'] = None
-                # Drop packaged instance; keep multi that still have path_roots
                 inst = reg2.get('instances') or {}
                 inst.pop('packaged', None)
                 reg2['instances'] = inst
@@ -2153,50 +2645,26 @@ def perform_uninstallation(
             except Exception as e:
                 logger.warning("Could not update registry after uninstall: %s", e)
 
-        # Step 10: Optionally remove log directory
-        if purge:
-            logger.info("\nStep 10: Removing log directory (--purge)...")
-            if os.path.exists(INSTALL_PATHS['log_dir']):
-                shutil.rmtree(INSTALL_PATHS['log_dir'])
-                logger.info(f"✓ Removed {INSTALL_PATHS['log_dir']}")
-            else:
-                logger.info("Log directory not found, skipping")
-        else:
-            logger.info("\nStep 10: Preserving log directory...")
-            logger.info(f"Log directory preserved: {INSTALL_PATHS['log_dir']}")
-            logger.info("(Use --purge to remove logs)")
-
-        # Step 11: Optionally remove cache directory
-        if purge:
-            logger.info("\nStep 11: Removing cache directory (--purge)...")
-            if os.path.exists(INSTALL_PATHS['cache_dir']):
-                shutil.rmtree(INSTALL_PATHS['cache_dir'])
-                logger.info(f"✓ Removed {INSTALL_PATHS['cache_dir']}")
-            else:
-                logger.info("Cache directory not found, skipping")
-        else:
-            logger.info("\nStep 11: Preserving cache directory...")
-            logger.info(f"Cache directory preserved: {INSTALL_PATHS['cache_dir']}")
-            logger.info("(Use --purge to remove cached downloads)")
-
-        # Uninstallation complete
-        logger.info("\n" + "="*60)
+        logger.info("\n" + "=" * 60)
         logger.info("UNINSTALLATION COMPLETED SUCCESSFULLY!")
-        logger.info("="*60)
+        logger.info("=" * 60)
 
         if not purge:
-            logger.info("\nPreserved directories:")
-            logger.info(f"  - {INSTALL_PATHS['state_dir']}")
-            logger.info(f"  - {INSTALL_PATHS['log_dir']}")
-            logger.info(f"  - {INSTALL_PATHS['cache_dir']}")
-            logger.info("  - multi-instance trees under /opt/logstash-agent (if any)")
-            logger.info("\nTo remove these, run:")
+            logger.info("\nPreserved under %s:", INSTALL_PATHS['opt_root'])
+            logger.info("  - state/  logs/  cache/  (and managed-N / simulate-N trees if any)")
+            logger.info("  - %s (CLI symlink)", INSTALL_PATHS['symlink'])
+            logger.info("\nRemove one multi-instance role:")
+            logger.info("  sudo logstash-agent uninstall --instance simulate-1")
+            logger.info("  sudo logstash-agent uninstall --instance managed-2")
+            logger.info("\nWipe everything (including symlink and /opt/logstash-agent):")
             logger.info("  sudo logstash-agent uninstall --purge")
+        else:
+            logger.info("Removed /opt/logstash-agent and CLI symlink.")
 
-        logger.info("="*60)
+        logger.info("=" * 60)
 
     except InstallError as e:
-        logger.error(f"\nUninstallation failed: {e}")
+        logger.error("\nUninstallation failed: %s", e)
         raise
     except Exception as e:
         logger.exception("\nUnexpected error during uninstallation")
@@ -2344,7 +2812,11 @@ def systemctl_via_sudo(action: str, unit: str, *, timeout: int = 30) -> subproce
     Prefer ``sudo logstash-agent-ctl <action> <unit>`` so sudoers never need
     wildcards (required for sudo-rs). Falls back to ``sudo systemctl`` for
     older installs that only have the legacy drop-in.
+
+    Uses :func:`host_subprocess_env` so PyInstaller LD_LIBRARY_PATH does not
+    break host systemctl OpenSSL.
     """
+    env = host_subprocess_env()
     ctl = INSTALL_PATHS['systemctl_ctl']
     if os.path.isfile(ctl) and os.access(ctl, os.X_OK):
         return subprocess.run(
@@ -2353,13 +2825,15 @@ def systemctl_via_sudo(action: str, unit: str, *, timeout: int = 30) -> subproce
             text=True,
             timeout=timeout,
             check=False,
+            env=env,
         )
     return subprocess.run(
-        ['sudo', 'systemctl', action, unit],
+        ['sudo', _systemctl_bin(), action, unit],
         capture_output=True,
         text=True,
         timeout=timeout,
         check=False,
+        env=env,
     )
 
 
@@ -2371,12 +2845,7 @@ def verify_service_running() -> bool:
         True if service is active, False otherwise
     """
     try:
-        result = subprocess.run(
-            ['systemctl', 'is-active', 'logstash-agent'],
-            capture_output=True,
-            timeout=5,
-            check=False,
-        )
+        result = _systemctl_cmd('is-active', 'logstash-agent')
         return result.returncode == 0
     except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
         return False
@@ -2503,11 +2972,7 @@ def perform_upgrade(version: str, auto: bool = False) -> None:
             logger.error(f"Error code: {e.errno}")
             logger.error(f"Error message: {e.strerror}")
             # Check service status
-            service_check = subprocess.run(
-                ['systemctl', 'is-active', 'logstash-agent'],
-                capture_output=True,
-                check=False,
-            )
+            service_check = _systemctl_cmd('is-active', 'logstash-agent')
             logger.error(f"Service status: {service_check.stdout.decode().strip()}")
             # Clean up temp file if it exists
             if os.path.exists(temp_binary):
@@ -2560,8 +3025,7 @@ def perform_upgrade(version: str, auto: bool = False) -> None:
         # Step 9: Restart service (always restart after upgrade)
         logger.info("\nStep 9: Restarting service with new binary...")
         try:
-            subprocess.run(['systemctl', 'restart', 'logstash-agent'],
-                         check=True, capture_output=True, timeout=30)
+            _systemctl_cmd('restart', 'logstash-agent', check=True)
             logger.info("✓ Service restarted")
 
             # Step 10: Verify service is running
@@ -2584,8 +3048,7 @@ def perform_upgrade(version: str, auto: bool = False) -> None:
 
             try:
                 # Stop the failed service
-                subprocess.run(['systemctl', 'stop', 'logstash-agent'],
-                             check=False, capture_output=True)
+                _systemctl_cmd('stop', 'logstash-agent')
                 logger.info("✓ Stopped failed service")
             except Exception as stop_error:
                 logger.warning(f"Could not stop service: {stop_error}")
@@ -2618,8 +3081,7 @@ def perform_upgrade(version: str, auto: bool = False) -> None:
             if rollback_success:
                 try:
                     # Start with old binary
-                    subprocess.run(['systemctl', 'start', 'logstash-agent'],
-                                 check=True, capture_output=True, timeout=30)
+                    _systemctl_cmd('start', 'logstash-agent', check=True)
                     logger.info("✓ Service restarted with previous version")
                     logger.info("\nRollback completed successfully")
                 except Exception as start_error:

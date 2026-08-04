@@ -140,8 +140,12 @@ def test_teardown_instance_stops_units(reg_dir, monkeypatch):
     assert "managed-1" not in reg.load_registry(str(reg_dir))["instances"]
 
 
-def test_perform_uninstall_instance_only(reg_dir, monkeypatch):
+def test_perform_uninstall_instance_only(reg_dir, monkeypatch, tmp_path):
     from logstashagent import installer
+
+    tree = tmp_path / "logstash-agent" / "managed-1"
+    tree.mkdir(parents=True)
+    (tree / "settings").mkdir()
 
     monkeypatch.setitem(installer.INSTALL_PATHS, "state_dir", str(reg_dir))
     with patch("logstashagent.installer.get_logstash_uid_gid", side_effect=Exception("x")):
@@ -150,7 +154,7 @@ def test_perform_uninstall_instance_only(reg_dir, monkeypatch):
             instance_id=1,
             agent_unit="logstash-agent@1",
             logstash_unit="logstash-managed@1",
-            path_root=None,
+            path_root=str(tree),
             state_dir=str(reg_dir),
         )
 
@@ -159,7 +163,40 @@ def test_perform_uninstall_instance_only(reg_dir, monkeypatch):
     with patch.object(installer, "verify_root"), patch.object(
         installer, "verify_platform"
     ), patch.object(installer.subprocess, "run"):
+        # Default instance uninstall deletes the path tree
         installer.perform_uninstallation(purge=False, instance="managed-1")
 
     assert "logstash-agent@1" in stopped
     assert "managed-1" not in reg.load_registry(str(reg_dir))["instances"]
+    assert not tree.exists()
+
+
+def test_perform_uninstall_instance_keep_data(reg_dir, monkeypatch, tmp_path):
+    from logstashagent import installer
+
+    tree = tmp_path / "logstash-agent" / "simulate-3"
+    tree.mkdir(parents=True)
+
+    monkeypatch.setitem(installer.INSTALL_PATHS, "state_dir", str(reg_dir))
+    with patch("logstashagent.installer.get_logstash_uid_gid", side_effect=Exception("x")):
+        reg.register_instance(
+            role="simulate",
+            instance_id=3,
+            agent_unit="lsagent-simulate@3",
+            logstash_unit="ls-simulate@3",
+            path_root=str(tree),
+            state_dir=str(reg_dir),
+        )
+
+    stopped = []
+    monkeypatch.setattr(reg, "stop_disable_unit", lambda u: stopped.append(u))
+    with patch.object(installer, "verify_root"), patch.object(
+        installer, "verify_platform"
+    ), patch.object(installer.subprocess, "run"):
+        installer.perform_uninstallation(
+            purge=False, instance="simulate-3", keep_data=True
+        )
+
+    assert "lsagent-simulate@3" in stopped
+    assert "simulate-3" not in reg.load_registry(str(reg_dir))["instances"]
+    assert tree.exists()

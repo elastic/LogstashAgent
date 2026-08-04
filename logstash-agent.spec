@@ -25,12 +25,26 @@ if len(_unit_datas) < 4:
         f"found {len(_unit_datas)}"
     )
 
+# Simulate harness confs (seeded into each simulate-N settings tree)
+_sim_conf = _root / "src" / "logstashagent" / "config" / "simulate"
+_sim_datas = []
+for _name in ("simulate_start.conf", "simulate_end.conf"):
+    _p = _sim_conf / _name
+    if _p.is_file():
+        _sim_datas.append((str(_p), "logstashagent/config/simulate"))
+if len(_sim_datas) < 2:
+    raise SystemExit(
+        f"logstash-agent.spec: expected simulate_start/end.conf under {_sim_conf}, "
+        f"found {len(_sim_datas)}"
+    )
+_bundle_datas = _unit_datas + _sim_datas
+
 
 a = Analysis(
     ['src/logstashagent/main.py'],
     pathex=[],
     binaries=[],
-    datas=_unit_datas,
+    datas=_bundle_datas,
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

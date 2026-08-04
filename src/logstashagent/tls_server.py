@@ -106,9 +106,8 @@ def _default_sans() -> tuple[list[str], list]:
     except Exception:
         pass
 
-    extra = (os.environ.get("LOGSTASH_AGENT_TLS_SANS") or "").strip()
-    if extra:
-        for part in extra.replace(";", ",").split(","):
+    def _merge_csv_env(value: str) -> None:
+        for part in (value or "").replace(";", ",").split(","):
             p = part.strip()
             if not p:
                 continue
@@ -118,12 +117,22 @@ def _default_sans() -> tuple[list[str], list]:
             except ValueError:
                 add_dns(p)
 
-    # Non-loopback local IPv4s (native host or container)
+    # Explicit callback host(s) for enroll/UI reachability
+    for env_key in ("LOGSTASH_AGENT_CALLBACK_HOST", "LOGSTASH_AGENT_HOSTNAME"):
+        raw = (os.environ.get(env_key) or "").strip()
+        if raw:
+            _merge_csv_env(raw)
+            break
+    # Optional extra SANs (comma-separated)
+    _merge_csv_env(os.environ.get("LOGSTASH_AGENT_TLS_SANS") or "")
+
+    # Non-loopback local IPv4s + PTR FQDNs (UI may connect by DNS name)
+    local_ips: list[str] = []
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             s.connect(("8.8.8.8", 80))
-            add_ip(s.getsockname()[0])
+            local_ips.append(s.getsockname()[0])
         finally:
             s.close()
     except Exception:
@@ -131,9 +140,27 @@ def _default_sans() -> tuple[list[str], list]:
     try:
         hn = socket.gethostname()
         for info in socket.getaddrinfo(hn, None):
-            add_ip(info[4][0])
+            addr = info[4][0]
+            if addr and addr not in local_ips:
+                local_ips.append(addr)
     except Exception:
         pass
+    for raw in local_ips:
+        add_ip(raw)
+        try:
+            old = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(1.0)
+            try:
+                ptr = socket.gethostbyaddr(raw)[0].rstrip(".")
+            finally:
+                socket.setdefaulttimeout(old)
+            if ptr and "." in ptr:
+                try:
+                    ipaddress.ip_address(ptr)
+                except ValueError:
+                    add_dns(ptr)
+        except Exception:
+            pass
 
     return names, ips
 

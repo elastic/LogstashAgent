@@ -108,7 +108,8 @@ def test_empty_version_raises():
 
 def test_list_installed_versions(tmp_path):
     v = "9.4.3"
-    binary = tmp_path / v / "bin" / "logstash"
+    # Canonical flat layout: logstash-versions/logstash-9.4.3/bin/logstash
+    binary = tmp_path / f"logstash-{v}" / "bin" / "logstash"
     binary.parent.mkdir(parents=True)
     binary.write_text("#!/bin/sh\n", encoding="utf-8")
     binary.chmod(0o755)
@@ -116,13 +117,25 @@ def test_list_installed_versions(tmp_path):
     assert len(found) == 1
     assert found[0]["version"] == v
     assert found[0]["binary"] == str(binary)
+    assert found[0]["install_dir"] == str(tmp_path / f"logstash-{v}")
     table = ld.format_versions_table(found)
     assert v in table
 
 
+def test_list_installed_versions_legacy_nested(tmp_path):
+    v = "9.4.3"
+    binary = tmp_path / v / f"logstash-{v}" / "bin" / "logstash"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    found = ld.list_installed_versions(str(tmp_path))
+    assert any(f["version"] == v for f in found)
+    assert ld.resolve_logstash_binary(v, str(tmp_path)) == binary
+
+
 def test_prune_versions_keeps_used(tmp_path, monkeypatch):
     for v in ("9.4.3", "8.19.0"):
-        b = tmp_path / v / "bin" / "logstash"
+        b = tmp_path / f"logstash-{v}" / "bin" / "logstash"
         b.parent.mkdir(parents=True)
         b.write_text("x", encoding="utf-8")
 
@@ -134,5 +147,51 @@ def test_prune_versions_keeps_used(tmp_path, monkeypatch):
     result = ld.prune_versions(str(tmp_path), keep=set(), keep_used=True, dry_run=False)
     assert "8.19.0" in result["removed"]
     assert "9.4.3" in result["kept"]
-    assert (tmp_path / "9.4.3").is_dir()
-    assert not (tmp_path / "8.19.0").exists()
+    assert (tmp_path / "logstash-9.4.3").is_dir()
+    assert not (tmp_path / "logstash-8.19.0").exists()
+
+
+def test_ensure_extracts_flat_not_nested(tmp_path):
+    version = "9.4.3"
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w:gz") as tar:
+        data = b"#!/bin/sh\necho logstash\n"
+        info = tarfile.TarInfo(name=f"logstash-{version}/bin/logstash")
+        info.size = len(data)
+        info.mode = 0o755
+        tar.addfile(info, io.BytesIO(data))
+    raw.seek(0)
+    tarball_bytes = raw.read()
+
+    def fake_urlopen(url, timeout=60):
+        class Stream:
+            def __enter__(self):
+                return io.BytesIO(tarball_bytes)
+
+            def __exit__(self, *a):
+                return False
+
+        class Resp:
+            def read(self):
+                import hashlib
+
+                h = hashlib.sha512(tarball_bytes).hexdigest()
+                return f"{h}  logstash.tar.gz".encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        if url.endswith(".sha512"):
+            return Resp()
+        return Stream()
+
+    with patch.object(ld.urllib.request, "urlopen", side_effect=fake_urlopen):
+        binary = ld.ensure_logstash_version(
+            version, str(tmp_path), platform_arch="linux-x86_64"
+        )
+    # Flat: <root>/logstash-9.4.3/bin/logstash — NOT <root>/9.4.3/logstash-9.4.3/...
+    assert Path(binary) == tmp_path / f"logstash-{version}" / "bin" / "logstash"
+    assert not (tmp_path / version).exists()

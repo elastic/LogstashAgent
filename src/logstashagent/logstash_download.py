@@ -69,8 +69,40 @@ def artifact_url(version: str, platform_arch: Optional[str] = None) -> str:
     return f"{ARTIFACTS_BASE}/{name}"
 
 
+def version_dir_name(version: str) -> str:
+    """Directory name for an extracted release (matches Elastic tarball top-level)."""
+    v = (version or "").strip()
+    if v.startswith("logstash-"):
+        return v
+    return f"logstash-{v}"
+
+
+def version_from_dir_name(name: str) -> Optional[str]:
+    """
+    Map a directory under download_root back to a version string.
+
+    Canonical: ``logstash-9.4.4`` → ``9.4.4``
+    Legacy:    ``9.4.4`` → ``9.4.4``
+    """
+    name = (name or "").strip()
+    if not name or name.startswith(".") or name.startswith("ls-download-"):
+        return None
+    if name.startswith("logstash-"):
+        ver = name[len("logstash-") :]
+        return ver or None
+    # Legacy bare version directory
+    if name[0].isdigit():
+        return name
+    return None
+
+
 def version_install_dir(version: str, download_root: str = DEFAULT_DOWNLOAD_ROOT) -> Path:
-    return Path(download_root) / version
+    """
+    Canonical install dir: ``<download_root>/logstash-<version>``.
+
+    (No extra ``<version>/`` wrapper — the tarball already names the tree.)
+    """
+    return Path(download_root) / version_dir_name(version)
 
 
 def resolve_logstash_binary(
@@ -79,13 +111,18 @@ def resolve_logstash_binary(
     """
     Path to bin/logstash inside an extracted version tree.
 
-    Elastic tarballs extract to logstash-<version>/ under the target dir.
-    We also accept a flattened layout: <download_root>/<version>/bin/logstash
+    Layouts accepted (first match wins):
+      - canonical: ``<root>/logstash-<ver>/bin/logstash``
+      - legacy:    ``<root>/<ver>/logstash-<ver>/bin/logstash``
+      - legacy:    ``<root>/<ver>/bin/logstash``
     """
-    root = version_install_dir(version, download_root)
+    root = Path(download_root)
+    ver = (version or "").strip()
     candidates = [
-        root / "bin" / "logstash",
-        root / f"logstash-{version}" / "bin" / "logstash",
+        version_install_dir(ver, download_root) / "bin" / "logstash",
+        root / ver / f"logstash-{ver}" / "bin" / "logstash",
+        root / ver / "bin" / "logstash",
+        root / f"logstash-{ver}" / "bin" / "logstash",
     ]
     for path in candidates:
         if path.is_file() and os.access(path, os.X_OK):
@@ -95,8 +132,42 @@ def resolve_logstash_binary(
         if path.is_file():
             return path
     raise LogstashDownloadError(
-        f"Logstash binary not found under {root} for version {version}"
+        f"Logstash binary not found under {download_root} for version {ver}"
     )
+
+
+def chown_tree_to_logstash(path: Path | str) -> None:
+    """
+    Recursively chown a VERSION tree (or download root) to logstash:logstash.
+
+    Logstash runs as the logstash user and must read its own install tree.
+    Downloads run as root during agent install/ensure-version.
+    """
+    path = Path(path)
+    if not path.exists():
+        return
+    try:
+        import grp
+        import pwd
+
+        if os.geteuid() != 0:
+            return
+        uid = pwd.getpwnam("logstash").pw_uid
+        gid = grp.getgrnam("logstash").gr_gid
+    except (AttributeError, KeyError, OSError, ImportError):
+        logger.debug("Skipping chown of %s (no logstash user or not root)", path)
+        return
+    for walk_root, dirs, files in os.walk(path):
+        try:
+            os.chown(walk_root, uid, gid)
+        except OSError as e:
+            logger.debug("chown %s: %s", walk_root, e)
+        for name in dirs + files:
+            try:
+                os.chown(os.path.join(walk_root, name), uid, gid)
+            except OSError:
+                pass
+    logger.info("✓ Ownership set to logstash on %s", path)
 
 
 def _download_file(url: str, dest: Path, timeout: int = 600) -> None:
@@ -156,12 +227,15 @@ def ensure_logstash_version(
     if not version:
         raise LogstashDownloadError("logstash_version is empty")
 
-    download_root = download_root or DEFAULT_DOWNLOAD_ROOT
+    download_root = normalize_download_dir(download_root or DEFAULT_DOWNLOAD_ROOT)
+    root = Path(download_root)
     install_dir = version_install_dir(version, download_root)
 
     if not force:
         try:
             binary = resolve_logstash_binary(version, download_root)
+            # Heal ownership on already-present trees (root-owned downloads)
+            chown_tree_to_logstash(binary.parent.parent)
             logger.info("Logstash %s already present at %s", version, binary)
             return binary
         except LogstashDownloadError:
@@ -171,7 +245,10 @@ def ensure_logstash_version(
     url = artifact_url(version, platform_arch)
     sha_url = url + ".sha512"
 
-    install_dir.mkdir(parents=True, exist_ok=True)
+    # Extract into download_root so the tarball top-level becomes
+    #   logstash-versions/logstash-<version>/
+    # (not logstash-versions/<version>/logstash-<version>/)
+    root.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory(prefix="ls-download-") as tmp:
         tmp_path = Path(tmp)
@@ -179,14 +256,20 @@ def ensure_logstash_version(
         _download_file(url, tarball)
         _verify_sha512(tarball, sha_url)
 
-        logger.info("Extracting %s into %s", tarball.name, install_dir)
+        # Remove partial/legacy trees for this version before extract
+        legacy_nested = root / version
+        for stale in (install_dir, legacy_nested):
+            if stale.is_dir() and force:
+                shutil.rmtree(stale, ignore_errors=True)
+
+        logger.info("Extracting %s into %s (flat logstash-%s/ layout)", tarball.name, root, version)
         try:
             with tarfile.open(tarball, "r:gz") as tar:
                 # Python 3.12+ filter= for safer extract; fall back if unavailable
                 try:
-                    tar.extractall(path=install_dir, filter="data")
+                    tar.extractall(path=root, filter="data")
                 except TypeError:
-                    tar.extractall(path=install_dir)
+                    tar.extractall(path=root)
         except Exception as exc:
             raise LogstashDownloadError(f"Failed to extract {tarball}: {exc}") from exc
 
@@ -195,6 +278,9 @@ def ensure_logstash_version(
         os.chmod(binary, 0o755)
     except OSError:
         pass
+    # Entire version tree must be readable by the logstash service user
+    chown_tree_to_logstash(binary.parent.parent)
+    chown_tree_to_logstash(root)
     logger.info("✓ Logstash %s ready at %s", version, binary)
     return binary
 
@@ -260,24 +346,24 @@ def list_installed_versions(
         return []
 
     for name in names:
-        # Skip temp / non-version dirs
-        if name.startswith(".") or name.startswith("ls-download-"):
+        ver = version_from_dir_name(name)
+        if not ver:
             continue
         vdir = root / name
         if not vdir.is_dir():
             continue
         try:
-            binary = resolve_logstash_binary(name, str(root))
+            binary = resolve_logstash_binary(ver, str(root))
         except LogstashDownloadError:
-            # Nested layout may use directory name != version; try probe
             nested = list(vdir.glob("logstash-*/bin/logstash"))
             if nested and nested[0].is_file():
                 binary = nested[0]
+                # Prefer nested dir as install_dir when legacy wrapper present
+                vdir = nested[0].parent.parent
             else:
                 continue
         size = None
         try:
-            # Rough tree size (may be slow on huge trees; cap depth walk)
             total = 0
             for dirpath, _dirnames, filenames in os.walk(vdir):
                 for fn in filenames:
@@ -290,7 +376,7 @@ def list_installed_versions(
             pass
         found.append(
             {
-                "version": name,
+                "version": ver,
                 "binary": str(binary),
                 "install_dir": str(vdir),
                 "size_bytes": size,
@@ -345,12 +431,17 @@ def collect_in_use_versions(
                     for line in env_path.read_text(encoding="utf-8").splitlines():
                         if line.startswith("LOGSTASH_BINARY="):
                             b = line.split("=", 1)[1].strip()
-                            # .../logstash-versions/<ver>/...
+                            # .../logstash-versions/logstash-<ver>/bin/logstash
+                            # or legacy .../logstash-versions/<ver>/...
                             parts = Path(b).parts
                             if "logstash-versions" in parts:
                                 i = parts.index("logstash-versions")
                                 if i + 1 < len(parts):
-                                    used.add(parts[i + 1])
+                                    ver = version_from_dir_name(parts[i + 1])
+                                    if ver:
+                                        used.add(ver)
+                                    else:
+                                        used.add(parts[i + 1])
                 except OSError:
                     pass
     except Exception:

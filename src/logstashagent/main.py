@@ -9,17 +9,43 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 import sys
 
-# Check early whether we're in a non-simulation mode (--run, --enroll, install, upgrade, or uninstall).
-# slots starts background threads on import, so we skip it in these modes.
-_SKIP_SIMULATION_IMPORTS = (
-    '--run' in sys.argv
-    or '--enroll' in sys.argv
+# slots starts a cleanup thread on import when mode looks like simulation.
+# Skip for enroll/install/admin and for packaged --run (controller only).
+# Do NOT skip for --run --mode simulate|managed|embedded — those serve FastAPI
+# slot allocate/release endpoints and need the slots module.
+def _argv_mode_hint() -> str | None:
+    argv = sys.argv[1:]
+    for i, a in enumerate(argv):
+        if a == '--mode' and i + 1 < len(argv):
+            return str(argv[i + 1]).lower()
+        if a.startswith('--mode='):
+            return a.split('=', 1)[1].lower()
+    return None
+
+
+_CLI_MODE_HINT = _argv_mode_hint()
+_SIM_FASTAPI_MODES = frozenset({
+    'simulate', 'managed', 'simulation', 'embedded',
+})
+_ADMIN_CLI = (
+    '--enroll' in sys.argv
     or 'install' in sys.argv
     or 'upgrade' in sys.argv
     or 'uninstall' in sys.argv
     or 'configure' in sys.argv
     or 'setup-simulate' in sys.argv
     or 'recover-simulate' in sys.argv
+    or 'list-instances' in sys.argv
+    or 'list-versions' in sys.argv
+    or 'ensure-version' in sys.argv
+    or 'prune-versions' in sys.argv
+)
+_SKIP_SIMULATION_IMPORTS = bool(
+    _ADMIN_CLI
+    or (
+        '--run' in sys.argv
+        and (_CLI_MODE_HINT is None or _CLI_MODE_HINT not in _SIM_FASTAPI_MODES)
+    )
 )
 
 import glob
@@ -83,8 +109,10 @@ def setup_file_logging():
     Setup file logging for normal operation (not install/uninstall/upgrade).
     This is called after we know we're running as the service.
     """
-    # Check for installed location first, then fall back to local data directory
-    if os.path.exists('/var/log/logstash-agent'):
+    # Prefer /opt layout, then legacy /var/log, then local dev data/
+    if os.path.isdir('/opt/logstash-agent/logs'):
+        logs_dir = Path('/opt/logstash-agent/logs')
+    elif os.path.isdir('/var/log/logstash-agent'):
         logs_dir = Path('/var/log/logstash-agent')
     else:
         logs_dir = Path(__file__).parent / 'data' / 'logs'
@@ -156,9 +184,12 @@ def get_config_path() -> str:
             return str(agent_state.instance_config_path(mode, instance))
         except ValueError:
             pass
-    packaged = "/etc/logstash-agent/logstash-agent.yml"
+    packaged = "/opt/logstash-agent/config/logstash-agent.yml"
     if os.path.exists(packaged):
         return packaged
+    legacy = "/etc/logstash-agent/logstash-agent.yml"
+    if os.path.exists(legacy):
+        return legacy
     return os.path.join(os.path.dirname(__file__), "config/logstashagent.yml")
 
 CONFIG_PATH = get_config_path()
@@ -169,6 +200,7 @@ def load_agent_config() -> dict:
     for candidate in (
         get_config_path(),
         os.environ.get('LOGSTASH_AGENT_CONFIG') or '',
+        "/opt/logstash-agent/config/logstash-agent.yml",
         "/etc/logstash-agent/logstash-agent.yml",
     ):
         if not candidate or not os.path.exists(candidate):
@@ -533,9 +565,10 @@ async def startup_event():
             "(ls-simulate@) + watchdog; skip embedded supervisor (API port %s)",
             port,
         )
-        # Ensure static harness exists under instance settings (idempotent)
+        # Ensure static harness + LOGSTASH_URL for StreamSimulate HTTP outputs
         try:
             from logstashagent import simulate_recovery
+            from pathlib import Path as _Path
 
             settings = simulate_recovery.resolve_settings_path(
                 agent_config=AGENT_CONFIG
@@ -545,6 +578,44 @@ async def startup_event():
             if not yml.is_file():
                 simulate_recovery.write_bare_pipelines_yml(settings)
                 logger.info("Wrote initial bare pipelines.yml for simulate instance")
+
+            # ls-simulate@N EnvironmentFile must carry LOGSTASH_URL (UI base).
+            # Without it, harness confs default to host.docker.internal:8080.
+            env_path = None
+            try:
+                st = agent_state.get_state() or {}
+                root = st.get('path_root') or (
+                    f"/opt/logstash-agent/simulate-{st.get('instance_id')}"
+                    if st.get('instance_id') is not None
+                    else None
+                )
+                if root:
+                    env_path = _Path(str(root)) / 'env'
+                else:
+                    # settings is .../simulate-N/settings → parent/env
+                    env_path = settings.parent / 'env'
+            except Exception:
+                env_path = settings.parent / 'env'
+            url_result = simulate_recovery.ensure_logstash_url_in_env(
+                env_path, agent_config=AGENT_CONFIG
+            )
+            if url_result.get('changed'):
+                logger.info(
+                    "Updated LOGSTASH_URL in %s — restarting Logstash unit to apply",
+                    env_path,
+                )
+                try:
+                    _restart_logstash_for_sim()
+                except Exception as re:
+                    logger.warning(
+                        "Could not restart Logstash after LOGSTASH_URL update: %s", re
+                    )
+            elif url_result.get('ok'):
+                logger.info("LOGSTASH_URL for StreamSimulate: %s", url_result.get('url'))
+            else:
+                logger.warning(
+                    "LOGSTASH_URL missing — simulate HTTP outputs will fail to reach UI"
+                )
         except Exception as e:
             logger.warning("Could not seed simulate harness on startup: %s", e)
         # Watchdog: bare recovery if Logstash stays unhealthy
@@ -612,6 +683,27 @@ def get_logstash_paths():
         'conf_d': f"{logstash_settings}conf.d",
         'metadata': f"{logstash_settings}pipeline-metadata"
     }
+
+
+def get_logstash_log_dir() -> str:
+    """
+    Directory with logstash-json*.log for this agent process.
+
+    Packaged/embedded: usually /var/log/logstash.
+    simulate-N / managed-N: /opt/logstash-agent/{role}-N/logs (from yml/state/env).
+    """
+    logs_path = None
+    try:
+        from logstashagent import agent_state
+
+        logs_path = agent_state.get_state().get("logs_path")
+    except Exception:
+        pass
+    log_dir = log_analyzer.resolve_logstash_log_dir(
+        logstash_log_path=AGENT_CONFIG.get("logstash_log_path"),
+        logs_path=logs_path,
+    )
+    return log_dir
 
 LOGSTASH_PATHS = get_logstash_paths()
 PIPELINES_YML_PATH = LOGSTASH_PATHS['pipelines_yml']
@@ -1118,6 +1210,27 @@ async def simulate_log(request: Request):
                 }
             )
 
+        # If a slot is specified, ensure that filter pipeline is loaded before
+        # forwarding. Otherwise simulate-start posts the "original" event and then
+        # hangs on pipeline-to-pipeline send_to (no instrumentation / empty snapshots).
+        if slot_id is not None:
+            target = f"slot{slot_id}-filter1"
+            ready = False
+            for _ in range(20):  # up to ~10s
+                try:
+                    with LogstashAPI(timeout=2.0) as api:
+                        if target in api.list_pipelines():
+                            ready = True
+                            break
+                except Exception:
+                    pass
+                await asyncio.sleep(0.5)
+            if not ready:
+                logger.warning(
+                    "Slot pipeline %s not ready; forwarding anyway (may yield empty snapshots)",
+                    target,
+                )
+
         # Logstash is healthy - forward immediately with retry logic
         max_retries = 3
         for attempt in range(max_retries):
@@ -1518,7 +1631,7 @@ async def allocate_simulation_slot(body: dict[str, Any]):
     # the first simulation event before the new one is loaded.
     if not reused:
         first_pipeline_name = f"slot{slot_id}-filter1"
-        max_wait = 10.0
+        max_wait = 30.0
         start_wait = time.time()
         logger.info(f"Waiting for old pipeline {first_pipeline_name} to be removed before creating new one...")
         while time.time() - start_wait < max_wait:
@@ -1532,10 +1645,22 @@ async def allocate_simulation_slot(body: dict[str, Any]):
                 logger.warning(f"Error checking pipeline removal: {e}")
             await asyncio.sleep(0.5)
         else:
-            logger.warning(f"Old pipeline {first_pipeline_name} still present after {max_wait}s, proceeding anyway")
+            # Force-delete stale pipeline so create does not race with a hung delete
+            logger.warning(
+                "Old pipeline %s still present after %.0fs — forcing delete",
+                first_pipeline_name,
+                max_wait,
+            )
+            try:
+                delete_pipeline_internal(first_pipeline_name)
+                await asyncio.sleep(1.0)
+            except Exception as e:
+                logger.warning("Force-delete %s failed: %s", first_pipeline_name, e)
 
     # Create pipelines if they don't exist (new slot or reused slot with deleted pipelines)
+    created_or_rebuilt = False
     if not reused or not pipelines_exist:
+        created_or_rebuilt = True
         try:
             await _create_slot_pipelines(slot_id, pipelines)
         except HTTPException:
@@ -1554,6 +1679,28 @@ async def allocate_simulation_slot(body: dict[str, Any]):
                     "slot_id": slot_id
                 }
             )
+
+    # Pipeline API "running" is not enough: the pipeline-to-pipeline bus address
+    # (slotN-filter1) can lag a beat after create. Pure reuse of an already-running
+    # pipeline skips the settle sleep so page-load warm / Run stay snappy.
+    if created_or_rebuilt:
+        await asyncio.sleep(1.5)
+        first_pipeline_name = f"slot{slot_id}-filter1"
+        try:
+            with LogstashAPI(timeout=3.0) as api:
+                all_pipelines = api.list_pipelines()
+                if first_pipeline_name not in all_pipelines:
+                    logger.warning(
+                        "Slot pipeline %s not listed after create+settle; UI may race",
+                        first_pipeline_name,
+                    )
+        except Exception as e:
+            logger.debug("Post-allocate pipeline list check: %s", e)
+    else:
+        logger.info(
+            "Slot %s pure reuse (pipelines already running) — skip bus settle wait",
+            slot_id,
+        )
 
     logger.info(f"Returning HTTP response for slot {slot_id}")
     return {
@@ -1713,18 +1860,27 @@ async def get_pipeline_logs(
     _validate_pipeline_id(pipeline_id)
 
     try:
-        # Fetch logs using log_analyzer
+        # Use instance log dir (simulate-N is not /var/log/logstash)
+        log_dir = get_logstash_log_dir()
+        logger.debug(
+            "get_pipeline_logs: pipeline_id=%s log_dir=%s min_level=%s",
+            pipeline_id,
+            log_dir,
+            min_level,
+        )
         logs = log_analyzer.find_related_logs(
             pipeline_id=pipeline_id,
+            log_dir=log_dir,
             max_entries=max_entries,
             min_level=min_level.upper(),
-            min_timestamp=min_timestamp
+            min_timestamp=min_timestamp,
         )
 
         return {
             "pipeline_id": pipeline_id,
+            "log_dir": log_dir,
             "log_count": len(logs),
-            "logs": logs
+            "logs": logs,
         }
     except Exception as e:
         raise HTTPException(
@@ -2297,13 +2453,22 @@ Examples:
     uninstall_parser.add_argument(
         '--purge',
         action='store_true',
-        help='Also remove state/log/cache and multi-instance path trees'
+        help='Full wipe: remove /opt/logstash-agent entirely and the CLI symlink'
     )
     uninstall_parser.add_argument(
         '--instance',
         metavar='ID',
         default=None,
-        help='Tear down only one registry instance (e.g. managed-1, simulate-2, packaged)'
+        help=(
+            'Remove only one multi-instance role (e.g. simulate-1, managed-2). '
+            'Stops units and deletes that path tree; package and other instances stay. '
+            'See also: list-instances'
+        ),
+    )
+    uninstall_parser.add_argument(
+        '--keep-data',
+        action='store_true',
+        help='With --instance: stop/disable units but keep the instance path tree'
     )
     uninstall_parser.add_argument(
         '--yes',
@@ -2727,45 +2892,58 @@ if __name__ == "__main__":
     # Check if we're in uninstall mode
     if args.command == 'uninstall':
         instance = getattr(args, 'instance', None)
+        keep_data = getattr(args, 'keep_data', False)
+        if instance and args.purge:
+            print(
+                "Note: --purge with --instance is ignored; "
+                "instance uninstall removes the path tree unless --keep-data."
+            )
         if not args.yes:
             if instance:
-                print(f"\nThis will uninstall only instance: {instance}")
-                if args.purge:
-                    print("  --purge: also delete the instance path tree")
+                print(f"\nThis will uninstall multi-instance role: {instance}")
+                print("  - Stop/disable its agent + Logstash systemd units")
+                if keep_data:
+                    print("  - Keep path tree under /opt/logstash-agent/ (--keep-data)")
                 else:
-                    print("  Units will be stopped/disabled; path tree preserved")
+                    print("  - Delete its path tree under /opt/logstash-agent/")
+                print("  - Leave the package binary and other instances installed")
             else:
                 print("\nThis will uninstall LogstashAgent from the system.")
-                print("\nThe following will be removed:")
+                print("\nRemoved:")
                 print("  - Binary: /opt/logstash-agent/bin")
-                print("  - Symlink: /usr/local/bin/logstash-agent")
-                print("  - Config: /etc/logstash-agent")
+                print("  - Config: /opt/logstash-agent/config")
                 print("  - Systemd units (packaged + multi-instance templates)")
-                print("  - Registered multi-instance agent units (stopped/disabled)")
+                print("  - Multi-instance units (stopped/disabled)")
                 try:
                     from logstashagent import install_registry as _reg
 
                     insts = _reg.list_instances(include_discovered=True)
                     multi = [i for i in insts if (i.get('role') or '') in ('managed', 'simulate')]
                     if multi:
-                        print("\nRegistered / discovered instances:")
+                        print("\nRegistered / discovered instances (stopped; trees kept unless --purge):")
                         for i in multi:
-                            print(f"  - {i.get('id')}: {i.get('agent_unit')}  {i.get('path_root') or ''}")
+                            print(
+                                f"  - {i.get('id')}: {i.get('agent_unit')}  "
+                                f"{i.get('path_root') or ''}"
+                            )
+                        print(
+                            "\nTip: remove one role only with:\n"
+                            "  sudo logstash-agent uninstall --instance <id>"
+                        )
                 except Exception as e:
                     logger.warning(f"Failed to list instances: {e!s}")
 
                 if args.purge:
-                    print("\n--purge flag detected. Also removing:")
-                    print("  - State: /var/lib/logstash-agent")
-                    print("  - Logs: /var/log/logstash-agent")
-                    print("  - Cache: /var/cache/logstash-agent")
-                    print("  - managed-N / simulate-N trees under /opt/logstash-agent")
+                    print("\n--purge: also remove")
+                    print("  - Entire /opt/logstash-agent (state, logs, cache, trees, downloads)")
+                    print("  - CLI symlink /usr/local/bin/logstash-agent")
+                    print("  - Legacy leftovers under /etc, /var/lib, /var/log, /var/cache if any")
                 else:
-                    print("\nPreserving:")
-                    print("  - State: /var/lib/logstash-agent (incl. install-registry.json)")
-                    print("  - Logs: /var/log/logstash-agent")
-                    print("  - multi-instance path trees (use --purge to remove)")
-                    print("  (Use --purge to remove these)")
+                    print("\nPreserved under /opt/logstash-agent:")
+                    print("  - state/  logs/  cache/")
+                    print("  - managed-N / simulate-N trees (if any)")
+                    print("  - CLI symlink /usr/local/bin/logstash-agent (until --purge)")
+                    print("\nWipe everything:  sudo logstash-agent uninstall --purge")
 
             print()
             answer = input("Continue? [y/N]: ").strip().lower()
@@ -2774,7 +2952,11 @@ if __name__ == "__main__":
                 sys.exit(0)
 
         try:
-            installer.perform_uninstallation(purge=args.purge, instance=instance)
+            installer.perform_uninstallation(
+                purge=args.purge,
+                instance=instance,
+                keep_data=keep_data,
+            )
             sys.exit(0)
         except installer.InstallError as e:
             logger.error(f"Uninstallation failed: {e}")

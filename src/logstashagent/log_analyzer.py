@@ -8,8 +8,20 @@ Logstash Log Analyzer Library
 This module provides functions to analyze Logstash JSON logs for pipeline health
 monitoring and error detection during simulations.
 
-Log files are expected to be in JSON format (one JSON object per line) located at:
-/var/log/logstash/logstash-json.log and rotated files logstash-json-*.log
+Log files are expected to be in JSON format (one JSON object per line).
+
+Default package path::
+
+    /var/log/logstash/logstash-json.log  (+ rotated logstash-json-*.log)
+
+Multi-instance simulate/managed agents write under their tree instead, e.g.::
+
+    /opt/logstash-agent/simulate-N/logs/logstash-json.log
+    /opt/logstash-agent/managed-N/logs/logstash-json.log
+
+Callers must pass that directory (via ``resolve_logstash_log_dir`` / agent config
+``logstash_log_path`` / state ``logs_path`` / env ``LOGSTASH_PATH_LOGS``); the
+default remains the package path for embedded/packaged installs.
 """
 
 import json
@@ -26,9 +38,39 @@ from typing import List, Dict, Any, Optional
 # Configure logging
 logger = logging.getLogger(__name__)
 
-# Default log directory
+# Default log directory (packaged / embedded distro Logstash)
 LOG_DIR = "/var/log/logstash"
 LOG_PATTERN = "logstash-json*.log"
+
+
+def resolve_logstash_log_dir(
+    logstash_log_path: Optional[str] = None,
+    logs_path: Optional[str] = None,
+    env: Optional[dict] = None,
+) -> str:
+    """
+    Resolve the directory that contains logstash-json*.log for this agent.
+
+    Preference order:
+      1. ``logstash_log_path`` (from logstash-agent.yml)
+      2. ``logs_path`` (from agent state / policy)
+      3. ``LOGSTASH_PATH_LOGS`` env (systemd EnvironmentFile for ls-simulate@N)
+      4. package default ``/var/log/logstash``
+    """
+    env_map = env if env is not None else os.environ
+    for candidate in (
+        logstash_log_path,
+        logs_path,
+        env_map.get("LOGSTASH_PATH_LOGS") if env_map is not None else None,
+        LOG_DIR,
+    ):
+        if candidate is None:
+            continue
+        text = str(candidate).strip()
+        if not text:
+            continue
+        return text.rstrip("/\\")
+    return LOG_DIR
 
 # Agent log directory (relative to this file's location — main.py writes here)
 AGENT_LOG_DIR = Path(__file__).parent / "data" / "logs"

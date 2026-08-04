@@ -33,6 +33,53 @@ class TestGetHostname:
             assert enrollment.get_hostname() == "unknown-host"
 
 
+class TestGetCallbackHost:
+    def test_env_override(self, monkeypatch):
+        monkeypatch.setenv("LOGSTASH_AGENT_CALLBACK_HOST", "agent.example.com")
+        assert enrollment.get_callback_host() == "agent.example.com"
+
+    def test_prefers_ip_over_hostname(self, monkeypatch):
+        """IP first: Docker LogstashUI cannot rely on host DNS."""
+        monkeypatch.delenv("LOGSTASH_AGENT_CALLBACK_HOST", raising=False)
+        monkeypatch.delenv("LOGSTASH_AGENT_HOSTNAME", raising=False)
+        monkeypatch.setattr(
+            enrollment,
+            "_non_loopback_ipv4s",
+            lambda: ["10.0.0.5"],
+        )
+        monkeypatch.setattr(enrollment.socket, "getfqdn", lambda: "loggy.untergeek.net")
+        assert enrollment.get_callback_host() == "10.0.0.5"
+
+    def test_uses_ip_when_available(self, monkeypatch):
+        monkeypatch.delenv("LOGSTASH_AGENT_CALLBACK_HOST", raising=False)
+        monkeypatch.delenv("LOGSTASH_AGENT_HOSTNAME", raising=False)
+        monkeypatch.setattr(enrollment, "_non_loopback_ipv4s", lambda: ["10.9.5.31"])
+        monkeypatch.setattr(enrollment.socket, "getfqdn", lambda: "loggy")
+        assert enrollment.get_callback_host() == "10.9.5.31"
+
+    def test_falls_back_to_fqdn_when_no_ip(self, monkeypatch):
+        monkeypatch.delenv("LOGSTASH_AGENT_CALLBACK_HOST", raising=False)
+        monkeypatch.delenv("LOGSTASH_AGENT_HOSTNAME", raising=False)
+        monkeypatch.setattr(enrollment, "_non_loopback_ipv4s", lambda: [])
+        monkeypatch.setattr(enrollment.socket, "getfqdn", lambda: "loggy.untergeek.net")
+        assert enrollment.get_callback_host() == "loggy.untergeek.net"
+
+    def test_get_callback_ip(self, monkeypatch):
+        monkeypatch.setattr(enrollment, "_non_loopback_ipv4s", lambda: ["10.1.2.3"])
+        assert enrollment.get_callback_ip() == "10.1.2.3"
+        monkeypatch.setattr(enrollment, "_non_loopback_ipv4s", lambda: [])
+        assert enrollment.get_callback_ip() is None
+
+    def test_short_host_label(self):
+        assert enrollment.short_host_label("loggy.untergeek.net") == "loggy"
+        assert enrollment.short_host_label("10.0.0.1") == "10.0.0.1"
+
+    def test_display_host_label_uses_hostname_for_ip(self, monkeypatch):
+        monkeypatch.setattr(enrollment, "get_hostname", lambda: "loggy")
+        assert enrollment.display_host_label("10.9.5.31") == "loggy"
+        assert enrollment.display_host_label("loggy.untergeek.net") == "loggy"
+
+
 class TestDecodeEnrollmentToken:
     def test_decodes_valid_payload(self):
         payload = {"enrollment_token": "secret-inner", "extra": 1}
@@ -76,7 +123,11 @@ class TestEnrollAgent:
         }
         response.json.return_value = result_body
 
-        with patch.object(enrollment, "get_hostname", return_value="host-1"), patch(
+        with patch.object(
+            enrollment, "get_callback_host", return_value="host-1.example.com"
+        ), patch.object(
+            enrollment, "get_callback_ip", return_value="10.0.0.9"
+        ), patch(
             "logstashagent.tls_trust.ensure_trust_from_token_payload", return_value=None
         ), patch(
             "logstashagent.tls_trust.ssl_verify_argument", return_value=True
@@ -91,7 +142,9 @@ class TestEnrollAgent:
         assert args[0] == "https://ui.example.com/ConnectionManager/Enroll/"
         body = kwargs["json"]
         assert body["enrollment_token"] == encoded
-        assert body["host"] == "host-1"
+        assert body["host"] == "host-1.example.com"
+        assert body["host_short"] == "host-1"
+        assert body["callback_ip"] == "10.0.0.9"
         assert body["agent_id"] == "agent-uuid"
         assert "csr_pem" in body
         assert "BEGIN CERTIFICATE REQUEST" in body["csr_pem"]
@@ -105,7 +158,7 @@ class TestEnrollAgent:
         response.raise_for_status = MagicMock()
         response.json.return_value = {"success": False, "error": "nope"}
 
-        with patch.object(enrollment, "get_hostname", return_value="h"), patch(
+        with patch.object(enrollment, "get_callback_host", return_value="h"), patch(
             "logstashagent.tls_trust.ensure_trust_from_token_payload", return_value=None
         ), patch(
             "logstashagent.tls_trust.ssl_verify_argument", return_value=True
@@ -121,7 +174,7 @@ class TestEnrollAgent:
         response.text = "<html>not json</html>"
         response.json.side_effect = json.JSONDecodeError("msg", "doc", 0)
 
-        with patch.object(enrollment, "get_hostname", return_value="h"), patch(
+        with patch.object(enrollment, "get_callback_host", return_value="h"), patch(
             "logstashagent.tls_trust.ensure_trust_from_token_payload", return_value=None
         ), patch(
             "logstashagent.tls_trust.ssl_verify_argument", return_value=True
@@ -131,7 +184,7 @@ class TestEnrollAgent:
 
     def test_request_exception_wrapped(self):
         encoded = _encoded_token({"enrollment_token": "x"})
-        with patch.object(enrollment, "get_hostname", return_value="h"), patch(
+        with patch.object(enrollment, "get_callback_host", return_value="h"), patch(
             "logstashagent.tls_trust.ensure_trust_from_token_payload", return_value=None
         ), patch(
             "logstashagent.tls_trust.ssl_verify_argument", return_value=True

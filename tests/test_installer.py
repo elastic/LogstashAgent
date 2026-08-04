@@ -57,7 +57,7 @@ def test_systemd_service_template():
     assert 'Group=logstash' in template
     assert 'ExecStart=/opt/logstash-agent/bin/logstash-agent --run' in template
     assert 'Restart=always' in template
-    assert 'WorkingDirectory=/var/lib/logstash-agent' in template
+    assert 'WorkingDirectory=/opt/logstash-agent/state' in template
 
 
 def test_github_release_url_format():
@@ -101,9 +101,12 @@ def test_uninstall_paths_match_install_paths():
 
 
 def test_cache_dir_in_install_paths():
-    """Test that cache_dir is defined in INSTALL_PATHS"""
+    """Test that cache_dir is defined in INSTALL_PATHS under /opt"""
     assert 'cache_dir' in installer.INSTALL_PATHS
-    assert installer.INSTALL_PATHS['cache_dir'] == '/var/cache/logstash-agent'
+    assert installer.INSTALL_PATHS['cache_dir'] == '/opt/logstash-agent/cache'
+    assert installer.INSTALL_PATHS['config_dir'] == '/opt/logstash-agent/config'
+    assert installer.INSTALL_PATHS['state_dir'] == '/opt/logstash-agent/state'
+    assert installer.INSTALL_PATHS['log_dir'] == '/opt/logstash-agent/logs'
 
 
 def test_backup_path_format():
@@ -153,12 +156,12 @@ def test_verify_service_running_active(mock_run):
     result = installer.verify_service_running()
 
     assert result is True
-    mock_run.assert_called_once_with(
-        ['systemctl', 'is-active', 'logstash-agent'],
-        capture_output=True,
-        timeout=5,
-        check=False,
-    )
+    assert mock_run.call_count == 1
+    cmd = mock_run.call_args[0][0]
+    assert cmd[-2:] == ['is-active', 'logstash-agent']
+    assert cmd[0].endswith('systemctl')
+    # Host env must be passed so PyInstaller libs do not break systemctl
+    assert 'env' in mock_run.call_args.kwargs
 
 
 @patch('subprocess.run')
@@ -191,7 +194,7 @@ def test_download_release_from_cache(mock_exists):
     result = installer.download_release('0.1.30', '/tmp/test')
 
     # Should return cached path (normalize for comparison)
-    expected = '/var/cache/logstash-agent/logstash-agent-0.1.30.tar.gz'
+    expected = '/opt/logstash-agent/cache/logstash-agent-0.1.30.tar.gz'
     assert os.path.normpath(result) == os.path.normpath(expected)
 
 
@@ -228,7 +231,7 @@ def test_download_release_downloads_when_not_cached(mock_exists, mock_makedirs, 
         mock_get.assert_called_once_with(expected_url, stream=True, timeout=60)
 
     # Should return cache path (normalize for comparison)
-    expected = '/var/cache/logstash-agent/logstash-agent-0.1.30.tar.gz'
+    expected = '/opt/logstash-agent/cache/logstash-agent-0.1.30.tar.gz'
     assert os.path.normpath(result) == os.path.normpath(expected)
 
 
@@ -412,11 +415,13 @@ def test_perform_upgrade_rollback_failure_provides_manual_steps(mock_exists):
             installer.perform_upgrade('0.1.30', auto=False)
 
 
+@patch('os.path.isdir')
 @patch('os.path.exists')
 @patch('shutil.rmtree')
-def test_perform_uninstallation_with_purge(mock_rmtree, mock_exists):
-    """Test perform_uninstallation removes all directories with --purge"""
+def test_perform_uninstallation_with_purge(mock_rmtree, mock_exists, mock_isdir):
+    """Test perform_uninstallation --purge wipes /opt/logstash-agent"""
     mock_exists.return_value = True
+    mock_isdir.return_value = True
 
     with patch('logstashagent.installer.verify_root'), \
          patch('logstashagent.installer.verify_platform'), \
@@ -425,19 +430,39 @@ def test_perform_uninstallation_with_purge(mock_rmtree, mock_exists):
          patch('os.unlink'), \
          patch('os.path.islink', return_value=True), \
          patch('os.listdir', return_value=[]), \
-         patch('os.rmdir'):
+         patch('os.rmdir'), \
+         patch('logstashagent.install_registry.load_registry', return_value={'instances': {}}), \
+         patch('logstashagent.install_registry.list_instances', return_value=[]), \
+         patch('logstashagent.install_registry.remove_shared_unit_files'):
 
         installer.perform_uninstallation(purge=True)
 
-        # Verify all directories were removed (binary_dir, config_dir, state_dir, log_dir, cache_dir)
-        assert mock_rmtree.call_count >= 5
+        # Opt root wipe + any legacy FHS dirs that mock isdir says exist
+        removed = [str(c.args[0]) for c in mock_rmtree.call_args_list]
+        assert any('/opt/logstash-agent' == p or p.endswith('/opt/logstash-agent') for p in removed) or \
+            installer.INSTALL_PATHS['opt_root'] in removed
+        assert mock_rmtree.call_count >= 1
 
 
+@patch('os.path.isdir')
 @patch('os.path.exists')
 @patch('shutil.rmtree')
-def test_perform_uninstallation_without_purge_preserves_data(mock_rmtree, mock_exists):
-    """Test perform_uninstallation preserves state/log/cache without --purge"""
+def test_perform_uninstallation_without_purge_preserves_data(mock_rmtree, mock_exists, mock_isdir):
+    """Test soft uninstall removes bin+config only; keeps state/logs/cache under opt"""
     mock_exists.return_value = True
+
+    def _isdir(path):
+        # Soft uninstall only rmtree's binary_dir and config_dir
+        return path in (
+            installer.INSTALL_PATHS['binary_dir'],
+            installer.INSTALL_PATHS['config_dir'],
+            installer.INSTALL_PATHS['state_dir'],
+            installer.INSTALL_PATHS['log_dir'],
+            installer.INSTALL_PATHS['cache_dir'],
+            installer.INSTALL_PATHS['opt_root'],
+        )
+
+    mock_isdir.side_effect = _isdir
 
     with patch('logstashagent.installer.verify_root'), \
          patch('logstashagent.installer.verify_platform'), \
@@ -445,14 +470,22 @@ def test_perform_uninstallation_without_purge_preserves_data(mock_rmtree, mock_e
          patch('os.remove'), \
          patch('os.unlink'), \
          patch('os.path.islink', return_value=True), \
-         patch('os.listdir', return_value=[]), \
-         patch('os.rmdir'):
+         patch('os.listdir', return_value=['state', 'logs']), \
+         patch('os.rmdir'), \
+         patch('logstashagent.install_registry.load_registry', return_value={'instances': {}}), \
+         patch('logstashagent.install_registry.list_instances', return_value=[]), \
+         patch('logstashagent.install_registry.remove_shared_unit_files'), \
+         patch('logstashagent.install_registry.save_registry'):
 
         installer.perform_uninstallation(purge=False)
 
-        # Verify only binary_dir and config_dir were removed (not state, log, cache)
-        # Should be exactly 2 calls: binary_dir and config_dir
-        assert mock_rmtree.call_count == 2
+        removed = [str(c.args[0]) for c in mock_rmtree.call_args_list]
+        assert installer.INSTALL_PATHS['binary_dir'] in removed
+        assert installer.INSTALL_PATHS['config_dir'] in removed
+        assert installer.INSTALL_PATHS['state_dir'] not in removed
+        assert installer.INSTALL_PATHS['log_dir'] not in removed
+        assert installer.INSTALL_PATHS['cache_dir'] not in removed
+        assert installer.INSTALL_PATHS['opt_root'] not in removed
 
 
 def test_install_paths_cache_dir_included():

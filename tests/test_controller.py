@@ -497,11 +497,15 @@ class TestCheckIn:
 
 
 class TestRunController:
-    def test_not_enrolled_returns_without_loop(self):
+    def test_not_enrolled_returns_after_wait(self):
+        """Controller polls for enrollment then exits if still missing."""
         with patch.object(controller.agent_state, "get_state", return_value={}):
-            with patch.object(controller.time, "sleep") as sleep:
-                controller.run_controller()
-        sleep.assert_not_called()
+            with patch.object(controller.agent_state, "STATE_DIR", "/tmp/x"):
+                with patch("time.sleep") as sleep:
+                    with patch("time.monotonic", side_effect=[0, 0, 200, 200]):
+                        controller.run_controller()
+        # At least one sleep while waiting (poll interval)
+        assert sleep.called
 
 
 class TestDecryptFromServer:

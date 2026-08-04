@@ -50,6 +50,27 @@ def test_instance_state_and_config_paths():
     )
 
 
+def test_relocate_state_to_copies_secret_key(tmp_path):
+    from logstashagent import agent_state
+    from cryptography.fernet import Fernet
+
+    src = tmp_path / "packaged"
+    dest = tmp_path / "simulate-1" / "state"
+    src.mkdir()
+    agent_state.configure_state_dir(src)
+    try:
+        secret = src / ".secret_key"
+        secret.write_bytes(Fernet.generate_key())
+        agent_state.update_state("agent_id", "reloc-test-id")
+        agent_state.relocate_state_to(dest, leave_source=True)
+        assert (dest / "state.json").is_file()
+        assert (dest / ".secret_key").is_file()
+        assert (dest / ".secret_key").read_bytes() == secret.read_bytes()
+        assert (src / ".secret_key").is_file()  # leave_source keeps packaged key
+    finally:
+        agent_state.configure_state_dir(None)
+
+
 def test_relocate_state_to_isolates(tmp_path):
     agent_state.configure_state_dir(tmp_path / "packaged")
     (tmp_path / "packaged").mkdir()

@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import logging
+import os
 import socket
 
 import requests
@@ -16,12 +17,140 @@ logger = logging.getLogger(__name__)
 
 
 def get_hostname():
-    """Get the hostname of the current machine"""
+    """Short OS hostname (display / fallback only)."""
     try:
         return socket.gethostname()
     except Exception as e:
         logger.warning(f"Failed to get hostname: {e}, using 'unknown-host'")
         return "unknown-host"
+
+
+def _is_multi_label_dns(name: str) -> bool:
+    """True for FQDN-like names (a.b), not bare hostnames or IP literals."""
+    n = (name or "").strip().rstrip(".")
+    if not n or "." not in n:
+        return False
+    try:
+        import ipaddress
+
+        ipaddress.ip_address(n)
+        return False
+    except ValueError:
+        return True
+
+
+def _non_loopback_ipv4s() -> list[str]:
+    ips: list[str] = []
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            if ip and not ip.startswith("127."):
+                ips.append(ip)
+        finally:
+            s.close()
+    except Exception:
+        pass
+    try:
+        hn = socket.gethostname()
+        for info in socket.getaddrinfo(hn, None, socket.AF_INET):
+            ip = info[4][0]
+            if ip and not ip.startswith("127.") and ip not in ips:
+                ips.append(ip)
+    except Exception:
+        pass
+    return ips
+
+
+def _is_ip_literal(host: str) -> bool:
+    h = (host or "").strip()
+    if not h:
+        return False
+    try:
+        import ipaddress
+
+        ipaddress.ip_address(h)
+        return True
+    except ValueError:
+        return False
+
+
+def short_host_label(host: str) -> str:
+    """First DNS label for UX (keep IPs unchanged)."""
+    h = (host or "").strip()
+    if not h:
+        return h
+    if _is_ip_literal(h):
+        return h
+    return h.split(".")[0]
+
+
+def display_host_label(callback_host: str | None = None) -> str:
+    """
+    Short label for connection names / UX.
+
+    When the callback host is an IP (typical default for Docker LogstashUI),
+    use the OS short hostname so names stay human-readable.
+    """
+    host = (callback_host if callback_host is not None else get_callback_host()) or ""
+    if _is_ip_literal(host):
+        return get_hostname()
+    label = short_host_label(host)
+    return label or get_hostname()
+
+
+def get_callback_ip() -> str | None:
+    """Best-effort non-loopback IPv4 for UI→agent callbacks (None if unavailable)."""
+    ips = _non_loopback_ipv4s()
+    return ips[0] if ips else None
+
+
+def get_callback_host() -> str:
+    """
+    Host identity the UI uses to reach this agent (HTTPS base URL host).
+
+    Prefer a routable non-loopback IPv4. LogstashUI often runs in Docker where
+    host DNS (short names and even some FQDNs) is not predictable, so IP is the
+    reliable default for Connection.host / sim health / editor traffic.
+
+    Override: ``LOGSTASH_AGENT_CALLBACK_HOST`` (or ``LOGSTASH_AGENT_HOSTNAME``)
+    when you need a specific FQDN or interface address.
+
+    Fallbacks: multi-label FQDN (PTR / getfqdn), then short hostname.
+    """
+    for env_key in ("LOGSTASH_AGENT_CALLBACK_HOST", "LOGSTASH_AGENT_HOSTNAME"):
+        raw = (os.environ.get(env_key) or "").strip()
+        if raw:
+            return raw
+
+    # 1) Routable IP first — works from containerized LogstashUI without DNS
+    ips = _non_loopback_ipv4s()
+    if ips:
+        logger.info(
+            "Callback host using IP %s (set LOGSTASH_AGENT_CALLBACK_HOST to "
+            "override interface/FQDN)",
+            ips[0],
+        )
+        return ips[0]
+
+    # 2) OS FQDN when multi-label (no usable local IP)
+    try:
+        fqdn = (socket.getfqdn() or "").strip().rstrip(".")
+        if _is_multi_label_dns(fqdn):
+            logger.info("Callback host from getfqdn: %s", fqdn)
+            return fqdn
+    except Exception:
+        pass
+
+    # 3) Short hostname (last resort — may not resolve from UI containers)
+    hn = get_hostname()
+    logger.warning(
+        "Callback host is short hostname %r — LogstashUI may not resolve it. "
+        "Set LOGSTASH_AGENT_CALLBACK_HOST to an FQDN or IP.",
+        hn,
+    )
+    return hn
 
 
 def decode_enrollment_token(encoded_token: str) -> dict:
@@ -86,20 +215,29 @@ def enroll_agent(encoded_token: str, logstash_ui_url: str, agent_id: str) -> dic
             f"Check fingerprint and that {ui_url}/.well-known/logstashui/ca.crt is reachable."
         ) from e
 
-    # Get hostname
-    hostname = get_hostname()
+    # Host the UI will use to call back into this agent (IP preferred for Docker UI)
+    callback_host = get_callback_host()
+    callback_ip = get_callback_ip()
+    short_name = display_host_label(callback_host)
 
     logger.info(f"Enrolling agent with logstashui at {ui_url}")
-    logger.info(f"Hostname: {hostname}")
+    logger.info(f"Callback host (UI → agent): {callback_host}")
+    if callback_ip and callback_ip != callback_host:
+        logger.info(f"Callback IP: {callback_ip}")
+    if short_name != callback_host:
+        logger.info(f"Short host label (display): {short_name}")
     logger.info(f"Agent ID: {agent_id}")
 
     # Prepare enrollment request - send the base64-encoded token, not the decoded one
     enrollment_url = f"{ui_url}/ConnectionManager/Enroll/"
     enrollment_data = {
         "enrollment_token": encoded_token,
-        "host": hostname,
-        "agent_id": agent_id
+        "host": callback_host,
+        "host_short": short_name,
+        "agent_id": agent_id,
     }
+    if callback_ip:
+        enrollment_data["callback_ip"] = callback_ip
     # Request product-CA-signed server cert for agent HTTPS (key stays local)
     try:
         from logstashagent import tls_server

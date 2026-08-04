@@ -57,7 +57,8 @@ class TestLogstashAPIInitialization:
         ) as ctor:
             api = LogstashAPI(use_shared_client=False, timeout=5.0)
 
-        assert api.base_url == "http://localhost:9560"
+        # Default resolves LOGSTASH_API_PORT / state; tests typically see 9560
+        assert api.base_url.startswith("http://localhost:")
         assert api.timeout == 5.0
         assert api._owns_client is True
         ctor.assert_called_once_with(timeout=5.0)

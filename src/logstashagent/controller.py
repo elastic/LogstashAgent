@@ -2466,6 +2466,21 @@ def check_in():
         # compares it against the deployed state (no decryption) and returns a
         # `managed_changes_available` flag; the actual delta is fetched via
         # GetConfigChanges only when something is dirty.
+        # Callback host/IP for UI → agent HTTPS (IP preferred; keep Connection.host current)
+        callback_host = None
+        callback_ip = None
+        try:
+            from logstashagent.enrollment import get_callback_host, get_callback_ip
+
+            callback_host = get_callback_host()
+            callback_ip = get_callback_ip()
+        except Exception:
+            pass
+        if callback_host:
+            status_blob['callback_host'] = callback_host
+        if callback_ip:
+            status_blob['callback_ip'] = callback_ip
+
         check_in_data = {
             'connection_id': connection_id,
             'revision_number': state.get('revision_number', 0),
@@ -2477,6 +2492,10 @@ def check_in():
                 ),
             },
         }
+        if callback_host:
+            check_in_data['host'] = callback_host
+        if callback_ip:
+            check_in_data['callback_ip'] = callback_ip
 
         # Upgrade path: re-issue product-CA server cert without re-enroll
         try:
@@ -2655,15 +2674,44 @@ def run_controller():
     logger.info("=" * 60)
     logger.info("LOGSTASH AGENT CONTROLLER STARTED")
     logger.info("=" * 60)
-    
-    # Load agent state to verify enrollment
-    state = agent_state.get_state()
-    
-    if not state.get('enrolled'):
-        logger.error("Agent is not enrolled!")
-        logger.error("Please enroll the agent first using:")
-        logger.error("  python main.py --enroll <TOKEN> --logstash-ui-url <URL>")
-        return
+
+    # Wait for enrollment state. Multi-instance install can start the unit
+    # while state.json is still being relocated; previously we returned
+    # immediately and never checked in — UI shows Offline while FastAPI stays up.
+    import time as _time
+
+    max_wait_sec = 120
+    poll_sec = 2.0
+    deadline = _time.monotonic() + max_wait_sec
+    state: dict = {}
+    while True:
+        state = agent_state.get_state()
+        if state.get('enrolled') and state.get('api_key') and state.get('connection_id'):
+            break
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            logger.error("Agent is not enrolled (gave up after %ss)!", max_wait_sec)
+            logger.error("State dir: %s", agent_state.STATE_DIR)
+            logger.error("Please enroll the agent first using:")
+            logger.error(
+                "  sudo logstash-agent install --enroll <TOKEN> --logstash-ui-url <URL>"
+            )
+            hint_unit = state.get('agent_unit') or (
+                f"lsagent-simulate@{state.get('instance_id')}"
+                if state.get('instance_id') is not None
+                else "logstash-agent"
+            )
+            logger.error(
+                "If enrollment is already on disk, restart the unit: sudo systemctl restart %s",
+                hint_unit,
+            )
+            return
+        logger.warning(
+            "Waiting for enrollment in %s (%.0fs left)…",
+            agent_state.STATE_DIR,
+            remaining,
+        )
+        _time.sleep(poll_sec)
 
     # Confirm role for upgraded installs (no re-enroll required for default agents)
     raw_mode = (state.get('mode') or 'default')

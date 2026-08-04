@@ -589,12 +589,18 @@ async def _verify_slot_pipelines_loaded_fallback(slot_id: int, expected_count: i
     """
     import asyncio
 
+    log_dir = log_analyzer.resolve_logstash_log_dir(
+        logstash_log_path=_config.get("logstash_log_path") if isinstance(_config, dict) else None,
+    )
     for attempt in range(max_retries):
         try:
-            pipeline_status = log_analyzer.get_running_pipelines()
+            pipeline_status = log_analyzer.get_running_pipelines(log_dir=log_dir)
 
             if not pipeline_status:
-                logger.warning(f"Attempt {attempt + 1}/{max_retries}: No pipeline status found in logs yet")
+                logger.warning(
+                    f"Attempt {attempt + 1}/{max_retries}: No pipeline status found in logs yet "
+                    f"(log_dir={log_dir})"
+                )
                 await asyncio.sleep(retry_delay)
                 continue
 
@@ -672,42 +678,50 @@ def _background_cleanup_worker():
 
 def _load_config() -> Dict[str, Any]:
     """
-    Load configuration from logstashagent.yml.
-    
-    Falls back to simulation mode defaults if config file is not found,
-    ensuring the background cleanup thread always starts in containerized environments.
+    Load agent configuration (prefer LOGSTASH_AGENT_CONFIG / instance yml).
 
-    Returns:
-        Dictionary with configuration settings
+    Falls back to AGENT_MODE env or simulate defaults so multi-instance
+    units still enable the slot cleanup worker.
     """
-    config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'logstashagent.yml')
+    candidates: list[str] = []
+    env_cfg = (os.environ.get("LOGSTASH_AGENT_CONFIG") or "").strip()
+    if env_cfg:
+        candidates.append(env_cfg)
+    candidates.append(
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), "logstashagent.yml")
+    )
+    candidates.append("/opt/logstash-agent/config/logstashagent.yml")
 
-    if not os.path.exists(config_path):
-        logger.warning(f"[Slots] Config file not found at {config_path}, using simulation mode defaults")
-        return {
-            'mode': 'simulation',
-            'simulation_mode': 'embedded'
-        }
+    for config_path in candidates:
+        if not config_path or not os.path.exists(config_path):
+            continue
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = yaml.safe_load(f)
+            if config:
+                return config
+        except Exception as e:
+            logger.error(f"[Slots] Error loading config {config_path}: {e}")
 
-    try:
-        with open(config_path, 'r') as f:
-            config = yaml.safe_load(f)
-            return config if config else {'mode': 'simulation', 'simulation_mode': 'embedded'}
-    except Exception as e:
-        logger.error(f"[Slots] Error loading config: {e}, using simulation mode defaults")
-        return {
-            'mode': 'simulation',
-            'simulation_mode': 'embedded'
-        }
+    env_mode = (os.environ.get("AGENT_MODE") or "").strip().lower()
+    if env_mode:
+        return {"mode": env_mode}
+    logger.warning("[Slots] Config file not found; using simulate defaults")
+    return {"mode": "simulate"}
 
 
-# Conditionally start the background cleanup thread based on config
+# Conditionally start the background cleanup thread based on config / env
 _config = _load_config()
-_mode = _config.get('mode', '').lower()
+_mode = (_config.get("mode") or os.environ.get("AGENT_MODE") or "").lower()
+# Legacy "simulation" plus multi-instance FastAPI roles that allocate slots
+_SLOT_CLEANUP_MODES = frozenset({"simulation", "simulate", "managed", "embedded"})
 
-if _mode == 'simulation':
+if _mode in _SLOT_CLEANUP_MODES:
     _cleanup_thread = Thread(target=_background_cleanup_worker, daemon=True, name="SlotCleanupThread")
     _cleanup_thread.start()
-    logger.info("[Slots] Started background cleanup thread (mode: simulation)")
+    logger.info("[Slots] Started background cleanup thread (mode: %s)", _mode or "simulation")
 else:
-    logger.warning(f"[Slots] Background cleanup thread NOT started (mode: {_mode or 'not set'})")
+    logger.info(
+        "[Slots] Background cleanup thread not started (mode: %s)",
+        _mode or "not set",
+    )

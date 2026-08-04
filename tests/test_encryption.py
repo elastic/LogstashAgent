@@ -71,6 +71,27 @@ class TestGetEncryptionKey:
         assert key_file.exists()
         assert key_file.read_bytes() == key
         assert Fernet(key) is not None
+        # New keys must be owner-readable only
+        assert (key_file.stat().st_mode & 0o777) == 0o600
+
+    def test_write_secret_key_uses_atomic_helper(
+        self, no_env_credential_key, temp_data_dir, monkeypatch
+    ):
+        from pathlib import Path as P
+
+        from logstashagent import encryption as enc
+
+        calls = []
+
+        def fake_write(path, key):
+            calls.append((P(path), key))
+            P(path).write_bytes(key)
+
+        monkeypatch.setattr(enc, "_write_secret_key_file", fake_write)
+        key = get_encryption_key()
+        assert calls
+        assert calls[0][0] == temp_data_dir / ".secret_key"
+        assert calls[0][1] == key
 
     def test_permission_error_reading_key_file(self, no_env_credential_key, temp_data_dir):
         key_file = temp_data_dir / ".secret_key"

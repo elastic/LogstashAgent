@@ -173,7 +173,7 @@ def test_smoke_materialize_managed_and_simulate_isolated(host_tree):
 def test_smoke_version_cache_list_and_prune(host_tree):
     root = host_tree["opt"] / "logstash-versions"
     for ver in ("9.4.3", "8.19.0"):
-        b = root / ver / "bin" / "logstash"
+        b = root / f"logstash-{ver}" / "bin" / "logstash"
         b.parent.mkdir(parents=True)
         b.write_text("#!/bin/sh\n", encoding="utf-8")
         b.chmod(0o755)
@@ -183,8 +183,8 @@ def test_smoke_version_cache_list_and_prune(host_tree):
         result = ld.prune_versions(str(root), keep=set(), keep_used=True, dry_run=False)
     assert "8.19.0" in result["removed"]
     assert "9.4.3" in result["kept"]
-    assert (root / "9.4.3").is_dir()
-    assert not (root / "8.19.0").exists()
+    assert (root / "logstash-9.4.3").is_dir()
+    assert not (root / "logstash-8.19.0").exists()
 
 
 def test_smoke_state_relocate_preserves_packaged(host_tree):

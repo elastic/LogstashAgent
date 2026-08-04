@@ -63,9 +63,13 @@ def tls_dir() -> Path:
     except Exception:
         base = Path.cwd() / "data" / "tls"
     # Prefer install path if present
-    install_tls = Path("/var/lib/logstash-agent/tls")
-    if install_tls.parent.is_dir() and os.access(install_tls.parent, os.W_OK):
-        base = install_tls
+    for candidate in (
+        Path("/opt/logstash-agent/state/tls"),
+        Path("/var/lib/logstash-agent/tls"),  # legacy
+    ):
+        if candidate.parent.is_dir() and os.access(candidate.parent, os.W_OK):
+            base = candidate
+            break
     base.mkdir(parents=True, exist_ok=True)
     return base
 

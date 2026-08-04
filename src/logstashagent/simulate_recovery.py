@@ -44,8 +44,33 @@ _MIN_SECONDS_BETWEEN_RECOVERIES = 45
 
 
 def package_simulate_conf_dir() -> Path:
-    """Directory of shipped simulate_start/end templates."""
-    return Path(__file__).resolve().parent / 'config' / 'simulate'
+    """
+    Directory of shipped simulate_start/end templates.
+
+    Dev: package source tree. PyInstaller: ``_internal/logstashagent/config/simulate/``.
+    """
+    import sys
+
+    beside = Path(__file__).resolve().parent / 'config' / 'simulate'
+    if beside.is_dir() and (beside / 'simulate_start.conf').is_file():
+        return beside
+    candidates = []
+    meipass = getattr(sys, '_MEIPASS', None)
+    if meipass:
+        candidates.append(Path(meipass) / 'logstashagent' / 'config' / 'simulate')
+    try:
+        exe = Path(sys.executable).resolve()
+        candidates.extend([
+            exe.parent / '_internal' / 'logstashagent' / 'config' / 'simulate',
+            exe.parent.parent / '_internal' / 'logstashagent' / 'config' / 'simulate',
+            exe.parent / 'logstashagent' / 'config' / 'simulate',
+        ])
+    except Exception:
+        pass
+    for c in candidates:
+        if c.is_dir() and (c / 'simulate_start.conf').is_file():
+            return c
+    return beside
 
 
 def resolve_settings_path(
@@ -101,6 +126,103 @@ def _metadata_dir(settings_path: Path) -> Path:
 
 def _pipelines_yml(settings_path: Path) -> Path:
     return settings_path / 'pipelines.yml'
+
+
+def resolve_stream_simulate_base_url(
+    ui_url: Optional[str] = None,
+    agent_config: Optional[dict] = None,
+) -> Optional[str]:
+    """
+    Base URL for Logstash HTTP outputs that POST to StreamSimulate.
+
+    Prefer explicit *ui_url*, then LOGSTASH_URL / LOGSTASH_UI_URL env, then
+    enrolled ``logstash_ui_url`` in agent state, then agent_config.
+    """
+    candidates = [
+        ui_url,
+        (os.environ.get("LOGSTASH_URL") or "").strip(),
+        (os.environ.get("LOGSTASH_UI_URL") or "").strip(),
+    ]
+    try:
+        from logstashagent import agent_state
+
+        st = agent_state.get_state() or {}
+        candidates.append((st.get("logstash_ui_url") or "").strip())
+    except Exception:
+        pass
+    if agent_config:
+        candidates.append((agent_config.get("logstash_ui_url") or "").strip())
+        candidates.append((agent_config.get("logstash_url") or "").strip())
+
+    for raw in candidates:
+        if not raw:
+            continue
+        return str(raw).rstrip("/")
+    return None
+
+
+def ensure_logstash_url_in_env(
+    env_path: Path | str,
+    ui_url: Optional[str] = None,
+    *,
+    agent_config: Optional[dict] = None,
+) -> dict[str, Any]:
+    """
+    Ensure instance ``env`` (EnvironmentFile for ls-simulate@N) sets LOGSTASH_URL.
+
+    Harness confs use ``${LOGSTASH_URL:http://host.docker.internal:8080}/...``.
+    Without LOGSTASH_URL, host simulate instances fail DNS for host.docker.internal
+    and StreamSimulate never receives step events.
+    """
+    path = Path(env_path)
+    base = resolve_stream_simulate_base_url(ui_url, agent_config=agent_config)
+    result: dict[str, Any] = {
+        "env_path": str(path),
+        "url": base,
+        "changed": False,
+        "ok": bool(base),
+    }
+    if not base:
+        logger.warning(
+            "Cannot set LOGSTASH_URL in %s: no logstash_ui_url in state/env",
+            path,
+        )
+        return result
+
+    lines: list[str] = []
+    found = False
+    if path.is_file():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("LOGSTASH_URL="):
+                current = line.split("=", 1)[1].strip().strip('"').strip("'")
+                if current.rstrip("/") == base:
+                    found = True
+                    lines.append(line)
+                else:
+                    lines.append(f"LOGSTASH_URL={base}")
+                    found = True
+                    result["changed"] = True
+            else:
+                lines.append(line)
+    if not found:
+        lines.append(f"LOGSTASH_URL={base}")
+        result["changed"] = True
+
+    # Also set LOGSTASH_UI_URL for clarity (same base)
+    has_ui = any(l.startswith("LOGSTASH_UI_URL=") for l in lines)
+    if not has_ui:
+        lines.append(f"LOGSTASH_UI_URL={base}")
+        result["changed"] = True
+
+    if result["changed"] or not path.is_file():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        try:
+            os.chmod(path, 0o640)
+        except OSError:
+            pass
+        logger.info("Wrote LOGSTASH_URL=%s to %s", base, path)
+    return result
 
 
 def seed_static_harness(settings_path: Path, force: bool = False) -> dict[str, Any]:

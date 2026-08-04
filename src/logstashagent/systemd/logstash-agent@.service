@@ -7,7 +7,7 @@ Documentation=https://github.com/elastic/LogstashAgent
 Type=simple
 # Instance paths: /opt/logstash-agent/managed-%i/
 # agent.env sets LOGSTASH_AGENT_STATE_DIR + LOGSTASH_AGENT_CONFIG so this unit
-# does not share /var/lib/logstash-agent or /etc/logstash-agent with packaged.
+# does not share /opt/logstash-agent/state or /opt/logstash-agent/config with packaged.
 EnvironmentFile=-/opt/logstash-agent/managed-%i/agent.env
 # Controller + FastAPI for this managed instance (ports from state/env)
 ExecStart=/opt/logstash-agent/bin/logstash-agent --run --mode managed --instance %i

@@ -5,9 +5,12 @@
 """
 Per-process agent state (state.json).
 
-Host coexistence: Packaged uses ``/var/lib/logstash-agent``; each managed-N /
+Host coexistence: Packaged uses ``/opt/logstash-agent/state``; each managed-N /
 simulate-N instance uses ``/opt/logstash-agent/{role}-{N}/state`` so multiple
 roles on one host do not share agent_id / enrollment secrets.
+
+Legacy packaged state at ``/var/lib/logstash-agent`` is still read if present
+and the new path does not exist (pre-consolidation installs).
 """
 
 from __future__ import annotations
@@ -26,8 +29,9 @@ logger = logging.getLogger(__name__)
 # Keys that should be encrypted when stored
 ENCRYPTED_KEYS = {'api_key', 'keystore_password'}
 
-PACKAGED_STATE_DIR = Path('/var/lib/logstash-agent')
 OPT_ROOT = Path('/opt/logstash-agent')
+PACKAGED_STATE_DIR = OPT_ROOT / 'state'
+_LEGACY_PACKAGED_STATE_DIR = Path('/var/lib/logstash-agent')
 
 # Explicit override (tests / install relocate)
 _state_dir_override: Path | None = None
@@ -115,10 +119,16 @@ def resolve_state_dir(argv: list[str] | None = None) -> Path:
         'install', 'upgrade', 'uninstall', 'list-instances', 'list-versions',
         'ensure-version', 'prune-versions', 'configure', 'setup-simulate',
     ):
+        if PACKAGED_STATE_DIR.exists():
+            return PACKAGED_STATE_DIR
+        if _LEGACY_PACKAGED_STATE_DIR.exists():
+            return _LEGACY_PACKAGED_STATE_DIR
         return PACKAGED_STATE_DIR
 
     if PACKAGED_STATE_DIR.exists():
         return PACKAGED_STATE_DIR
+    if _LEGACY_PACKAGED_STATE_DIR.exists():
+        return _LEGACY_PACKAGED_STATE_DIR
 
     return Path(__file__).parent / 'data'
 
@@ -179,15 +189,21 @@ def get_or_create_agent_id() -> str:
         except (json.JSONDecodeError, IOError) as e:
             logger.warning(f"Failed to read state.json: {e}, generating new agent_id")
 
-    # Generate new agent_id
+    # Generate new agent_id — merge into existing state; never wipe enrollment
     agent_id = str(uuid.uuid4())
     logger.info(f"Generated new agent_id: {agent_id}")
 
-    # Save to state file
-    state = {'agent_id': agent_id}
+    existing: dict = {}
+    if STATE_FILE.exists():
+        try:
+            with open(STATE_FILE, 'r') as f:
+                existing = json.load(f) or {}
+        except (json.JSONDecodeError, IOError):
+            existing = {}
+    existing['agent_id'] = agent_id
     try:
         with open(STATE_FILE, 'w') as f:
-            json.dump(state, f, indent=2)
+            json.dump(existing, f, indent=2)
         logger.info(f"Saved agent_id to {STATE_FILE}")
     except IOError as e:
         logger.error(f"Failed to save state.json: {e}")
@@ -264,15 +280,19 @@ def update_state(key: str, value):
 
 def relocate_state_to(dest_dir: str | Path, *, leave_source: bool = False) -> Path:
     """
-    Copy current state.json into dest_dir/state.json and point this process at it.
+    Copy current state.json (and ``.secret_key``) into dest_dir and point this
+    process at it.
 
     Used after multi-instance enroll (which initially writes packaged state dir)
-    so instance secrets do not remain as the packaged agent's state.
+    so instance secrets do not remain as the packaged agent's state. The Fernet
+    key must move with state.json or encrypted fields become unreadable / a new
+    root-owned key is generated in the instance tree.
     """
     import shutil
 
     refresh_state_paths()
     src = STATE_FILE
+    src_dir = STATE_DIR
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / 'state.json'
@@ -287,5 +307,42 @@ def relocate_state_to(dest_dir: str | Path, *, leave_source: bool = False) -> Pa
                 logger.info("Removed transient enrollment state at %s", src)
             except OSError as e:
                 logger.warning("Could not remove %s after relocate: %s", src, e)
+
+    # Keep Fernet key with the state that was encrypted under it.
+    # Copy via encryption helper when possible so ownership is correct even as root.
+    src_key = Path(src_dir) / '.secret_key'
+    dest_key = dest_dir / '.secret_key'
+    if src_key.is_file():
+        try:
+            key_bytes = src_key.read_bytes()
+            from logstashagent.encryption import _write_secret_key_file
+
+            _write_secret_key_file(dest_key, key_bytes)
+            logger.info("Relocated encryption key %s → %s", src_key, dest_key)
+            if not leave_source and src_key.resolve() != dest_key.resolve():
+                try:
+                    src_key.unlink()
+                except OSError:
+                    pass
+        except Exception as e:
+            # Fallback: plain copy + chown
+            logger.warning("Atomic key relocate failed (%s); falling back to copy2", e)
+            try:
+                shutil.copy2(src_key, dest_key)
+                os.chmod(dest_key, 0o600)
+                from logstashagent.encryption import _chown_to_logstash, ensure_secret_key_ownership
+
+                _chown_to_logstash(dest_key)
+                ensure_secret_key_ownership(dest_dir)
+            except OSError as e2:
+                logger.warning("Could not relocate .secret_key: %s", e2)
+    else:
+        try:
+            from logstashagent.encryption import ensure_secret_key_ownership
+
+            ensure_secret_key_ownership(dest_dir)
+        except Exception as e:
+            logger.debug("ensure_secret_key_ownership after relocate: %s", e)
+
     configure_state_dir(dest_dir)
     return dest

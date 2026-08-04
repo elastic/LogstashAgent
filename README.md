@@ -73,7 +73,10 @@ Legacy `mode: agent|host` maps to **packaged** at startup (see logs: `mode=packa
 <details>
 <summary><b>Local State + Credential Protection</b> - Persist agent identity and encrypted sensitive fields.</summary>
 
-- Packaged state: `/var/lib/logstash-agent/state.json`
+- Packaged state: `/opt/logstash-agent/state/state.json`
+- Packaged config: `/opt/logstash-agent/config/logstash-agent.yml`
+- Packaged logs: `/opt/logstash-agent/logs/`
+- CLI symlink (only path outside `/opt`): `/usr/local/bin/logstash-agent`
 - Multi-instance state: `/opt/logstash-agent/{managed,simulate}-N/state/state.json`
 - Dev/source default: `src/logstashagent/data/state.json`
 - Encryption key and logs under the same state parent (or package log dir)
