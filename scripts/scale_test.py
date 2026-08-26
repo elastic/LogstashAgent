@@ -148,6 +148,9 @@ class MetricBucket:
             "elapsed_seconds": round(max(0.0, elapsed), 3),
             "requests_per_second": round(self.attempts / elapsed, 3) if elapsed > 0 else 0.0,
             "latency_seconds": {
+                "average": sum(latencies) / len(latencies) if latencies else None,
+                "median": percentile(latencies, 0.50),
+                "min": min(latencies) if latencies else None,
                 "p50": percentile(latencies, 0.50),
                 "p95": percentile(latencies, 0.95),
                 "p99": percentile(latencies, 0.99),
@@ -171,7 +174,10 @@ class MetricBucket:
         return (
             f"{label} {count} | success {self.successes:,} | failed {self.failures:,} "
             f"| {summary['requests_per_second']:.1f}/sec "
-            f"| p50 {format_latency(latencies['p50'])} "
+            f"| avg {format_latency(latencies['average'])} "
+            f"| median {format_latency(latencies['median'])} "
+            f"| min {format_latency(latencies['min'])} "
+            f"| max {format_latency(latencies['max'])} "
             f"| p95 {format_latency(latencies['p95'])} "
             f"| p99 {format_latency(latencies['p99'])} "
             f"| locked {locked:,} | timeouts {timeouts:,}"
@@ -697,7 +703,10 @@ async def minute_reporter(state: ScaleState) -> None:
             f"| config fetches {state.config_fetches.attempts:,} "
             f"| locked {summary['errors'].get('sqlite_locked', 0):,} "
             f"| timeouts {summary['errors'].get('timeout', 0):,} "
-            f"| p50 {format_latency(latencies['p50'])} "
+            f"| avg {format_latency(latencies['average'])} "
+            f"| median {format_latency(latencies['median'])} "
+            f"| min {format_latency(latencies['min'])} "
+            f"| max {format_latency(latencies['max'])} "
             f"| p95 {format_latency(latencies['p95'])} "
             f"| p99 {format_latency(latencies['p99'])}"
         )
@@ -900,7 +909,10 @@ def print_final_report(report: dict[str, Any], report_path: Path) -> None:
             f"{key.replace('_', ' ').title():20} "
             f"attempts={item['attempts']:,} success={item['successes']:,} "
             f"failed={item['failures']:,} rate={item['requests_per_second']:.1f}/sec "
-            f"p50={format_latency(latency['p50'])} "
+            f"avg={format_latency(latency['average'])} "
+            f"median={format_latency(latency['median'])} "
+            f"min={format_latency(latency['min'])} "
+            f"max={format_latency(latency['max'])} "
             f"p95={format_latency(latency['p95'])} "
             f"p99={format_latency(latency['p99'])}"
         )
