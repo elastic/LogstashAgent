@@ -515,8 +515,9 @@ def build_identity(index: int, run_id: str) -> Identity:
     )
 
 
-async def generate_identities(count: int, run_id: str) -> list[Identity]:
-    print(f"Preparing {count:,} unique RSA keys and CSRs (excluded from server timings)...")
+async def generate_identities(count: int, run_id: str, *, offset: int = 0) -> list[Identity]:
+    label = f"(retry offset +{offset:,}) " if offset else ""
+    print(f"Preparing {count:,} unique RSA keys and CSRs {label}(excluded from server timings)...")
     worker_count = min(32, max(4, (os.cpu_count() or 4) * 2))
     semaphore = asyncio.Semaphore(worker_count)
     completed = 0
@@ -530,7 +531,9 @@ async def generate_identities(count: int, run_id: str) -> list[Identity]:
             print(f"Prepared identities {completed:,}/{count:,}")
         return identity
 
-    return list(await asyncio.gather(*(one(index) for index in range(1, count + 1))))
+    return list(
+        await asyncio.gather(*(one(index) for index in range(offset + 1, offset + count + 1)))
+    )
 
 
 async def post_json(
@@ -946,8 +949,143 @@ def save_report(state: ScaleState) -> tuple[dict[str, Any], Path]:
     return report, path
 
 
-async def run_scale(args: argparse.Namespace) -> int:
-    identities = await generate_identities(args.num_of_agents, args.run_id)
+# ---------------------------------------------------------------------------
+# TSV reporting
+# ---------------------------------------------------------------------------
+
+def _tv(v: Any, precision: int = 6) -> str:
+    """Format a scalar for TSV: None → 'n/a', floats rounded, rest stringified."""
+    if v is None:
+        return "n/a"
+    if isinstance(v, float):
+        return f"{v:.{precision}f}"
+    return str(v).replace("\t", " ")
+
+
+def _errors_cell(errors: dict[str, int], limit: int = 5) -> str:
+    """Render top errors as 'key=count; key=count' — safe for a single TSV cell."""
+    if not errors:
+        return "none"
+    return "; ".join(f"{k}={v}" for k, v in list(errors.items())[:limit])
+
+
+ENROLLMENT_TSV_HEADERS: list[str] = [
+    "run_id", "started_at", "requested_agents", "enrolled_agents",
+    "attempts", "successes", "failures", "success_rate_pct",
+    "elapsed_s", "req_per_s",
+    "lat_avg_s", "lat_median_s", "lat_min_s", "lat_max_s", "lat_p95_s", "lat_p99_s",
+    "bytes_sent", "bytes_received", "top_errors",
+]
+
+CHECKIN_TSV_HEADERS: list[str] = [
+    "run_id", "started_at", "requested_agents", "enrolled_agents", "num_check_ins_per_agent",
+    "initial_attempts", "initial_successes", "initial_failures",
+    "periodic_attempts", "periodic_successes", "periodic_failures",
+    "all_attempts", "all_successes", "all_failures",
+    "all_success_rate_pct", "all_elapsed_s", "all_req_per_s",
+    "lat_avg_s", "lat_median_s", "lat_min_s", "lat_max_s", "lat_p95_s", "lat_p99_s",
+    "config_fetch_attempts", "config_fetch_successes", "config_fetch_failures",
+    "bytes_sent", "bytes_received", "top_errors",
+]
+
+
+def _enrollment_tsv_row(report: dict[str, Any]) -> list[str]:
+    m = report["metrics"]["enrollment"]
+    lat = m["latency_seconds"]
+    return [
+        report["run_id"],
+        report["started_at"],
+        _tv(report["configuration"]["requested_agents"]),
+        _tv(report["enrolled_agents"]),
+        _tv(m["attempts"]),
+        _tv(m["successes"]),
+        _tv(m["failures"]),
+        _tv(m["success_rate_percent"]),
+        _tv(m["elapsed_seconds"]),
+        _tv(m["requests_per_second"]),
+        _tv(lat["average"]),
+        _tv(lat["median"]),
+        _tv(lat["min"]),
+        _tv(lat["max"]),
+        _tv(lat["p95"]),
+        _tv(lat["p99"]),
+        _tv(m["bytes_sent"]),
+        _tv(m["bytes_received"]),
+        _errors_cell(m["errors"]),
+    ]
+
+
+def _checkin_tsv_row(report: dict[str, Any]) -> list[str]:
+    metrics = report["metrics"]
+    ic = metrics["initial_checkins"]
+    pc = metrics["periodic_checkins"]
+    ac = metrics["all_checkins"]
+    cf = metrics["config_fetches"]
+    lat = ac["latency_seconds"]
+    bytes_sent = ac["bytes_sent"] + cf["bytes_sent"]
+    bytes_received = ac["bytes_received"] + cf["bytes_received"]
+    combined_errors: Counter[str] = Counter(ac["errors"]) + Counter(cf["errors"])
+    return [
+        report["run_id"],
+        report["started_at"],
+        _tv(report["configuration"]["requested_agents"]),
+        _tv(report["enrolled_agents"]),
+        _tv(report["configuration"]["num_check_ins_per_agent"]),
+        _tv(ic["attempts"]),
+        _tv(ic["successes"]),
+        _tv(ic["failures"]),
+        _tv(pc["attempts"]),
+        _tv(pc["successes"]),
+        _tv(pc["failures"]),
+        _tv(ac["attempts"]),
+        _tv(ac["successes"]),
+        _tv(ac["failures"]),
+        _tv(ac["success_rate_percent"]),
+        _tv(ac["elapsed_seconds"]),
+        _tv(ac["requests_per_second"]),
+        _tv(lat["average"]),
+        _tv(lat["median"]),
+        _tv(lat["min"]),
+        _tv(lat["max"]),
+        _tv(lat["p95"]),
+        _tv(lat["p99"]),
+        _tv(cf["attempts"]),
+        _tv(cf["successes"]),
+        _tv(cf["failures"]),
+        _tv(bytes_sent),
+        _tv(bytes_received),
+        _errors_cell(dict(combined_errors.most_common())),
+    ]
+
+
+def append_tsv_row(path: Path, headers: list[str], row: list[str]) -> None:
+    """Write header if the file is new/empty, then append one data row."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.exists() or path.stat().st_size == 0
+    with path.open("a", encoding="utf-8", newline="") as fh:
+        if write_header:
+            fh.write("\t".join(headers) + "\n")
+        fh.write("\t".join(row) + "\n")
+
+
+async def run_enrollment_batch(
+    state: ScaleState, identities: list[Identity]
+) -> list[VirtualAgent]:
+    """Enroll a batch of identities concurrently; return only the successful agents."""
+    semaphore = asyncio.Semaphore(ENROLLMENT_CONCURRENCY)
+    enrolled: list[VirtualAgent] = []
+
+    async def one(identity: Identity) -> None:
+        async with semaphore:
+            agent = await enroll_identity(state, identity)
+        if agent is not None:
+            enrolled.append(agent)
+
+    await asyncio.gather(*(one(identity) for identity in identities))
+    return enrolled
+
+
+async def run_scale(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     limits = httpx.Limits(max_connections=None, max_keepalive_connections=0)
     async with httpx.AsyncClient(
         verify=args.ssl_context,
@@ -958,33 +1096,69 @@ async def run_scale(args: argparse.Namespace) -> int:
         follow_redirects=False,
     ) as client:
         state = ScaleState(args=args, run_id=args.run_id, client=client)
-        semaphore = asyncio.Semaphore(ENROLLMENT_CONCURRENCY)
         return_code: int | None = None
-
-        async def enroll_and_start(identity: Identity) -> None:
-            async with semaphore:
-                agent = await enroll_identity(state, identity)
-            if agent is not None:
-                state.agents.append(agent)
-                state.agent_tasks.append(asyncio.create_task(agent_loop(state, agent)))
+        _report: dict[str, Any] = {}
 
         try:
+            # --- Phase 1: enrollment with retries ---
             print(
                 f"Starting enrollment blast: {args.num_of_agents:,} agents, "
                 f"{ENROLLMENT_CONCURRENCY} concurrent requests, fresh connections"
             )
-            await asyncio.gather(*(enroll_and_start(identity) for identity in identities))
-            print(state.enrollment.progress_line("Enrollment final", args.num_of_agents))
+            identities = await generate_identities(args.num_of_agents, args.run_id)
+            batch = await run_enrollment_batch(state, identities)
+            state.agents.extend(batch)
+            print(state.enrollment.progress_line("Enrollment round 1", args.num_of_agents))
+
+            identity_offset = args.num_of_agents
+            for retry_round in range(1, args.enrollment_retries + 1):
+                shortfall = args.num_of_agents - len(state.agents)
+                if shortfall <= 0:
+                    break
+                print(
+                    f"Enrollment retry {retry_round}/{args.enrollment_retries}: "
+                    f"{len(state.agents):,}/{args.num_of_agents:,} enrolled, "
+                    f"need {shortfall:,} more..."
+                )
+                retry_identities = await generate_identities(
+                    shortfall, args.run_id, offset=identity_offset
+                )
+                identity_offset += shortfall
+                batch = await run_enrollment_batch(state, retry_identities)
+                if not batch:
+                    print(
+                        f"Enrollment retry {retry_round}: zero new agents enrolled; "
+                        f"stopping retries."
+                    )
+                    break
+                state.agents.extend(batch)
+                print(state.enrollment.progress_line(
+                    f"Enrollment after retry {retry_round}", args.num_of_agents
+                ))
+
             if not state.agents:
                 state.checkins_done.set()
                 print("No agents enrolled successfully; skipping check-ins.")
                 return_code = 1
             else:
+                shortfall = args.num_of_agents - len(state.agents)
+                if shortfall:
+                    print(
+                        f"Enrollment complete with shortfall: "
+                        f"{len(state.agents):,}/{args.num_of_agents:,} agents enrolled "
+                        f"({shortfall:,} could not be recovered after "
+                        f"{args.enrollment_retries} retries)."
+                    )
+                else:
+                    print(
+                        f"Enrollment complete: all {len(state.agents):,} agents enrolled."
+                    )
                 print(
-                    f"Enrollment complete. Running {args.num_check_ins:,} check-ins for each "
-                    f"of {len(state.agents):,} active agents, every "
-                    f"{CHECKIN_INTERVAL_SECONDS:g} ± {CHECKIN_JITTER_SECONDS:g} seconds."
+                    f"Starting {args.num_check_ins:,} check-ins per agent, "
+                    f"every {CHECKIN_INTERVAL_SECONDS:g} ± {CHECKIN_JITTER_SECONDS:g} seconds."
                 )
+                for agent in state.agents:
+                    state.agent_tasks.append(asyncio.create_task(agent_loop(state, agent)))
                 reporter = asyncio.create_task(minute_reporter(state))
                 initial_reporter = asyncio.create_task(initial_checkin_reporter(state))
                 await asyncio.gather(*state.agent_tasks)
@@ -1025,8 +1199,8 @@ async def run_scale(args: argparse.Namespace) -> int:
                         completed_at=time.monotonic(),
                     )
                 )
-            report, report_path = save_report(state)
-            print_final_report(report, report_path)
+            _report, report_path = save_report(state)
+            print_final_report(_report, report_path)
 
         has_failures = any(
             bucket.failures
@@ -1041,10 +1215,10 @@ async def run_scale(args: argparse.Namespace) -> int:
         duplicates = duplicate_allocations(state.agents)
         has_duplicates = any(duplicates[field_name] for field_name in duplicates)
         if state.interrupted:
-            return 130
+            return 130, _report
         if return_code is not None:
-            return return_code
-        return 1 if has_failures or has_duplicates else 0
+            return return_code, _report
+        return (1 if has_failures or has_duplicates else 0), _report
 
 
 def build_ssl_context(token_payload: dict[str, Any], ui_url: str) -> ssl.SSLContext:
@@ -1055,11 +1229,38 @@ def build_ssl_context(token_payload: dict[str, Any], ui_url: str) -> ssl.SSLCont
     return agent_ssl_context()
 
 
+def _parse_increment_agents(value: str, parser: argparse.ArgumentParser) -> list[int]:
+    try:
+        parts = [int(p.strip()) for p in value.split(",")]
+        if len(parts) != 3:
+            raise ValueError("expected exactly 3 comma-separated values")
+        start, end, step = parts
+        if any(v <= 0 for v in (start, end, step)):
+            raise ValueError("START, END, and STEP must all be positive integers")
+        if start > end:
+            raise ValueError("START must be less than or equal to END")
+    except ValueError as exc:
+        parser.error(f"--increment-agents: {exc} (format: START,END,STEP e.g. 10,200,10)")
+    counts = list(range(start, end + 1, step))
+    if not counts:
+        parser.error("--increment-agents produced an empty range; check your START, END, and STEP values")
+    return counts
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Scale-test LogstashUI with wire-compatible virtual Logstash Agents."
     )
-    parser.add_argument("--num-of-agents", type=int, help="Number of virtual agents")
+    agent_count_group = parser.add_mutually_exclusive_group()
+    agent_count_group.add_argument("--num-of-agents", type=int, help="Number of virtual agents")
+    agent_count_group.add_argument(
+        "--increment-agents",
+        metavar="START,END,STEP",
+        help=(
+            "Run sequential scale tests incrementing the agent count. "
+            "Format: START,END,STEP (e.g. 10,200,10 runs at 10, 20, 30, ..., 200 agents)"
+        ),
+    )
     parser.add_argument(
         "--num-check-ins",
         type=int,
@@ -1079,6 +1280,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=20260825, help="Deterministic workload seed")
     parser.add_argument(
+        "--enrollment-retries",
+        type=int,
+        default=3,
+        help=(
+            "Maximum number of additional enrollment rounds to run when the initial blast "
+            "does not enroll all requested agents (default: 3; 0 disables retries)"
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         default=str(PROJECT_ROOT / "scale-test-results"),
         help="Directory for JSON reports",
@@ -1089,10 +1299,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     if args.cleanup:
         return args
+
+    if args.increment_agents:
+        args.agent_counts = _parse_increment_agents(args.increment_agents, parser)
+        args.num_of_agents = args.agent_counts[0]
+    else:
+        args.agent_counts = [args.num_of_agents] if args.num_of_agents is not None else []
+
     missing = [
         option
         for option, value in (
-            ("--num-of-agents", args.num_of_agents),
+            ("--num-of-agents / --increment-agents", args.num_of_agents),
             ("--num-check-ins", args.num_check_ins),
             ("--enrollment-token", args.enrollment_token),
         )
@@ -1126,7 +1343,42 @@ async def async_main(args: argparse.Namespace) -> int:
     args.ssl_context = await asyncio.to_thread(
         build_ssl_context, token_payload, args.logstash_ui_url
     )
-    return await run_scale(args)
+
+    output_dir = Path(args.output_dir).resolve()
+    sequence_id = utc_now().strftime("%Y%m%dT%H%M%SZ") + f"-{uuid.uuid4().hex[:6]}"
+    enrollment_tsv = output_dir / f"scale-test-enrollment-{sequence_id}.tsv"
+    checkin_tsv = output_dir / f"scale-test-checkins-{sequence_id}.tsv"
+
+    def _append_tsv(report: dict[str, Any]) -> None:
+        if not report:
+            return
+        append_tsv_row(enrollment_tsv, ENROLLMENT_TSV_HEADERS, _enrollment_tsv_row(report))
+        append_tsv_row(checkin_tsv, CHECKIN_TSV_HEADERS, _checkin_tsv_row(report))
+
+    if len(args.agent_counts) == 1:
+        exit_code, report = await run_scale(args)
+        _append_tsv(report)
+        print(f"TSV enrollment : {enrollment_tsv}")
+        print(f"TSV check-ins  : {checkin_tsv}")
+        return exit_code
+
+    overall_exit = 0
+    for i, count in enumerate(args.agent_counts, 1):
+        args.num_of_agents = count
+        args.run_id = utc_now().strftime("%Y%m%dT%H%M%SZ") + f"-{uuid.uuid4().hex[:6]}"
+        print(f"\n{'=' * 78}")
+        print(f"INCREMENT RUN {i}/{len(args.agent_counts)}: {count:,} agents")
+        print(f"{'=' * 78}")
+        exit_code, report = await run_scale(args)
+        _append_tsv(report)
+        if exit_code not in (0, 130):
+            overall_exit = exit_code
+        if exit_code == 130:
+            print("Increment sequence interrupted.")
+            break
+    print(f"\nTSV enrollment : {enrollment_tsv}")
+    print(f"TSV check-ins  : {checkin_tsv}")
+    return 130 if exit_code == 130 else overall_exit
 
 
 def main(argv: list[str] | None = None) -> int:
