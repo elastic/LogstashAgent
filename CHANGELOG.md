@@ -1,4 +1,4 @@
-## [0.5.1] - Agent roles, multi-instance, TLS, pure-Python keystores - TBD
+## [0.5.1] - Agent roles, multi-instance, TLS, pure-Python keystores - 08/31/2026
 
 Package version is **0.5.1**. Pair with **LogstashUI 0.5.1**.
 
@@ -38,6 +38,17 @@ Package version is **0.5.1**. Pair with **LogstashUI 0.5.1**.
 - **Production agents do not need to re-enroll.** Upgrade package, restart the unit, confirm `mode=packaged` or `mode=default` in logs.
 - Add Simulate/Managed instances with a new policy token (`install --enroll` or enroll + `setup-simulate`); existing Packaged service is left alone.
 - Day-2: `logstash-agent list-instances` for a host map.
+
+### Scale testing
+
+- Added `scripts/scale_test.py` — end-to-end scale test that enrolls N agents, collects timing metrics, and generates a markdown report.
+- Report includes average, median, min, and max enrollment and check-in latencies per batch.
+- Automated mode: iterates over increasing agent counts and accumulates results across runs.
+- Batch enrollment is resilient — test continues with however many agents successfully enrolled.
+
+### Fixed
+
+- Fixed additional edge cases in cold-start sequencing that could cause the agent controller to report Offline on fresh installs.
 
 
 ## [0.3.2] - SNMP compatibility
