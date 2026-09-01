@@ -404,6 +404,11 @@ def sim_logstash_api_port() -> int:
 # Restart counter for systemctl-managed simulate (supervisor has its own)
 _sim_systemctl_restart_count = 0
 
+# Monotonic timestamp of when the systemctl-managed simulate Logstash last became
+# healthy (None until the first healthy probe after start/restart).  The supervisor
+# tracks the equivalent value for embedded mode via _healthy_since.
+_sim_systemctl_healthy_since: float | None = None
+
 
 def check_sim_logstash_health() -> dict:
     """
@@ -449,6 +454,39 @@ def check_sim_logstash_health() -> dict:
     }
 
 
+# How long after Logstash first becomes healthy we wait before accepting slot
+# allocations.  The Logstash pipeline bus can lag several seconds behind the
+# HTTP API becoming responsive; allocations during this window produce pipelines
+# that start and silently terminate in ~172ms, leaving a dead bus address.
+PIPELINE_BUS_WARMUP_SECONDS = 15.0
+
+
+def _get_logstash_healthy_duration() -> float | None:
+    """
+    Return how many seconds Logstash has been continuously healthy since its
+    last start or restart, or None if it has never been healthy in this session.
+
+    For embedded mode: reads from the supervisor's ``_healthy_since`` timestamp.
+    For systemctl-managed simulate: reads the module-level ``_sim_systemctl_healthy_since``.
+
+    NOTE: intentionally does NOT call get_supervisor() — that lazily creates a
+    supervisor even for systemctl-managed instances, which would always return None
+    and prevent the systemctl path from ever being reached.
+    """
+    # Systemctl-managed simulate has no in-process supervisor; use module-level var.
+    if is_systemctl_managed_simulate():
+        if _sim_systemctl_healthy_since is None:
+            return None
+        return time.monotonic() - _sim_systemctl_healthy_since
+
+    # Embedded / legacy host: read directly from the existing supervisor instance
+    # without creating one (get_supervisor() would lazily instantiate a fresh one).
+    supervisor = logstash_supervisor._supervisor
+    if supervisor is None or supervisor._healthy_since is None:
+        return None
+    return time.monotonic() - supervisor._healthy_since
+
+
 def trigger_sim_logstash_restart(reason: str = 'Manual restart') -> bool:
     """
     Restart Logstash for sim failure recovery.
@@ -459,11 +497,13 @@ def trigger_sim_logstash_restart(reason: str = 'Manual restart') -> bool:
 
     Embedded / legacy host: in-process supervisor restart (still clears slots).
     """
-    global _sim_systemctl_restart_count
+    global _sim_systemctl_restart_count, _sim_systemctl_healthy_since
     if is_systemctl_managed_simulate():
         logger.warning(
             "Simulate recovery restart (bare pipelines + systemctl): %s", reason
         )
+        # Clear healthy timestamp so the warmup gate rearms after the restart.
+        _sim_systemctl_healthy_since = None
         from logstashagent import simulate_recovery
 
         result = simulate_recovery.recover_simulate_logstash(
@@ -591,13 +631,15 @@ def trigger_sim_logstash_hard_restart(reason: str = "bus storm hard restart") ->
     Stuck AbstractPipelineBus retries do not drain even when the destination
     pipeline is listed — only killing the process clears them.
     """
-    global _sim_systemctl_restart_count
+    global _sim_systemctl_restart_count, _sim_systemctl_healthy_since
 
     logger.error(
         "Simulate HARD restart (kill -9 JVM + recovery/restart): %s", reason
     )
 
     if is_systemctl_managed_simulate():
+        # Clear healthy timestamp so the warmup gate rearms after the hard restart.
+        _sim_systemctl_healthy_since = None
         kill_info = force_kill_simulate_logstash_jvm(reason=reason)
         logger.error(
             "force_kill result: unit=%s pids=%s errors=%s",
@@ -1025,8 +1067,13 @@ def _simulate_watchdog_loop():
                 continue
             health = check_sim_logstash_health()
             if health.get('healthy'):
+                global _sim_systemctl_healthy_since
+                if _sim_systemctl_healthy_since is None:
+                    _sim_systemctl_healthy_since = time.monotonic()
                 failures = 0
                 continue
+            # Logstash became unhealthy — reset so the next healthy probe records a fresh timestamp
+            _sim_systemctl_healthy_since = None
             failures += 1
             logger.warning(
                 "Simulate watchdog: Logstash unhealthy (failures=%s via=%s)",
@@ -2221,6 +2268,33 @@ async def allocate_simulation_slot(body: dict[str, Any]):
     if not pipelines:
         raise HTTPException(status_code=400, detail="Missing 'pipelines' field or empty pipeline list")
 
+    # Startup warmup gate: reject allocations while the pipeline bus is still
+    # initializing.  Logstash's HTTP API becomes responsive before the
+    # pipeline-to-pipeline bus is ready; a pipeline created in this window
+    # starts and silently terminates in ~172ms, leaving a dead bus address.
+    healthy_for = _get_logstash_healthy_duration()
+    if healthy_for is None or healthy_for < PIPELINE_BUS_WARMUP_SECONDS:
+        remaining = (
+            int(PIPELINE_BUS_WARMUP_SECONDS - healthy_for) + 1
+            if healthy_for is not None
+            else int(PIPELINE_BUS_WARMUP_SECONDS)
+        )
+        logger.info(
+            "allocate rejected: Logstash pipeline bus still initializing "
+            "(healthy_for=%s retry_after=%ss)",
+            f"{healthy_for:.1f}s" if healthy_for is not None else "never",
+            remaining,
+        )
+        raise HTTPException(
+            status_code=503,
+            headers={"Retry-After": str(remaining)},
+            detail={
+                "error": "logstash_initializing",
+                "message": "Logstash pipeline bus is still initializing, retry shortly",
+                "retry_after_seconds": remaining,
+            },
+        )
+
     content_hash = slots._compute_pipeline_hash(pipelines)
 
     # Single-flight: one leader create/verify per content hash; others join.
@@ -2391,6 +2465,32 @@ async def _allocate_simulation_slot_impl(
                 except Exception as e:
                     logger.warning("Force-delete %s failed: %s", first_pipeline_name, e)
             timings_ms["evict_wait"] = _ms_since(t0)
+
+        # When the pipeline appears listed but was created during a cold-start race
+        # it may have already terminated (Logstash bus not ready → 172ms silent exit).
+        # Trust detect_pipeline_state over mere listing: if the pipeline isn't
+        # idle/running it isn't bus-ready, so force-delete and recreate.
+        if pipelines_exist:
+            try:
+                with LogstashAPI(timeout=3.0) as api:
+                    bus_state = api.detect_pipeline_state(first_pipeline_name)
+            except Exception as _e:
+                bus_state = "unknown"
+                logger.debug("bus-ready check for %s failed: %s", first_pipeline_name, _e)
+            if bus_state not in ("idle", "running"):
+                logger.warning(
+                    "Slot %s pipeline %s is listed but not bus-ready (state=%s) — "
+                    "forcing delete and recreate",
+                    slot_id,
+                    first_pipeline_name,
+                    bus_state,
+                )
+                try:
+                    delete_pipeline_internal(first_pipeline_name)
+                    await asyncio.sleep(0.5)
+                except Exception as _e:
+                    logger.warning("Force-delete before recreate failed: %s", _e)
+                pipelines_exist = False
 
         # Create pipelines if they don't exist (new slot or reused slot with deleted pipelines)
         created_or_rebuilt = False
