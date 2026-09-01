@@ -33,9 +33,12 @@ class TestSupervisorInit:
         sup = LogstashSupervisor(config=supervisor_config_embedded)
         assert sup.simulation_mode_type == "embedded"
 
-    def test_host_mode_config(self, supervisor_config_host):
+    def test_host_mode_config_collapses_to_embedded_process(self, supervisor_config_host):
+        """Legacy simulation_mode=host still uses embedded process ownership."""
         sup = LogstashSupervisor(config=supervisor_config_host)
-        assert sup.simulation_mode_type == "host"
+        assert sup.simulation_mode_type == "embedded"
+        assert sup.legacy_host_layout is True
+        assert sup.run_as_logstash_user is True
 
     def test_settings_path_trailing_slash_added(self):
         sup = LogstashSupervisor(config={"logstash_settings": "/etc/logstash"})
@@ -92,7 +95,7 @@ class TestStartLogstash:
             os.environ.pop("LOGSTASH_URL", None)
             supervisor_instance.start_logstash()
         env = mock_popen.call_args[1]["env"]
-        assert env["LOGSTASH_URL"] == "http://host.docker.internal:8080"
+        assert env["LOGSTASH_URL"] == "https://logstashui:8443"
 
     @patch("logstashagent.logstash_supervisor.os.name", "posix")
     @patch("logstashagent.logstash_supervisor.os.getpgid", return_value=12345)
@@ -104,12 +107,12 @@ class TestStartLogstash:
                                            reset_supervisor_global):
         mock_popen.return_value = mock_logstash_process
         sup = LogstashSupervisor(config=supervisor_config_host)
-        with patch.object(sup, "setup_host_mode"), \
+        with patch.object(sup, "ensure_sim_layout"), \
              patch.dict(os.environ, {}, clear=False):
             os.environ.pop("LOGSTASH_URL", None)
             sup.start_logstash()
         env = mock_popen.call_args[1]["env"]
-        assert env["LOGSTASH_URL"] == "https://localhost"
+        assert env["LOGSTASH_URL"] == "https://localhost:8443"
 
     @patch("logstashagent.logstash_supervisor.os.name", "posix")
     @patch("logstashagent.logstash_supervisor.os.path.exists", return_value=False)
@@ -159,12 +162,12 @@ class TestStartLogstash:
     @patch("logstashagent.logstash_supervisor.subprocess.Popen")
     @patch("logstashagent.logstash_supervisor.os.path.exists", return_value=True)
     @patch("logstashagent.logstash_supervisor.os.chmod")
-    def test_start_host_mode_calls_setup(self, _c, _e, mock_popen, _getpgid,
+    def test_start_calls_ensure_sim_layout(self, _c, _e, mock_popen, _getpgid,
                                           supervisor_config_host, mock_logstash_process,
                                           reset_supervisor_global):
         mock_popen.return_value = mock_logstash_process
         sup = LogstashSupervisor(config=supervisor_config_host)
-        with patch.object(sup, "setup_host_mode") as mock_setup:
+        with patch.object(sup, "ensure_sim_layout") as mock_setup:
             sup.start_logstash()
             mock_setup.assert_called_once()
 
@@ -560,37 +563,26 @@ class TestMonitorLoop:
             assert call_count[0] >= 2
 
 
-# ---- TestHostModeSetup ----
+# ---- TestEnsureSimLayout ----
 
-class TestHostModeSetup:
-    def test_raises_missing_config_dir(self, supervisor_config_host):
-        sup = LogstashSupervisor(config=supervisor_config_host)
-        with patch("logstashagent.logstash_supervisor.os.path.exists",
-                   return_value=False):
-            with pytest.raises(FileNotFoundError, match="Config directory not found"):
-                sup.setup_host_mode()
+class TestEnsureSimLayout:
+    def test_seeds_harness_and_dirs(self, supervisor_config_host, tmp_path):
+        settings = str(tmp_path / "settings")
+        cfg = dict(supervisor_config_host)
+        cfg["logstash_settings"] = settings
+        cfg["logstash_log_path"] = str(tmp_path / "logs")
+        sup = LogstashSupervisor(config=cfg)
+        sup.ensure_sim_layout()
+        assert (tmp_path / "settings" / "conf.d").is_dir()
+        assert (tmp_path / "settings" / "config" / "simulate_start.conf").is_file()
+        assert (tmp_path / "settings" / "config" / "simulate_end.conf").is_file()
+        assert (tmp_path / "settings" / "pipelines.yml").is_file()
 
-    def test_creates_directories(self, supervisor_config_host):
+    def test_setup_host_mode_alias(self, supervisor_config_host):
         sup = LogstashSupervisor(config=supervisor_config_host)
-        # Mock config directory - use normalized paths
-        cfg = os.path.normpath(os.path.join(os.path.dirname(logstash_supervisor.__file__), "..", "..", "docker", "config"))
-        files = {os.path.normpath(os.path.join(cfg, f)): True for f in [
-            "jvm.options", "log4j2.properties", "logstash.yml",
-            "pipelines.yml", "simulate_start.conf", "simulate_end.conf"
-        ]}
-        def chk(p):
-            normalized_p = os.path.normpath(p)
-            normalized_cfg = os.path.normpath(cfg)
-            return normalized_p == normalized_cfg or normalized_p in files or normalized_p.startswith(os.path.normpath(sup.logstash_settings))
-        with patch("logstashagent.logstash_supervisor.os.path.exists",
-                   side_effect=chk), \
-             patch("logstashagent.logstash_supervisor.shutil.copy2"), \
-             patch("logstashagent.logstash_supervisor.os.makedirs") as mm, \
-             patch("builtins.open", MagicMock()):
+        with patch.object(sup, "ensure_sim_layout") as ensure:
             sup.setup_host_mode()
-        paths = [c[0][0] for c in mm.call_args_list]
-        assert any("conf.d" in p for p in paths)
-        assert any("pipeline-metadata" in p for p in paths)
+        ensure.assert_called_once()
 
 
 # ---- TestCleanupOrphanedProcesses ----
@@ -644,6 +636,40 @@ class TestHealthState:
                           return_value=None):
             supervisor_instance._check_memory_thresholds()
         assert supervisor_instance.is_healthy is False
+
+    def test_healthy_since_set_on_first_healthy_response(self, supervisor_instance):
+        """_healthy_since is recorded on the False->True transition."""
+        assert supervisor_instance._healthy_since is None
+        supervisor_instance.is_healthy = False
+        supervisor_instance.heap_max_gb = 4.0
+        before = time.monotonic()
+        with patch.object(supervisor_instance, "_get_jvm_heap_usage", return_value=50.0), \
+             patch.object(supervisor_instance, "_get_rss_memory_gb", return_value=3.0):
+            supervisor_instance._check_memory_thresholds()
+        assert supervisor_instance._healthy_since is not None
+        assert supervisor_instance._healthy_since >= before
+
+    def test_healthy_since_not_overwritten_while_already_healthy(self, supervisor_instance):
+        """_healthy_since stays fixed once set so warm-healthy duration keeps growing."""
+        supervisor_instance.is_healthy = True
+        supervisor_instance.heap_max_gb = 4.0
+        first = time.monotonic() - 10.0
+        supervisor_instance._healthy_since = first
+        with patch.object(supervisor_instance, "_get_jvm_heap_usage", return_value=50.0), \
+             patch.object(supervisor_instance, "_get_rss_memory_gb", return_value=3.0):
+            supervisor_instance._check_memory_thresholds()
+        assert supervisor_instance._healthy_since == first
+
+    def test_healthy_since_reset_on_restart(self, supervisor_instance):
+        """restart_logstash clears _healthy_since so the next start gets a fresh timestamp."""
+        supervisor_instance._healthy_since = time.monotonic()
+        with patch.object(supervisor_instance, "stop_logstash"), \
+             patch.object(supervisor_instance, "start_logstash"), \
+             patch("logstashagent.logstash_supervisor.time.sleep"), \
+             patch("logstashagent.slots") as ms:
+            ms.evict_all_slots_and_cleanup.return_value = []
+            supervisor_instance.restart_logstash("reset test")
+        assert supervisor_instance._healthy_since is None
 
 
 # ---- TestGlobalFunctions ----

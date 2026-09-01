@@ -16,8 +16,10 @@ from logstashagent import slots
 @pytest.fixture(autouse=True)
 def clear_slots():
     slots.clear_all_slots()
+    slots.clear_allocate_flights()
     yield
     slots.clear_all_slots()
+    slots.clear_allocate_flights()
 
 
 def _pipelines(filter_config: str, index: int = 1, output_config: str = "ignored-output"):
@@ -36,6 +38,63 @@ class TestPipelineHash:
         changed_index = _pipelines("filter { mutate { add_tag => ['a'] } }", index=2)
         assert slots._compute_pipeline_hash(base) != slots._compute_pipeline_hash(changed_filter)
         assert slots._compute_pipeline_hash(base) != slots._compute_pipeline_hash(changed_index)
+
+
+class TestReleaseSlotIfHash:
+    def test_releases_only_matching_hash(self):
+        pipelines = _pipelines("filter { drop {} }")
+        sid = slots.allocate_slot("p", pipelines)
+        h = slots._compute_pipeline_hash(pipelines)
+        assert slots.release_slot_if_hash(sid, "deadbeef" * 8) is False
+        assert sid in slots.get_slot_state()
+        with patch.object(slots, "_delete_slot_pipelines") as cleanup:
+            assert slots.release_slot_if_hash(sid, h) is True
+        assert sid not in slots.get_slot_state()
+        # Named Logstash pipelines must be torn down with the slot
+        cleanup.assert_called_once()
+        assert cleanup.call_args[0][0] == sid
+
+    def test_noop_missing_slot(self):
+        with patch.object(slots, "_delete_slot_pipelines") as cleanup:
+            assert slots.release_slot_if_hash(99, "abc") is False
+        cleanup.assert_not_called()
+
+
+class TestAllocateSingleFlight:
+    def test_followers_join_leader_result(self):
+        async def _run():
+            h = "a" * 64
+            fut1, lead1 = await slots.begin_allocate_flight(h)
+            assert lead1 is True
+            fut2, lead2 = await slots.begin_allocate_flight(h)
+            assert lead2 is False
+            assert fut2 is fut1
+
+            result = {"slot_id": 3, "reused": False}
+            await slots.complete_allocate_flight(h, fut1, result=result)
+            assert await fut2 == result
+
+            # New flight can start after complete
+            fut3, lead3 = await slots.begin_allocate_flight(h)
+            assert lead3 is True
+            await slots.complete_allocate_flight(h, fut3, result={"slot_id": 1})
+
+        asyncio.run(_run())
+
+    def test_followers_see_leader_error(self):
+        async def _run():
+            h = "b" * 64
+            fut1, lead1 = await slots.begin_allocate_flight(h)
+            assert lead1 is True
+            fut2, lead2 = await slots.begin_allocate_flight(h)
+            assert lead2 is False
+
+            err = RuntimeError("boom")
+            await slots.complete_allocate_flight(h, fut1, error=err)
+            with pytest.raises(RuntimeError, match="boom"):
+                await fut2
+
+        asyncio.run(_run())
 
 
 class TestAllocateSlot:
@@ -83,11 +142,62 @@ class TestAllocateSlot:
 
 
 class TestSlotLifecycle:
-    def test_release_slot(self):
-        slot_id = slots.allocate_slot("pipeline-a", _pipelines("filter { drop {} }"))
-        assert slots.release_slot(slot_id) is True
-        assert slots.release_slot(slot_id) is False
+    def test_release_slot_clears_named_pipelines(self):
+        """Clearing a slot must delete slotN-filter* from Logstash (yml + conf.d).
+
+        Otherwise simulate-start keeps send_to'ing a bus address that is gone
+        or half-dead after memory-only release.
+        """
+        pipelines = _pipelines("filter { drop {} }")
+        slot_id = slots.allocate_slot("pipeline-a", pipelines)
+        snapshot = slots.get_slot_state()[slot_id].copy()
+
+        with patch.object(slots, "_delete_slot_pipelines") as cleanup:
+            assert slots.release_slot(slot_id) is True
+
         assert slot_id not in slots.get_slot_state()
+        cleanup.assert_called_once_with(slot_id, snapshot)
+
+    def test_release_missing_slot_still_attempts_orphan_pipeline_cleanup(self):
+        """DELETE /slots/{id} for an unknown slot should still purge leftovers."""
+        with patch.object(slots, "_delete_slot_pipelines") as cleanup:
+            assert slots.release_slot(3) is False
+        cleanup.assert_called_once()
+        assert cleanup.call_args[0][0] == 3
+        # Synthetic slot_data with at least filter1 so filter1 is always targeted
+        assert cleanup.call_args[0][1] == {"pipelines": [{"index": 1}]}
+
+    def test_release_slot_can_skip_pipeline_cleanup(self):
+        slot_id = slots.allocate_slot("pipeline-a", _pipelines("filter { drop {} }"))
+        with patch.object(slots, "_delete_slot_pipelines") as cleanup:
+            assert slots.release_slot(slot_id, cleanup_pipelines=False) is True
+        cleanup.assert_not_called()
+        assert slot_id not in slots.get_slot_state()
+
+
+class TestDeleteSlotPipelines:
+    def test_deletes_each_filter_pipeline_for_slot(self):
+        slot_data = {
+            "pipelines": [
+                {"filter_config": "filter { drop {} }", "index": 1},
+                {"filter_config": "filter { json {} }", "index": 2},
+            ]
+        }
+        with patch("logstashagent.main.delete_pipeline_internal", return_value=True) as delete:
+            with patch("logstashagent.main.PIPELINES_DIR", "/nonexistent"):
+                slots._delete_slot_pipelines(2, slot_data)
+
+        assert [c.args[0] for c in delete.call_args_list] == [
+            "slot2-filter1",
+            "slot2-filter2",
+        ]
+
+    def test_always_targets_filter1_when_slot_data_empty(self):
+        with patch("logstashagent.main.delete_pipeline_internal", return_value=False) as delete:
+            with patch("logstashagent.main.PIPELINES_DIR", "/nonexistent"):
+                slots._delete_slot_pipelines(1, None)
+
+        delete.assert_called_once_with("slot1-filter1")
 
 
 class TestEvictExpiredSlots:
@@ -117,10 +227,16 @@ class TestEvictExpiredSlots:
 
 
 class TestEvictFailedSlots:
-    def _age_slot(self, slot_id: int, age_seconds: int = 60):
+    def _age_slot(self, slot_id: int, age_seconds: int = 60, access_seconds: int | None = None):
         ts = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+        access = (
+            datetime.now(timezone.utc) - timedelta(seconds=access_seconds)
+            if access_seconds is not None
+            else ts
+        )
         with slots._slots_lock:
             slots._slots[slot_id]["created_at"] = ts.isoformat()
+            slots._slots[slot_id]["last_accessed"] = access.isoformat()
 
     def test_does_not_evict_new_slot_before_min_age(self):
         slot_id = slots.allocate_slot("new-slot", _pipelines("filter { drop {} }"))
@@ -136,9 +252,28 @@ class TestEvictFailedSlots:
         assert evicted == []
         assert slot_id in slots.get_slot_state()
 
+    def test_does_not_evict_missing_pipeline_within_not_found_grace(self):
+        """Cold allocate can exceed 30s; 60s-old missing slots stay until 90s grace."""
+        slot_id = slots.allocate_slot("mid-age", _pipelines("filter { drop {} }"))
+        self._age_slot(slot_id, age_seconds=60, access_seconds=60)
+
+        mock_api = MagicMock()
+        mock_api.__enter__.return_value = mock_api
+        mock_api.__exit__.return_value = False
+        mock_api.list_pipelines.return_value = []
+
+        with patch("logstashagent.slots.LogstashAPI", return_value=mock_api):
+            with patch.object(slots, "_delete_slot_pipelines") as cleanup:
+                evicted = slots.evict_failed_slots()
+
+        assert evicted == []
+        cleanup.assert_not_called()
+        assert slot_id in slots.get_slot_state()
+
     def test_evicts_when_pipeline_missing_after_min_age(self):
         slot_id = slots.allocate_slot("missing", _pipelines("filter { drop {} }"))
-        self._age_slot(slot_id)
+        # Past not_found grace and last_access grace
+        self._age_slot(slot_id, age_seconds=120, access_seconds=120)
 
         mock_api = MagicMock()
         mock_api.__enter__.return_value = mock_api
@@ -153,9 +288,57 @@ class TestEvictFailedSlots:
         cleanup.assert_called_once()
         assert len(slots.get_slot_state()) == 0
 
+    def test_does_not_evict_listed_pipeline_with_detect_not_found(self):
+        """list_pipelines membership wins over detect_pipeline_state==not_found glitches."""
+        slot_id = slots.allocate_slot("glitch", _pipelines("filter { drop {} }"))
+        self._age_slot(slot_id, age_seconds=120, access_seconds=120)
+        pipeline_name = f"slot{slot_id}-filter1"
+
+        mock_api = MagicMock()
+        mock_api.__enter__.return_value = mock_api
+        mock_api.__exit__.return_value = False
+        mock_api.list_pipelines.return_value = [pipeline_name]
+        mock_api.detect_pipeline_state.return_value = "not_found"
+
+        with patch("logstashagent.slots.LogstashAPI", return_value=mock_api):
+            with patch.object(slots, "_delete_slot_pipelines") as cleanup:
+                evicted = slots.evict_failed_slots()
+
+        assert evicted == []
+        cleanup.assert_not_called()
+        assert slot_id in slots.get_slot_state()
+
+    def test_skips_eviction_during_in_flight_allocate(self):
+        pipelines = _pipelines("filter { drop {} }")
+        slot_id = slots.allocate_slot("inflight", pipelines)
+        self._age_slot(slot_id, age_seconds=120, access_seconds=120)
+        h = slots._compute_pipeline_hash(pipelines)
+
+        async def _prime_flight():
+            fut, lead = await slots.begin_allocate_flight(h)
+            assert lead is True
+            return fut
+
+        fut = asyncio.run(_prime_flight())
+
+        mock_api = MagicMock()
+        mock_api.__enter__.return_value = mock_api
+        mock_api.__exit__.return_value = False
+        mock_api.list_pipelines.return_value = []
+
+        try:
+            with patch("logstashagent.slots.LogstashAPI", return_value=mock_api):
+                with patch.object(slots, "_delete_slot_pipelines") as cleanup:
+                    evicted = slots.evict_failed_slots()
+            assert evicted == []
+            cleanup.assert_not_called()
+            assert slot_id in slots.get_slot_state()
+        finally:
+            asyncio.run(slots.complete_allocate_flight(h, fut, result={"slot_id": slot_id}))
+
     def test_evicts_when_pipeline_state_failed(self):
         slot_id = slots.allocate_slot("failed", _pipelines("filter { drop {} }"))
-        self._age_slot(slot_id)
+        self._age_slot(slot_id, age_seconds=30, access_seconds=30)
 
         pipeline_name = f"slot{slot_id}-filter1"
         mock_api = MagicMock()
@@ -199,6 +382,31 @@ class TestVerifySlotPipelinesLoaded:
 
         assert result is True
         mock_api.detect_pipeline_state.assert_called_once_with("slot1-filter1")
+
+    def test_idle_accepts_after_short_stability(self):
+        """Idle pipelines succeed after idle_stability_seconds (not a multi-second hold)."""
+        mock_api = MagicMock()
+        mock_api.__enter__.return_value = mock_api
+        mock_api.__exit__.return_value = False
+        mock_api.get_pipeline_stats.return_value = {
+            "pipelines": {
+                "slot1-filter1": {"reloads": {"failures": 0, "successes": 1}}
+            }
+        }
+        mock_api.detect_pipeline_state.return_value = "idle"
+
+        with patch("logstashagent.slots.LogstashAPI", return_value=mock_api):
+            result = asyncio.run(
+                slots.verify_slot_pipelines_loaded(
+                    slot_id=1,
+                    expected_count=1,
+                    max_wait_seconds=2.0,
+                    poll_interval=0.05,
+                    idle_stability_seconds=0.15,
+                )
+            )
+
+        assert result is True
 
     def test_returns_false_on_new_reload_failures(self):
         mock_api = MagicMock()

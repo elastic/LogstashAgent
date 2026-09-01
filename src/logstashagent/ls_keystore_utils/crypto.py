@@ -31,11 +31,12 @@ from .exceptions import IncorrectPassword, LogstashKeystoreException
 from .utils import read_file_bytes
 from .settings import (
     AES_KEY_LENGTHS,
-    ATTR_TYPES,
     CERT_BAG,
+    FRIENDLY_NAME_ATTR_TYPES,
     KEY_BAG,
     KEYSTORE_ALIAS,
     KEYSTORE_SEED,
+    LOCAL_KEY_ID_ATTR_TYPES,
     OBFUSCATION_KEY,
     PBES2,
     PKCS8_SHROUDED_KEY_BAG,
@@ -311,6 +312,10 @@ def decrypt_private_key(bag_value, password: str) -> bytes:
 def get_alias_from_bag(bag) -> Optional[str]:
     """Extract the friendly name alias from a PKCS12 bag.
 
+    Only ``friendlyName`` attributes are used. ``localKeyId`` is reserved for
+    Logstash timestamps (``Time <millis>``) and must not be treated as an alias.
+    Attribute order is undefined in PKCS#12 SETs, so filtering by type is required.
+
     Args:
         bag: The PKCS12 bag object.
 
@@ -322,50 +327,47 @@ def get_alias_from_bag(bag) -> Optional[str]:
         >>> alias is None or isinstance(alias, str)
         True
     """
-    alias = None
     bag_attrs = bag["bag_attributes"] or []
-    if bag_attrs:
-        for attr in bag_attrs:
-            attr_type = attr["type"].native
-            if attr_type in ATTR_TYPES:
-                alias = attr["values"][0].native
-                alias = (
-                    alias.decode("utf-8") if isinstance(alias, bytes) else str(alias)
-                )
-                # logger.debug("Found alias: %s", alias)
-                break
-    return alias
+    for attr in bag_attrs:
+        attr_type = attr["type"].native
+        if attr_type not in FRIENDLY_NAME_ATTR_TYPES:
+            continue
+        alias = attr["values"][0].native
+        return alias.decode("utf-8") if isinstance(alias, bytes) else str(alias)
+    return None
 
 
 def get_bag_timestamp(bag) -> Optional[int]:
-    """Extract creation and modification timestamps from bag attributes.
+    """Extract modification timestamp from bag attributes.
+
+    Logstash stores timestamps in the ``localKeyId`` attribute as
+    ``Time <epoch_millis>``. The value is returned in **milliseconds** since
+    epoch to match the on-disk attribute and to distinguish rapid updates.
 
     Args:
         bag: The PKCS12 bag object.
     Returns:
-        An integer timestamp since epoch, or None if not present.
+        An integer timestamp in milliseconds since epoch, or None if not present.
     """
-    timestamp = None
     bag_attrs = bag["bag_attributes"] or []
-    if bag_attrs:
-        for attr in bag_attrs:
-            time_value = attr["values"][0].native
-            # Decode bytes to string if necessary
-            if isinstance(time_value, bytes):
-                try:
-                    time_value = time_value.decode("utf-8")
-                except UnicodeDecodeError:
-                    continue  # Skip if not valid UTF-8
-            # Check for "Time <timestamp>" pattern
-            if isinstance(time_value, str) and time_value.startswith("Time "):
-                try:
-                    timestamp_ms = int(time_value.split(" ")[1])
-                    timestamp = int(timestamp_ms / 1000.0)
-                    # logger.debug("Parsed modification time: %s", timestamp)
-                    break  # Assume only one timestamp per bag
-                except (ValueError, IndexError):
-                    logger.warning("Failed to parse time value: %s", time_value)
-    return timestamp
+    for attr in bag_attrs:
+        attr_type = attr["type"].native
+        if attr_type not in LOCAL_KEY_ID_ATTR_TYPES:
+            continue
+        time_value = attr["values"][0].native
+        if isinstance(time_value, bytes):
+            try:
+                time_value = time_value.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+        if isinstance(time_value, str) and time_value.startswith("Time "):
+            try:
+                # Preserve millisecond precision from Logstash's "Time <ms>" attribute.
+                # Second truncation made rapid pure-Python updates look unchanged.
+                return int(time_value.split(" ")[1])
+            except (ValueError, IndexError):
+                logger.warning("Failed to parse time value: %s", time_value)
+    return None
 
 
 def is_keystore_seed_bag(bag) -> bool:
@@ -586,7 +588,7 @@ class KeyEntry:
     Attributes:
         obfuscated_value: The obfuscated value object.
         timestamp: The timestamp when the key was last modified
-            (seconds since epoch).
+            (milliseconds since epoch).
     """
 
     obfuscated_value: "ObfuscatedValue"

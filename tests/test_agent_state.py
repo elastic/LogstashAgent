@@ -14,27 +14,35 @@ from logstashagent import agent_state
 
 
 def test_default_state_dir_is_package_local():
-    """Test STATE_DIR defaults to package local or installed location."""
-    # STATE_DIR can be either /var/lib/logstash-agent (if installed) or package local
+    """Test resolve_state_dir defaults to package local or installed location."""
     import os
-    if os.path.exists('/var/lib/logstash-agent'):
-        # Installed location takes precedence
-        assert agent_state.STATE_DIR == Path('/var/lib/logstash-agent')
+
+    agent_state.configure_state_dir(None)
+    # Clear env override that may leak from other tests
+    os.environ.pop("LOGSTASH_AGENT_STATE_DIR", None)
+    resolved = agent_state.resolve_state_dir([])
+    if os.path.isdir("/opt/logstash-agent/state"):
+        assert resolved == Path("/opt/logstash-agent/state")
+    elif os.path.isdir("/var/lib/logstash-agent"):
+        assert resolved == Path("/var/lib/logstash-agent")
     else:
-        # Falls back to package local
         expected = Path(agent_state.__file__).resolve().parent / "data"
-        assert agent_state.STATE_DIR.resolve() == expected
+        assert resolved.resolve() == expected
 
 
 @pytest.fixture
 def isolated_state(temp_dir):
     """Use a temp directory for STATE_DIR / STATE_FILE instead of package data."""
     state_dir = Path(temp_dir) / "data"
+    state_dir.mkdir(parents=True, exist_ok=True)
     state_file = state_dir / "state.json"
-    with patch.object(agent_state, "STATE_DIR", state_dir), patch.object(
-        agent_state, "STATE_FILE", state_file
-    ):
+    # Prefer configure_state_dir so refresh_state_paths() keeps isolation
+    # (patching STATE_DIR alone is overwritten by get_state/update_state).
+    agent_state.configure_state_dir(state_dir)
+    try:
         yield {"state_dir": state_dir, "state_file": state_file}
+    finally:
+        agent_state.configure_state_dir(None)
 
 
 class TestGetOrCreateAgentId:
@@ -67,7 +75,7 @@ class TestGetOrCreateAgentId:
     def test_regenerates_when_file_has_no_agent_id(self, isolated_state):
         f = isolated_state["state_file"]
         f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_text(json.dumps({"other": "value"}), encoding="utf-8")
+        f.write_text(json.dumps({"other": "value", "enrolled": True}), encoding="utf-8")
         fixed = "99999999-aaaa-bbbb-cccc-dddddddddddd"
 
         with patch.object(agent_state.uuid, "uuid4", return_value=MagicMock(__str__=lambda _: fixed)):
@@ -76,6 +84,9 @@ class TestGetOrCreateAgentId:
         assert result == fixed
         data = json.loads(f.read_text(encoding="utf-8"))
         assert data["agent_id"] == fixed
+        # Must not wipe existing enrollment fields when injecting agent_id
+        assert data["other"] == "value"
+        assert data["enrolled"] is True
 
     def test_regenerates_on_invalid_json(self, isolated_state):
         f = isolated_state["state_file"]

@@ -3,18 +3,31 @@
 #you may not use this file except in compliance with the Elastic License.
 
 
-# Mode determines if the agent is used for simulating
-# in logstashui, or for controlling an actual Logstash host
-mode: simulation # simulation | host
+# Agent role / mode:
+#   default  - Enrolled production control-plane agent (systemctl logstash)
+#   simulate - Enrolled simulation agent (lsagent-simulate@N + ls-simulate@N)
+#   embedded - Docker-local simulation node (no enrollment; FastAPI + supervisor)
+#
+# Legacy values still accepted and mapped:
+#   agent|host            -> default
+#   simulation + embedded -> embedded
+#   simulation + host     -> simulate (prefer re-enrolling under Simulate Policy)
+mode: default # default | simulate | embedded
 
-# Only applies if mode 'mode' is set to simulation
-simulation_mode: embedded # embedded | host
+# Only used when mode is embedded (or legacy simulation_mode)
+# simulation_mode: embedded  # deprecated; use mode: embedded|simulate
 
-
-# Linux example, default
+# Linux package paths (default mode / system Logstash source)
 logstash_binary: /usr/share/logstash/bin/logstash
 logstash_settings: /etc/logstash
 logstash_log_path: /var/log/logstash
 
-# FastAPI agent API port (simulation mode only)
+# FastAPI agent API port (simulate / embedded)
+# Simulate instances use 9500+N from enrollment; embedded uses 9500
 port: 9500
+
+# Optional overrides after simulate enrollment (normally set from policy_config)
+# instance_id: 1
+# agent_api_port: 9501
+# logstash_api_port: 9561
+# keystore_env_file: /opt/logstash-agent/simulate-1/env

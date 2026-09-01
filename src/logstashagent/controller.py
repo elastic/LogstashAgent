@@ -73,96 +73,607 @@ def _record_last_apply(source, success, failed_operations, revision=None):
     agent_state.update_state('last_apply', last_apply)
 
 
-# Default environment file sourced by the Logstash systemd unit.
+# Default environment file sourced by the package Logstash systemd unit.
 _LOGSTASH_ENV_FILE = Path('/etc/default/logstash')
 
 
-def update_logstash_env_file(password: str) -> None:
-    """
-    Write (or update) LOGSTASH_KEYSTORE_PASS in /etc/default/logstash so that
-    the Logstash systemd service can open the password-protected keystore on startup.
+def _resolve_keystore_env_file(env_file: Optional[str] = None) -> Path:
+    """Prefer explicit path, then agent state, then package default."""
+    if env_file:
+        return Path(env_file)
+    try:
+        state_path = agent_state.get_state().get('keystore_env_file')
+        if state_path:
+            return Path(state_path)
+    except Exception:
+        pass
+    return _LOGSTASH_ENV_FILE
 
-    Uses sudo tee/cat as configured in /etc/sudoers.d/logstash-agent since the agent
-    runs as the logstash user and /etc/default/logstash is root-owned.
-    
-    The file is written with mode 0o640 so that Logstash (running as the
-    logstash user/group) can read it but unprivileged users cannot.
-    
+
+def update_logstash_env_file(
+    password: Optional[str],
+    env_file: Optional[str] = None,
+) -> None:
+    """
+    Write, update, or clear LOGSTASH_KEYSTORE_PASS in the Logstash env file.
+
+    When ``password`` is a non-empty string, the variable is set so the Logstash
+    systemd service can open a password-protected keystore on startup.
+    When ``password`` is None or empty, any existing LOGSTASH_KEYSTORE_PASS line
+    is removed (unauthenticated / trailer keystores).
+
+    ``env_file`` overrides the path (policy ``keystore_env_file``). For package
+    Logstash the default is ``/etc/default/logstash`` (sudo cat/tee). For simulate
+    instances the path is typically ``/opt/logstash-agent/simulate-N/env`` and is
+    written directly when the agent owns the tree.
+
     Raises:
-        FileNotFoundError: If /etc/default/logstash doesn't exist
+        FileNotFoundError: If a required package env file doesn't exist
         OSError: If unable to read or write the file
     """
     var_name = 'LOGSTASH_KEYSTORE_PASS'
+    env_path = _resolve_keystore_env_file(env_file)
+    use_sudo = str(env_path) == str(_LOGSTASH_ENV_FILE) or str(env_path).startswith('/etc/')
 
-    # Verify the file exists - it should always exist on a proper Logstash installation
-    if not _LOGSTASH_ENV_FILE.exists():
-        logger.error(f"{_LOGSTASH_ENV_FILE} does not exist - Logstash may not be properly installed")
+    # Package env file must already exist; simulate instance env may be created.
+    if use_sudo and not env_path.exists():
+        logger.error(f"{env_path} does not exist - Logstash may not be properly installed")
         raise FileNotFoundError(
-            f"{_LOGSTASH_ENV_FILE} not found. "
+            f"{env_path} not found. "
             "This file should be created by the Logstash package installation. "
             "Please verify Logstash is properly installed."
         )
 
-    # Read existing lines using sudo cat since we don't have read permission
+    # Read existing lines
     existing_lines = []
     try:
-        result = subprocess.run(
-            ['sudo', 'cat', str(_LOGSTASH_ENV_FILE)],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        if result.returncode == 0:
-            existing_lines = result.stdout.splitlines()
-        else:
-            logger.error(f"Failed to read {_LOGSTASH_ENV_FILE}: {result.stderr}")
-            raise OSError(f"Cannot read {_LOGSTASH_ENV_FILE}")
+        if use_sudo:
+            result = subprocess.run(
+                ['sudo', 'cat', str(env_path)],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                existing_lines = result.stdout.splitlines()
+            else:
+                logger.error(f"Failed to read {env_path}: {result.stderr}")
+                raise OSError(f"Cannot read {env_path}")
+        elif env_path.exists():
+            existing_lines = env_path.read_text(encoding='utf-8').splitlines()
     except subprocess.TimeoutExpired:
-        logger.error(f"Timeout reading {_LOGSTASH_ENV_FILE}")
+        logger.error(f"Timeout reading {env_path}")
+        raise
+    except OSError:
         raise
     except Exception as e:
-        logger.error(f"Failed to read {_LOGSTASH_ENV_FILE}: {e}")
+        logger.error(f"Failed to read {env_path}: {e}")
         raise
 
-    # Filter out any existing LOGSTASH_KEYSTORE_PASS line and add the new one
+    # Drop any existing LOGSTASH_KEYSTORE_PASS line; re-add only when setting a password
     filtered = [ln for ln in existing_lines if not ln.startswith(f'{var_name}=')]
-    filtered.append(f'{var_name}={password}')
+    if password:
+        filtered.append(f'{var_name}={password}')
+        logger.info(f"Setting {var_name} in {env_path}")
+    else:
+        logger.info(f"Clearing {var_name} from {env_path} (unauthenticated keystore)")
 
     content = '\n'.join(filtered) + '\n'
-    
-    # Use sudo tee to write the file since we don't have direct write permission
+
     try:
-        result = subprocess.run(
-            ['sudo', 'tee', str(_LOGSTASH_ENV_FILE)],
-            input=content,
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        
-        if result.returncode == 0:
-            # Set permissions using sudo chmod
+        if use_sudo:
+            result = subprocess.run(
+                ['sudo', 'tee', str(env_path)],
+                input=content,
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            if result.returncode != 0:
+                logger.error(f"Failed to write {env_path}: {result.stderr}")
+                raise OSError(f"Cannot write to {env_path}")
             chmod_result = subprocess.run(
-                ['sudo', 'chmod', '640', str(_LOGSTASH_ENV_FILE)],
+                ['sudo', 'chmod', '640', str(env_path)],
                 capture_output=True,
                 timeout=5,
                 check=False
             )
             if chmod_result.returncode != 0:
-                logger.warning(f"Failed to set permissions on {_LOGSTASH_ENV_FILE}: {chmod_result.stderr}")
-            logger.info(f"Updated {var_name} in {_LOGSTASH_ENV_FILE}")
+                logger.warning(f"Failed to set permissions on {env_path}: {chmod_result.stderr}")
         else:
-            logger.error(f"Failed to write {_LOGSTASH_ENV_FILE}: {result.stderr}")
-            raise OSError(f"Cannot write to {_LOGSTASH_ENV_FILE}")
+            env_path.parent.mkdir(parents=True, exist_ok=True)
+            env_path.write_text(content, encoding='utf-8')
+            try:
+                os.chmod(env_path, 0o640)
+            except OSError as chmod_err:
+                logger.warning(f"Failed to set permissions on {env_path}: {chmod_err}")
+        logger.info(f"Updated {var_name} in {env_path}")
     except subprocess.TimeoutExpired:
-        logger.error(f"Timeout writing {_LOGSTASH_ENV_FILE}")
+        logger.error(f"Timeout writing {env_path}")
+        raise
+    except OSError:
         raise
     except Exception as e:
-        logger.error(f"Failed to write {_LOGSTASH_ENV_FILE}: {e}")
+        logger.error(f"Failed to write {env_path}: {e}")
         raise
+
+
+def ensure_keystore(settings_path: str, password: Optional[str] = None) -> LogstashKeystore:
+    """
+    Load an existing keystore or create one in the requested password mode.
+
+    Args:
+        settings_path: Logstash settings directory (path.settings).
+        password: Explicit password for authenticated mode, or None for an
+            unauthenticated (default-password trailer) keystore.
+
+    Returns:
+        Loaded or newly created LogstashKeystore instance.
+    """
+    if settings_path:
+        settings_path = settings_path.replace('\\', '/')
+    if not settings_path.endswith('/'):
+        settings_path = settings_path + '/'
+
+    keystore_file = Path(settings_path) / 'logstash.keystore'
+    if keystore_file.exists():
+        return LogstashKeystore.load(path_settings=settings_path, password=password)
+    mode = "authenticated" if password else "unauthenticated"
+    logger.info(f"Creating {mode} keystore at {settings_path}")
+    return LogstashKeystore.create(path_settings=settings_path, password=password)
+
+
+def set_keystore_password(settings_path: str, new_password: str) -> dict:
+    """
+    Apply an authenticated keystore password, preferring secret-preserving migrate.
+
+    - Existing unauthenticated keystore: migrate_to_authenticated (keeps secrets).
+    - Existing authenticated keystore with known agent password: migrate in place.
+    - No keystore file: create authenticated empty keystore.
+    - Authenticated file that cannot be opened: wipe and recreate (secrets lost).
+
+    Updates agent state (keystore_password, keystore_password_hash) and
+    LOGSTASH_KEYSTORE_PASS in the Logstash env file.
+
+    Args:
+        settings_path: Logstash settings directory.
+        new_password: Non-empty password to apply.
+
+    Returns:
+        dict with keys: success (bool), wiped (bool), action (str).
+
+    Raises:
+        ValueError: If new_password is empty.
+    """
+    if not new_password:
+        raise ValueError("new_password must be a non-empty string")
+
+    if settings_path:
+        settings_path = settings_path.replace('\\', '/')
+    if not settings_path.endswith('/'):
+        settings_path = settings_path + '/'
+
+    keystore_file = Path(settings_path) / 'logstash.keystore'
+    state = agent_state.get_state()
+    current_password = state.get('keystore_password') or None
+    wiped = False
+    action = 'none'
+
+    try:
+        if keystore_file.exists():
+            # Prefer opening as unauthenticated (trailer) first when we have no
+            # stored password — common path when server first sets a password.
+            try:
+                if current_password:
+                    ks = LogstashKeystore.load(
+                        path_settings=settings_path, password=current_password
+                    )
+                else:
+                    ks = LogstashKeystore.load(
+                        path_settings=settings_path, password=None
+                    )
+                ks.migrate_to_authenticated(new_password)
+                action = 'migrated'
+                logger.info("Migrated keystore to authenticated password (secrets preserved)")
+            except Exception as open_err:
+                logger.warning(
+                    f"Could not migrate existing keystore ({open_err}); "
+                    "recreating authenticated keystore (secrets will be wiped)"
+                )
+                try:
+                    keystore_file.unlink(missing_ok=True)
+                except Exception as del_e:
+                    logger.error(f"Failed to delete keystore for recreate: {del_e}")
+                    return {'success': False, 'wiped': False, 'action': 'failed'}
+                LogstashKeystore.create(
+                    path_settings=settings_path, password=new_password
+                )
+                wiped = True
+                action = 'recreated'
+        else:
+            LogstashKeystore.create(path_settings=settings_path, password=new_password)
+            action = 'created'
+            logger.info("Created new authenticated keystore")
+
+        new_hash = hashlib.sha256(new_password.encode('utf-8')).hexdigest()
+        agent_state.update_state('keystore_password', new_password)
+        agent_state.update_state('keystore_password_hash', new_hash)
+
+        if wiped and state.get('snmp_keystore'):
+            agent_state.update_state('snmp_keystore', {})
+            logger.info(
+                "Cleared SNMP keystore state after password recreate; "
+                "SNMP keys will be re-provisioned on next check-in"
+            )
+
+        try:
+            update_logstash_env_file(new_password)
+        except Exception as env_err:
+            logger.warning(f"Keystore password applied but env file update failed: {env_err}")
+
+        return {'success': True, 'wiped': wiped, 'action': action}
+    except Exception as e:
+        logger.error(f"set_keystore_password failed: {e}")
+        logger.exception("set_keystore_password exception details:")
+        return {'success': False, 'wiped': wiped, 'action': 'failed'}
+
+
+def clear_keystore_password(settings_path: str) -> dict:
+    """
+    Convert an authenticated keystore to unauthenticated (embedded trailer).
+
+    Invoked from check-in when GetConfigChanges returns ``keystore_password: null``
+    (policy no longer has a password; agent still reported a hash).
+
+    Requires the current password in agent state so secrets can be re-encrypted.
+    Clears keystore_password from agent state and removes LOGSTASH_KEYSTORE_PASS
+    from the Logstash env file.
+
+    Args:
+        settings_path: Logstash settings directory.
+
+    Returns:
+        dict with keys: success (bool), action (str).
+    """
+    if settings_path:
+        settings_path = settings_path.replace('\\', '/')
+    if not settings_path.endswith('/'):
+        settings_path = settings_path + '/'
+
+    state = agent_state.get_state()
+    current_password = state.get('keystore_password') or None
+    keystore_file = Path(settings_path) / 'logstash.keystore'
+
+    try:
+        if not keystore_file.exists():
+            ensure_keystore(settings_path, password=None)
+            agent_state.update_state('keystore_password', None)
+            agent_state.update_state('keystore_password_hash', '')
+            try:
+                update_logstash_env_file(None)
+            except Exception as env_err:
+                logger.warning(f"Unauth keystore ready but env clear failed: {env_err}")
+            return {'success': True, 'action': 'created_unauth'}
+
+        if current_password:
+            ks = LogstashKeystore.load(
+                path_settings=settings_path, password=current_password
+            )
+        else:
+            # Already unauthenticated
+            ks = LogstashKeystore.load(path_settings=settings_path, password=None)
+            if ks.uses_embedded_password:
+                agent_state.update_state('keystore_password', None)
+                agent_state.update_state('keystore_password_hash', '')
+                try:
+                    update_logstash_env_file(None)
+                except Exception:
+                    pass
+                return {'success': True, 'action': 'already_unauth'}
+
+        ks.migrate_to_unauthenticated()
+        agent_state.update_state('keystore_password', None)
+        agent_state.update_state('keystore_password_hash', '')
+        try:
+            update_logstash_env_file(None)
+        except Exception as env_err:
+            logger.warning(f"Migrated to unauth but env clear failed: {env_err}")
+        logger.info("Migrated keystore to unauthenticated mode (secrets preserved)")
+        return {'success': True, 'action': 'migrated_unauth'}
+    except Exception as e:
+        logger.error(f"clear_keystore_password failed: {e}")
+        logger.exception("clear_keystore_password exception details:")
+        return {'success': False, 'action': 'failed'}
+
+
+def apply_keystore_password_change(
+    settings_path: str,
+    keystore_password_response,
+    api_key: str,
+) -> dict:
+    """
+    Apply the ``keystore_password`` field from GetConfigChanges.
+
+    Protocol:
+      - ``False``: no change
+      - ``None`` (JSON null): clear → unauthenticated (``clear_keystore_password``)
+      - encrypted string: set/rotate via ``set_keystore_password``
+
+    Returns:
+        dict: applied (bool), success (bool), requires_restart (bool),
+        error (str|None), action (str|None)
+    """
+    if keystore_password_response is False:
+        return {
+            'applied': False,
+            'success': True,
+            'requires_restart': False,
+            'error': None,
+            'action': None,
+        }
+
+    if keystore_password_response is None:
+        logger.info("Keystore password clear requested (policy has no password)")
+        result = clear_keystore_password(settings_path)
+        if result.get('success'):
+            logger.info(
+                "Keystore password cleared (action=%s)",
+                result.get('action'),
+            )
+            return {
+                'applied': True,
+                'success': True,
+                'requires_restart': True,
+                'error': None,
+                'action': result.get('action'),
+            }
+        return {
+            'applied': True,
+            'success': False,
+            'requires_restart': False,
+            'error': 'keystore password clear failed',
+            'action': result.get('action'),
+        }
+
+    # Encrypted password string from server
+    logger.info("Keystore password change detected")
+    try:
+        actual_password = _decrypt_from_server(api_key, keystore_password_response)
+        logger.info("Successfully decrypted new keystore password")
+        result = set_keystore_password(settings_path, actual_password)
+        if result.get('success'):
+            logger.info(
+                "Keystore password applied (action=%s, wiped=%s)",
+                result.get('action'),
+                result.get('wiped'),
+            )
+            return {
+                'applied': True,
+                'success': True,
+                'requires_restart': True,
+                'error': None,
+                'action': result.get('action'),
+            }
+        return {
+            'applied': True,
+            'success': False,
+            'requires_restart': False,
+            'error': 'keystore password apply failed',
+            'action': result.get('action'),
+        }
+    except Exception as decrypt_error:
+        logger.error(
+            "Failed to decrypt keystore password from server: %s",
+            decrypt_error,
+        )
+        keystore_file = Path(settings_path) / 'logstash.keystore'
+        try:
+            keystore_file.unlink(missing_ok=True)
+            logger.warning(
+                "Deleted keystore file - will recreate with correct password "
+                "on next successful sync"
+            )
+        except Exception as del_e:
+            logger.warning("Could not delete keystore file: %s", del_e)
+        return {
+            'applied': True,
+            'success': False,
+            'requires_restart': False,
+            'error': f'keystore_password decrypt failed: {decrypt_error}',
+            'action': 'decrypt_failed',
+        }
+
 
 # Module-level watcher — started once by run_controller(), consulted by check_in()
 _log_watcher: Optional[log_analyzer.LogstashLogWatcher] = None
+
+
+def update_env_logstash_binary(env_file: Optional[str], binary: str) -> bool:
+    """
+    Set or replace LOGSTASH_BINARY= in a multi-instance env file
+    (e.g. /opt/logstash-agent/simulate-N/env or managed-N/env) without sudo
+    when the agent owns the tree.
+    """
+    if not env_file or not binary:
+        return False
+    path = Path(env_file)
+    try:
+        lines = []
+        if path.exists():
+            lines = path.read_text(encoding='utf-8').splitlines()
+        filtered = [ln for ln in lines if not ln.startswith('LOGSTASH_BINARY=')]
+        filtered.append(f'LOGSTASH_BINARY={binary}')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('\n'.join(filtered) + '\n', encoding='utf-8')
+        try:
+            os.chmod(path, 0o640)
+        except OSError:
+            pass
+        logger.info(f"Updated LOGSTASH_BINARY in {path} -> {binary}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to update LOGSTASH_BINARY in {env_file}: {e}")
+        return False
+
+
+def apply_logstash_runtime(runtime: dict) -> dict:
+    """
+    Apply policy Logstash binary source (SYSTEM vs VERSION download).
+
+    Downloads VERSION artifacts when needed, updates agent state and the
+    multi-instance EnvironmentFile LOGSTASH_BINARY line (simulate + managed).
+
+    Returns:
+        dict: success (bool), requires_restart (bool), binary (str|None),
+              error (str|None), source, version
+    """
+    from .logstash_download import (
+        resolve_binary_from_policy,
+        LogstashDownloadError,
+        DEFAULT_DOWNLOAD_ROOT,
+        normalize_download_dir,
+    )
+
+    if not runtime or runtime is False:
+        return {
+            'success': True,
+            'requires_restart': False,
+            'binary': None,
+            'error': None,
+            'source': None,
+            'version': None,
+        }
+
+    source = (runtime.get('source') or 'SYSTEM').upper()
+    version = (runtime.get('version') or '').strip()
+    download_dir = normalize_download_dir(
+        (runtime.get('download_dir') or DEFAULT_DOWNLOAD_ROOT).strip()
+    )
+    binary_path = runtime.get('binary_path') or '/usr/share/logstash/bin'
+
+    logger.info(
+        "Applying logstash_runtime: source=%s version=%s download_dir=%s binary_path=%s",
+        source, version or '(none)', download_dir, binary_path,
+    )
+
+    try:
+        binary = resolve_binary_from_policy(
+            logstash_source=source,
+            logstash_version=version,
+            logstash_download_dir=download_dir,
+            binary_path=binary_path,
+        )
+    except LogstashDownloadError as e:
+        logger.error(f"Logstash runtime apply failed: {e}")
+        return {
+            'success': False,
+            'requires_restart': False,
+            'binary': None,
+            'error': str(e),
+            'source': source,
+            'version': version,
+        }
+    except Exception as e:
+        logger.error(f"Unexpected error applying logstash_runtime: {e}", exc_info=True)
+        return {
+            'success': False,
+            'requires_restart': False,
+            'binary': None,
+            'error': str(e),
+            'source': source,
+            'version': version,
+        }
+
+    binary = str(binary)
+    # State binary_path is historically a directory used for existence checks
+    bin_dir = str(Path(binary).parent) if Path(binary).name in ('logstash', 'logstash.bat') else binary
+
+    prev_state = agent_state.get_state() or {}
+    prev_binary = prev_state.get('logstash_binary') or ''
+    prev_source = (prev_state.get('logstash_source') or 'SYSTEM').upper()
+    prev_version = (prev_state.get('logstash_version') or '').strip()
+
+    agent_state.update_state('logstash_source', source)
+    agent_state.update_state('logstash_version', version)
+    agent_state.update_state('logstash_download_dir', download_dir)
+    agent_state.update_state('binary_path', bin_dir)
+    agent_state.update_state('logstash_binary', binary)
+    if source == 'VERSION' and version:
+        agent_state.update_state('logstash_version_resolved', version)
+    elif source == 'SYSTEM':
+        # Clear resolved pin so UI does not show a stale VERSION
+        agent_state.update_state('logstash_version_resolved', '')
+
+    state = agent_state.get_state() or {}
+    env_file = state.get('keystore_env_file')
+    mode = (state.get('mode') or '').lower()
+    # Multi-instance units (simulate + managed) read LOGSTASH_BINARY from */env
+    if mode in ('simulate', 'managed') or (env_file and str(env_file).endswith('/env')):
+        if env_file:
+            update_env_logstash_binary(env_file, binary)
+
+    # Track VERSION install in host registry (best-effort)
+    if source == 'VERSION' and version:
+        try:
+            from logstashagent import install_registry as _reg
+
+            _reg.register_logstash_version(
+                version=version,
+                binary=binary,
+                download_dir=download_dir,
+                used_by=state.get('agent_id') or state.get('deployment_id'),
+            )
+            # Also stamp current instance entry when known
+            role = mode if mode in ('managed', 'simulate') else None
+            iid = state.get('instance_id')
+            if role and iid is not None:
+                key = _reg.instance_key(role, int(iid))
+                reg = _reg.load_registry()
+                inst = (reg.get('instances') or {}).get(key)
+                if inst:
+                    inst['logstash_source'] = 'VERSION'
+                    inst['logstash_version'] = version
+                    inst['logstash_binary'] = binary
+                    reg['instances'][key] = inst
+                    _reg.save_registry(reg)
+        except Exception as e:
+            logger.debug("Could not record VERSION in install registry: %s", e)
+
+    requires_restart = (
+        str(prev_binary) != binary
+        or prev_source != source
+        or (source == 'VERSION' and prev_version != version)
+    )
+    if not prev_binary and not prev_version and source == 'SYSTEM':
+        # First apply of same default system path — still restart if unit never
+        # picked up env; prefer restart on first runtime apply for multi-instance.
+        requires_restart = mode in ('simulate', 'managed') or requires_restart
+
+    from datetime import datetime, timezone
+
+    agent_state.update_state(
+        'last_runtime_apply',
+        {
+            'source': source,
+            'version': version or None,
+            'binary': binary,
+            'requires_restart': requires_restart,
+            'at': datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+    logger.info(
+        "Logstash runtime applied: binary=%s requires_restart=%s",
+        binary, requires_restart,
+    )
+    return {
+        'success': True,
+        'requires_restart': requires_restart,
+        'binary': binary,
+        'error': None,
+        'source': source,
+        'version': version,
+    }
 
 
 def update_logstash_yml(settings_path, content):
@@ -243,30 +754,34 @@ def update_log4j2_properties(settings_path, content):
 def update_keystore(settings_path, keystore_changes):
     """
     Update the Logstash keystore with set/delete operations.
-    
+
+    Supports authenticated keystores (password in agent state) and unauthenticated
+    Logstash keystores (password=None; default-password trailer on disk). Uses
+    pure-Python PKCS#12 writes by default.
+
     Args:
         settings_path: Path to Logstash settings directory
         keystore_changes: Dictionary with 'set' and 'delete' keys
             - 'set': Dictionary of {key_name: key_value} to add/update
             - 'delete': List of key names to remove
-    
+
     Returns:
         bool: True if successful, False otherwise
     """
     try:
         logger.info(f"Starting keystore update at {settings_path}")
         logger.debug(f"Keystore changes requested: {keystore_changes}")
-        
-        # Get keystore password from agent state
-        # Pass None (not empty string) for passwordless keystores — LogstashKeystore
-        # requires None when no password is set; an empty string leaves self.password unset.
+
+        # Get keystore password from agent state.
+        # Pass None (not empty string) for unauthenticated keystores — LogstashKeystore
+        # recovers the embedded trailer password when password is None.
         state = agent_state.get_state()
         keystore_password = state.get('keystore_password') or None
 
         if keystore_password:
             logger.info("Keystore password: CONFIGURED (using provided password)")
         else:
-            logger.info("Keystore password: NOT CONFIGURED (passwordless keystore)")
+            logger.info("Keystore password: NOT CONFIGURED (unauthenticated keystore)")
         
         # Normalize path separators
         if settings_path:
@@ -315,7 +830,8 @@ def update_keystore(settings_path, keystore_changes):
         except LogstashKeystoreException as e:
             logger.warning(f"Failed to load keystore: {e}")
             try:
-                logger.info("Keystore does not exist - creating new keystore...")
+                mode = "authenticated" if keystore_password else "unauthenticated"
+                logger.info(f"Keystore does not exist - creating new {mode} keystore...")
                 ks = LogstashKeystore.create(
                     path_settings=settings_path,
                     password=keystore_password
@@ -324,6 +840,10 @@ def update_keystore(settings_path, keystore_changes):
             except Exception as create_error:
                 logger.error(f"Failed to create keystore: {create_error}")
                 return False
+        except ValueError as e:
+            # Authenticated file but no password in state (or no trailer).
+            logger.error(f"Cannot open keystore without a password: {e}")
+            return False
         except Exception as e:
             logger.error(f"Unexpected error loading keystore: {e}")
             return False
@@ -746,60 +1266,82 @@ def update_pipelines(settings_path, pipeline_changes):
         return False
 
 
+def _logstash_unit_name() -> str:
+    """
+    Systemd unit for this agent role.
+
+    - packaged/default: ``logstash``
+    - simulate: ``ls-simulate@N`` from state (or derived from instance_id)
+    - managed: ``logstash-managed@N`` from state (or derived from instance_id)
+    """
+    state = agent_state.get_state()
+    unit = state.get('logstash_unit')
+    if unit:
+        return unit
+    mode = (state.get('mode') or 'default').lower()
+    instance_id = state.get('instance_id')
+    if mode == 'managed' and instance_id is not None:
+        return f'logstash-managed@{instance_id}'
+    if mode == 'simulate' and instance_id is not None:
+        return f'ls-simulate@{instance_id}'
+    return 'logstash'
+
+
 def restart_logstash():
     """
-    Restart the Logstash service.
+    Restart the Logstash service for this agent role.
     Uses sudo as configured in /etc/sudoers.d/logstash-agent
-    
+
+    Packaged agents restart ``logstash``; simulate uses ``ls-simulate@N``;
+    managed uses ``logstash-managed@N``.
+
     Returns:
         bool: True if successful, False otherwise
     """
+    unit = _logstash_unit_name()
     try:
-        logger.info("Restarting Logstash service...")
-        
-        # Try systemctl first (most common on Linux)
-        # Use sudo since agent runs as logstash user
+        logger.info(f"Restarting Logstash service ({unit})...")
+
+        # Prefer validated helper (sudo-rs compatible); falls back to sudo systemctl
         try:
-            result = subprocess.run(
-                ['sudo', 'systemctl', 'restart', 'logstash'],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            
+            from logstashagent.installer import systemctl_via_sudo
+
+            result = systemctl_via_sudo('restart', unit, timeout=30)
+
             if result.returncode == 0:
-                logger.info("Logstash service restarted successfully via systemctl")
+                logger.info(f"Logstash service restarted successfully via systemctl ({unit})")
                 return True
             else:
-                logger.warning(f"systemctl restart failed: {result.stderr}")
+                logger.warning(f"systemctl restart {unit} failed: {result.stderr}")
         except FileNotFoundError:
             logger.debug("systemctl not found, trying service command")
-        
-        # Try service command as fallback
-        try:
-            result = subprocess.run(
-                ['sudo', 'service', 'logstash', 'restart'],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            
-            if result.returncode == 0:
-                logger.info("Logstash service restarted successfully via service command")
-                return True
-            else:
-                logger.warning(f"service restart failed: {result.stderr}")
-        except FileNotFoundError:
-            logger.debug("service command not found")
-        
-        logger.error("Failed to restart Logstash - no suitable service manager found")
+
+        # Try service command as fallback (default unit only)
+        if unit == 'logstash':
+            try:
+                result = subprocess.run(
+                    ['sudo', 'service', 'logstash', 'restart'],
+                    capture_output=True,
+                    text=True,
+                    timeout=30
+                )
+
+                if result.returncode == 0:
+                    logger.info("Logstash service restarted successfully via service command")
+                    return True
+                else:
+                    logger.warning(f"service restart failed: {result.stderr}")
+            except FileNotFoundError:
+                logger.debug("service command not found")
+
+        logger.error(f"Failed to restart Logstash unit {unit} - no suitable service manager found")
         return False
-        
+
     except subprocess.TimeoutExpired:
-        logger.error("Logstash restart timed out after 30 seconds")
+        logger.error(f"Logstash restart timed out after 30 seconds ({unit})")
         return False
     except Exception as e:
-        logger.error(f"Failed to restart Logstash service: {e}")
+        logger.error(f"Failed to restart Logstash service ({unit}): {e}")
         return False
 
 
@@ -835,8 +1377,9 @@ def _merge_pipelines_into(plan_pipelines, incoming):
 def _apply_merged_plan(settings_path, plan, policy_res, snmp_res):
     """
     Apply a merged policy + SNMP change plan in a SINGLE pass:
-    one `logstash-keystore` batch, one pipelines.yml rewrite, and at most one
-    Logstash restart — instead of each channel applying and restarting on its own.
+    one keystore write batch (pure-Python PKCS#12 by default), one pipelines.yml
+    rewrite, and at most one Logstash restart — instead of each channel applying
+    and restarting on its own.
 
     Config files and the keystore-password rebuild are applied earlier, inline in
     `get_config_changes` (they are policy-only and order-sensitive). This function
@@ -866,7 +1409,7 @@ def _apply_merged_plan(settings_path, plan, policy_res, snmp_res):
     pl_ok = True
 
     # Keystore first — pipelines may reference these keys. Single batched
-    # `logstash-keystore add` covers both policy and SNMP keys.
+    # keystore write covers both policy and SNMP keys (pure-Python by default).
     if ks_has:
         logger.info(f"Merged keystore apply: {len(ks['set'])} set, {len(ks['delete'])} delete")
         ks_ok = update_keystore(settings_path, ks)
@@ -1098,6 +1641,9 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
             'settings_path': settings_path,
             'logs_path': logs_path,
             'binary_path': binary_path,
+            'logstash_source': state.get('logstash_source') or 'SYSTEM',
+            'logstash_version': state.get('logstash_version') or '',
+            'logstash_download_dir': state.get('logstash_download_dir') or '',
             'keystore': keystore_state,
             'keystore_password_hash': state.get('keystore_password_hash', ''),
             'pipelines': pipelines_state,
@@ -1117,12 +1663,14 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
         
         logger.debug(f"Checking config changes with {config_changes_url}")
         
+        from logstashagent.tls_trust import ssl_verify_argument
+
         response = requests.post(
             config_changes_url,
             json=request_data,
             headers=headers,
             timeout=30,
-            verify=False
+            verify=ssl_verify_argument(),
         )
         
         if response.status_code >= 400:
@@ -1201,95 +1749,68 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
             if changes.get('logs_path') and changes.get('logs_path') != False:
                 logger.info(f"Configuration change found for logs_path: {changes.get('logs_path')}")
 
-            # Handle keystore password change (must run BEFORE keystore key changes)
+            # Apply Logstash binary source (SYSTEM vs VERSION download) before keystore/pipelines
             if not rollout_aborted:
-                keystore_password_response = changes.get('keystore_password')
-                if keystore_password_response and keystore_password_response != False:
-                    logger.info("Keystore password change detected - recreating keystore")
-                    try:
-                        actual_password = _decrypt_from_server(api_key, keystore_password_response)
-                        new_hash = hashlib.sha256(actual_password.encode('utf-8')).hexdigest()
-                        logger.info("Successfully decrypted new keystore password")
+                runtime = changes.get('logstash_runtime')
+                if runtime and runtime != False:
+                    logger.info("Logstash runtime change detected (source/version/binary)")
+                    rt_result = apply_logstash_runtime(runtime)
+                    if rt_result.get('success'):
+                        files_updated = True
+                        if rt_result.get('requires_restart'):
+                            requires_restart = True
+                        # Prefer server binary_path state already updated inside apply
+                        if rt_result.get('binary'):
+                            binary_path = str(Path(rt_result['binary']).parent)
+                    else:
+                        logger.error(
+                            "Failed to apply logstash_runtime: %s — aborting rollout",
+                            rt_result.get('error'),
+                        )
+                        failed_operations.append(
+                            f"logstash_runtime apply failed: {rt_result.get('error')}"
+                        )
+                        rollout_aborted = True
 
-                        # Delete the keystore file directly — no need to load/decrypt the old one
-                        # Note: /etc/logstash is owned by logstash:logstash (set during install)
-                        keystore_file = Path(settings_path) / 'logstash.keystore'
-                        
-                        if keystore_file.exists():
-                            try:
-                                keystore_file.unlink(missing_ok=True)
-                                logger.info("Deleted existing keystore file")
-                            except PermissionError as del_e:
-                                logger.error(f"Permission denied deleting keystore: {del_e}")
-                                logger.error(f"Directory ownership issue on {settings_path}")
-                                logger.error("This should have been fixed during installation.")
-                                logger.error("Manual fix required:")
-                                logger.error(f"  sudo chown -R logstash:logstash {settings_path}")
-                                failed_operations.append(f'keystore deletion failed (permission denied): {del_e}')
-                                rollout_aborted = True
-                            except Exception as del_e:
-                                logger.error(f"Could not delete keystore file: {del_e}")
-                                failed_operations.append(f'keystore deletion failed: {del_e}')
-                                rollout_aborted = True
+            # Handle keystore password change/clear (must run BEFORE keystore key changes)
+            # Protocol: false=no-op, null=clear to unauth, string=encrypted set/rotate
+            if not rollout_aborted and 'keystore_password' in changes:
+                pw_result = apply_keystore_password_change(
+                    settings_path,
+                    changes.get('keystore_password'),
+                    api_key,
+                )
+                if pw_result.get('applied'):
+                    if pw_result.get('success'):
+                        state = agent_state.get_state()
+                        files_updated = True
+                        if pw_result.get('requires_restart'):
+                            requires_restart = True
+                    else:
+                        failed_operations.append(
+                            pw_result.get('error') or 'keystore password change failed'
+                        )
+                        # Decrypt failure leaves keystore deleted; still abort key writes
+                        if pw_result.get('action') != 'decrypt_failed':
+                            rollout_aborted = True
                         else:
-                            logger.info("Keystore file does not exist, will create new one")
-
-                        # Only attempt creation if we didn't abort due to permission issues
-                        if not rollout_aborted:
-                            try:
-                                LogstashKeystore.create(path_settings=settings_path, password=actual_password)
-                                logger.info("Created new keystore with updated password")
-                                agent_state.update_state('keystore_password', actual_password)
-                                agent_state.update_state('keystore_password_hash', new_hash)
-                                # Rebuilding the keystore wipes ALL keys, including the
-                                # SNMP-managed keys that arrive on the separate check-in
-                                # channel (they are intentionally excluded from this
-                                # policy-channel rebuild). Clear our SNMP keystore
-                                # hash-state so the next check-in reports them missing and
-                                # the server re-provisions this agent's SNMP keys.
-                                # Without this, the physical keystore would be permanently
-                                # missing SNMP secrets until an unrelated SNMP change.
-                                if state.get('snmp_keystore'):
-                                    agent_state.update_state('snmp_keystore', {})
-                                    logger.info(
-                                        "Cleared SNMP keystore state after password rebuild; "
-                                        "SNMP keys will be re-provisioned on next check-in"
-                                    )
-                                state = agent_state.get_state()
-                                update_logstash_env_file(actual_password)
-                                files_updated = True
-                                requires_restart = True
-                            except Exception as create_error:
-                                logger.error(f"Failed to create keystore: {create_error}")
-                                logger.exception("Keystore creation exception details:")
-                                failed_operations.append(f'keystore creation failed: {create_error}')
-                                rollout_aborted = True
-
-                    except Exception as decrypt_error:
-                        # Decrypt failed — delete the keystore file so we're in a clean
-                        # state for the next sync. Skip key changes this cycle since the
-                        # values are encrypted with the same key and will also fail.
-                        logger.error(f"Failed to decrypt keystore password from server: {decrypt_error}")
-                        failed_operations.append(f'keystore_password decrypt failed: {decrypt_error}')
-                        keystore_file = Path(settings_path) / 'logstash.keystore'
-                        try:
-                            keystore_file.unlink(missing_ok=True)
-                            logger.warning("Deleted keystore file - will recreate with correct password on next successful sync")
-                        except Exception as del_e:
-                            logger.warning(f"Could not delete keystore file: {del_e}")
+                            # Match prior behavior: do not hard-abort entire rollout on
+                            # decrypt fail, but skip subsequent keystore key updates
+                            # by leaving state without password (keys still attempted
+                            # only if password in state — update_keystore handles unauth).
+                            pass
 
             # Handle keystore changes — skip if keystore password is not yet in state
             # (e.g. decrypt failed this cycle; will be retried next sync)
             if not rollout_aborted:
                 keystore_changes = changes.get('keystore')
                 if keystore_changes and keystore_changes != False:
-                    if not state.get('keystore_password'):
-                        logger.warning("Skipping keystore key changes - no keystore password in agent state yet")
-                        failed_operations.append('keystore changes skipped - no password in state')
-                    elif plan is not None:
+                    # Unauthenticated keystores (no password in state) are supported;
+                    # secret values are still decrypted with the agent API key.
+                    if plan is not None:
                         # Merge mode: defer the actual keystore write so it can be
                         # batched with SNMP (and any other source) into ONE
-                        # `logstash-keystore add` and ONE restart in the caller.
+                        # keystore apply and ONE restart in the caller.
                         logger.info("Keystore changes detected (deferred to merged apply)")
                         _merge_keystore_into(plan['keystore'], keystore_changes)
                         files_updated = True
@@ -1673,16 +2194,10 @@ def apply_snmp_changes(settings_path, snmp_changes, plan=None):
                 'pipeline_delete_names': list(pipelines_to_delete),
             }
             if keys_to_set or keys_to_delete:
-                # Setting keys needs the keystore password; if it isn't in state
-                # yet, skip the whole SNMP keystore this cycle (matches legacy;
-                # the policy channel provisions the password on a revision change).
-                if keys_to_set and not state.get('keystore_password'):
-                    logger.warning("Skipping SNMP keystore - no keystore password in agent state yet")
-                    contributed['keystore_skipped'] = True
-                else:
-                    _merge_keystore_into(plan['keystore'], keystore_changes)
-                    contributed['keystore_set_names'] = list(keys_to_set.keys())
-                    contributed['keystore_delete_names'] = list(keys_to_delete)
+                # Unauthenticated keystores are supported (password may be absent).
+                _merge_keystore_into(plan['keystore'], keystore_changes)
+                contributed['keystore_set_names'] = list(keys_to_set.keys())
+                contributed['keystore_delete_names'] = list(keys_to_delete)
             if pipelines_to_set or pipelines_to_delete:
                 _merge_pipelines_into(plan['pipelines'], pipeline_changes)
             return contributed
@@ -1694,12 +2209,8 @@ def apply_snmp_changes(settings_path, snmp_changes, plan=None):
         # --- Keystore first (pipelines may reference these keys) ---
         if keys_to_set or keys_to_delete:
             state = agent_state.get_state()
-            # Setting keys requires the keystore password so the agent can
-            # open/create the keystore. If it isn't present yet, skip this cycle
-            # (the regular policy channel provisions it on revision change).
-            if keys_to_set and not state.get('keystore_password'):
-                logger.warning("Skipping SNMP keystore set - no keystore password in agent state yet")
-            elif update_keystore(settings_path, keystore_changes):
+            # Unauthenticated keystores are supported when keystore_password is absent.
+            if update_keystore(settings_path, keystore_changes):
                 # regular_ks now uses lowercase key names (normalized in update_keystore),
                 # matching the lowercase names the server sends for SNMP entries.
                 # The lookup is now a direct match with no case conversion needed.
@@ -1920,7 +2431,17 @@ def check_in():
             'binaries': binaries,
             'log_file': log_info,
             'problems': '\n'.join(problems) if problems else None,
-            'agent_version': state.get('agent_version', '0.0.0+unknown')
+            'agent_version': state.get('agent_version', '0.0.0+unknown'),
+            # VERSION lifecycle — UI surfaces resolved pin on connections / sim targets
+            'mode': state.get('mode'),
+            'logstash_source': state.get('logstash_source') or 'SYSTEM',
+            'logstash_version': state.get('logstash_version') or '',
+            'logstash_version_resolved': state.get('logstash_version_resolved')
+            or state.get('logstash_version')
+            or '',
+            'logstash_binary': state.get('logstash_binary') or '',
+            'logstash_download_dir': state.get('logstash_download_dir') or '',
+            'last_runtime_apply': state.get('last_runtime_apply'),
         }
 
         api_port = state.get('api_port', 9600)
@@ -1945,6 +2466,21 @@ def check_in():
         # compares it against the deployed state (no decryption) and returns a
         # `managed_changes_available` flag; the actual delta is fetched via
         # GetConfigChanges only when something is dirty.
+        # Callback host/IP for UI → agent HTTPS (IP preferred; keep Connection.host current)
+        callback_host = None
+        callback_ip = None
+        try:
+            from logstashagent.enrollment import get_callback_host, get_callback_ip
+
+            callback_host = get_callback_host()
+            callback_ip = get_callback_ip()
+        except Exception:
+            pass
+        if callback_host:
+            status_blob['callback_host'] = callback_host
+        if callback_ip:
+            status_blob['callback_ip'] = callback_ip
+
         check_in_data = {
             'connection_id': connection_id,
             'revision_number': state.get('revision_number', 0),
@@ -1956,6 +2492,23 @@ def check_in():
                 ),
             },
         }
+        if callback_host:
+            check_in_data['host'] = callback_host
+        if callback_ip:
+            check_in_data['callback_ip'] = callback_ip
+
+        # Upgrade path: re-issue product-CA server cert without re-enroll
+        try:
+            from logstashagent import tls_server
+
+            csr = tls_server.csr_pem_for_request()
+            if csr:
+                check_in_data['csr_pem'] = csr
+                status_blob['tls_server'] = {'needs_cert': True}
+            elif tls_server.has_server_cert():
+                status_blob['tls_server'] = {'has_cert': True}
+        except Exception as e:
+            logger.debug("Agent TLS server CSR for check-in skipped: %s", e)
         
         # Send check-in request
         check_in_url = f"{logstash_ui_url}/ConnectionManager/CheckIn/"
@@ -1966,12 +2519,14 @@ def check_in():
         
         logger.debug(f"Sending check-in to {check_in_url}")
         
+        from logstashagent.tls_trust import ssl_verify_argument
+
         response = requests.post(
             check_in_url,
             json=check_in_data,
             headers=headers,
             timeout=30,
-            verify=False  # Allow self-signed certificates
+            verify=ssl_verify_argument(),
         )
         
         # Check for error status codes
@@ -1993,6 +2548,14 @@ def check_in():
         if result.get('success'):
             logger.info("Check-in successful")
 
+            try:
+                from logstashagent import tls_server
+
+                if tls_server.apply_signed_response(result):
+                    logger.info("Agent server certificate issued/renewed on check-in")
+            except Exception as e:
+                logger.warning("Could not persist server certificate from check-in: %s", e)
+
             # Decide what's dirty from the cheap check-in response (Phase 2):
             #   - policy: revision number differs
             #   - snmp (and any future managed source): per-source rollup flag
@@ -2001,6 +2564,30 @@ def check_in():
             policy_dirty = agent_revision != server_revision
             managed_available = result.get('managed_changes_available', {}) or {}
             snmp_dirty = bool(managed_available.get('snmp'))
+
+            # Detect Logstash runtime drift (VERSION/SYSTEM) even if revision matches
+            # (e.g. partial enroll) so ensure_logstash_version can still run.
+            server_source = (result.get('logstash_source') or 'SYSTEM').upper()
+            server_version = result.get('logstash_version') or ''
+            server_download_dir = result.get('logstash_download_dir') or ''
+            agent_source = (state.get('logstash_source') or 'SYSTEM').upper()
+            agent_version = state.get('logstash_version') or ''
+            agent_download_dir = state.get('logstash_download_dir') or ''
+            runtime_dirty = (
+                server_source != agent_source
+                or (server_source == 'VERSION' and server_version != agent_version)
+                or (
+                    server_source == 'VERSION'
+                    and server_download_dir
+                    and server_download_dir != agent_download_dir
+                )
+            )
+            if runtime_dirty:
+                logger.info(
+                    "Logstash runtime drift detected (agent %s/%s vs server %s/%s)",
+                    agent_source, agent_version or '-',
+                    server_source, server_version or '-',
+                )
 
             # Build ONE merged apply plan so the policy channel and the SNMP
             # channel share a single keystore batch, a single pipelines.yml
@@ -2015,7 +2602,7 @@ def check_in():
             snmp_res = None
             snmp_settings_path = result.get('settings_path') or state.get('settings_path')
 
-            if not policy_dirty and not snmp_dirty:
+            if not policy_dirty and not snmp_dirty and not runtime_dirty:
                 logger.info(f"Agent is up-to-date (revision {agent_revision})")
             else:
                 # Single unified fetch: GetConfigChanges returns BOTH the policy
@@ -2028,6 +2615,8 @@ def check_in():
                     )
                 if snmp_dirty:
                     logger.info("SNMP-managed changes flagged at check-in — fetching delta")
+                if runtime_dirty and not policy_dirty:
+                    logger.info("Fetching config changes for logstash_runtime (VERSION/SYSTEM) apply")
 
                 # In merge mode get_config_changes applies config files + keystore
                 # password inline and defers keystore-key/pipeline changes into
@@ -2047,7 +2636,7 @@ def check_in():
                 # config drift), while avoiding last_policy_apply churn + no-op
                 # revision writes on true SNMP-only cycles.
                 policy_did_work = fetch_res.get('files_updated') if fetch_res else False
-                policy_res = fetch_res if (policy_dirty or policy_did_work) else None
+                policy_res = fetch_res if (policy_dirty or policy_did_work or runtime_dirty) else None
 
                 snmp_changes = (fetch_res or {}).get('snmp_changes')
                 if snmp_changes:
@@ -2085,20 +2674,68 @@ def run_controller():
     logger.info("=" * 60)
     logger.info("LOGSTASH AGENT CONTROLLER STARTED")
     logger.info("=" * 60)
-    
-    # Load agent state to verify enrollment
-    state = agent_state.get_state()
-    
-    if not state.get('enrolled'):
-        logger.error("Agent is not enrolled!")
-        logger.error("Please enroll the agent first using:")
-        logger.error("  python main.py --enroll <TOKEN> --logstash-ui-url <URL>")
-        return
+
+    # Wait for enrollment state. Multi-instance install can start the unit
+    # while state.json is still being relocated; previously we returned
+    # immediately and never checked in — UI shows Offline while FastAPI stays up.
+    import time as _time
+
+    max_wait_sec = 120
+    poll_sec = 2.0
+    deadline = _time.monotonic() + max_wait_sec
+    state: dict = {}
+    while True:
+        state = agent_state.get_state()
+        if state.get('enrolled') and state.get('api_key') and state.get('connection_id'):
+            break
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            logger.error("Agent is not enrolled (gave up after %ss)!", max_wait_sec)
+            logger.error("State dir: %s", agent_state.STATE_DIR)
+            logger.error("Please enroll the agent first using:")
+            logger.error(
+                "  sudo logstash-agent install --enroll <TOKEN> --logstash-ui-url <URL>"
+            )
+            hint_unit = state.get('agent_unit') or (
+                f"lsagent-simulate@{state.get('instance_id')}"
+                if state.get('instance_id') is not None
+                else "logstash-agent"
+            )
+            logger.error(
+                "If enrollment is already on disk, restart the unit: sudo systemctl restart %s",
+                hint_unit,
+            )
+            return
+        logger.warning(
+            "Waiting for enrollment in %s (%.0fs left)…",
+            agent_state.STATE_DIR,
+            remaining,
+        )
+        _time.sleep(poll_sec)
+
+    # Confirm role for upgraded installs (no re-enroll required for default agents)
+    raw_mode = (state.get('mode') or 'default')
+    mode = str(raw_mode).lower()
+    if mode in ('agent', 'host'):
+        logger.info(f"mode=default (legacy '{mode}' mapped) [state]")
+        mode = 'default'
+        try:
+            agent_state.update_state('mode', 'default')
+        except Exception:
+            pass
+    elif mode in ('default', 'simulate', 'embedded'):
+        logger.info(f"mode={mode} [state]")
+    else:
+        logger.info(f"mode={mode} [state]")
     
     logger.info(f"Agent ID: {state.get('agent_id')}")
     logger.info(f"Connection ID: {state.get('connection_id')}")
     logger.info(f"logstashui URL: {state.get('logstash_ui_url')}")
     logger.info(f"Policy ID: {state.get('policy_id')}")
+    if state.get('instance_id') is not None:
+        logger.info(f"Simulate instance_id: {state.get('instance_id')}")
+    if state.get('logstash_unit'):
+        logger.info(f"Logstash unit: {state.get('logstash_unit')}")
     logger.info("=" * 60)
     logger.info("Starting check-in loop (every 60 seconds)")
     logger.info("Press Ctrl+C to stop")

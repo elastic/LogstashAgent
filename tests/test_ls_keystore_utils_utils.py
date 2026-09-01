@@ -123,16 +123,26 @@ class TestExecutableFile:
 
 class TestFindPathSettings:
     def test_returns_existing_writable_dir(self, tmp_path):
-        result = find_path_settings(binary_path=None)
-        # Only meaningful when a candidate dir exists; otherwise it raises.
-        # We just confirm it returns a Path when it succeeds.
+        with patch(
+            "logstashagent.ls_keystore_utils.resolve.resolve_path_settings_from_env",
+            return_value=None,
+        ), patch(
+            "logstashagent.ls_keystore_utils.utils.CANDIDATES", [str(tmp_path)]
+        ), patch(
+            "logstashagent.ls_keystore_utils.utils.ALTERNATE_LS_PATHS", {}
+        ):
+            result = find_path_settings(binary_path=None)
         assert isinstance(result, Path)
+        assert result == tmp_path
 
     def test_raises_when_no_candidate_found(self, tmp_path):
         with patch(
             "logstashagent.ls_keystore_utils.utils.CANDIDATES", []
         ), patch(
             "logstashagent.ls_keystore_utils.utils.ALTERNATE_LS_PATHS", {}
+        ), patch(
+            "logstashagent.ls_keystore_utils.resolve.resolve_path_settings_from_env",
+            return_value=None,
         ):
             with pytest.raises(LogstashKeystoreException, match="No valid path.settings"):
                 find_path_settings()
@@ -143,6 +153,9 @@ class TestFindPathSettings:
             "logstashagent.ls_keystore_utils.utils.CANDIDATES", candidates
         ), patch(
             "logstashagent.ls_keystore_utils.utils.ALTERNATE_LS_PATHS", {}
+        ), patch(
+            "logstashagent.ls_keystore_utils.resolve.resolve_path_settings_from_env",
+            return_value=None,
         ):
             result = find_path_settings()
             assert result == tmp_path
