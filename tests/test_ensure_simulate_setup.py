@@ -31,7 +31,7 @@ SIM_CFG = {
 
 
 def test_ensure_simulate_setup_as_root():
-    with patch.object(installer.os, 'geteuid', return_value=0), patch.object(
+    with patch.object(installer.os, 'geteuid', return_value=0, create=True), patch.object(
         installer, 'setup_simulate_from_policy', return_value={'instance_id': 3}
     ) as setup:
         out = installer.ensure_simulate_setup(dict(SIM_CFG))
@@ -41,7 +41,7 @@ def test_ensure_simulate_setup_as_root():
 
 
 def test_ensure_simulate_setup_sudo_success():
-    with patch.object(installer.os, 'geteuid', return_value=1000), patch.object(
+    with patch.object(installer.os, 'geteuid', return_value=1000, create=True), patch.object(
         installer, '_try_sudo_setup_simulate',
         return_value={'status': 'complete', 'via': 'sudo', 'messages': ['ok']},
     ) as sudo, patch.object(installer, 'setup_simulate_from_policy') as setup:
@@ -60,7 +60,7 @@ def test_ensure_simulate_setup_partial_writable(tmp_path):
     cfg['data_path'] = str(tmp_path / 'simulate-3' / 'data')
     cfg['keystore_env_file'] = str(tmp_path / 'simulate-3' / 'env')
 
-    with patch.object(installer.os, 'geteuid', return_value=1000), patch.object(
+    with patch.object(installer.os, 'geteuid', return_value=1000, create=True), patch.object(
         installer, '_try_sudo_setup_simulate', return_value=None
     ), patch.object(
         installer, '_can_write_simulate_tree', return_value=True
@@ -71,7 +71,7 @@ def test_ensure_simulate_setup_partial_writable(tmp_path):
         return_value='/usr/share/logstash/bin/logstash',
     ), patch.object(
         installer, 'get_logstash_uid_gid', return_value=(1000, 1000)
-    ), patch.object(installer.os, 'chown'):
+    ), patch.object(installer.os, 'chown', create=True):
         out = installer.ensure_simulate_setup(cfg)
 
     assert out['status'] == 'partial'
@@ -81,7 +81,7 @@ def test_ensure_simulate_setup_partial_writable(tmp_path):
 
 
 def test_ensure_simulate_setup_pending_when_no_privs():
-    with patch.object(installer.os, 'geteuid', return_value=1000), patch.object(
+    with patch.object(installer.os, 'geteuid', return_value=1000, create=True), patch.object(
         installer, '_try_sudo_setup_simulate', return_value=None
     ), patch.object(installer, '_can_write_simulate_tree', return_value=False):
         out = installer.ensure_simulate_setup(dict(SIM_CFG))

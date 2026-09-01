@@ -4,6 +4,7 @@
 
 """Managed multi-instance unit names, materialize, and template install."""
 
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -60,7 +61,7 @@ def test_materialize_managed_tree(tmp_path, monkeypatch):
     }
 
     with patch.object(installer, "get_logstash_uid_gid", return_value=(0, 0)), patch.object(
-        installer.os, "chown"
+        installer.os, "chown", create=True
     ), patch(
         "logstashagent.logstash_download.resolve_binary_from_policy",
         return_value="/usr/share/logstash/bin/logstash",
@@ -98,6 +99,7 @@ def test_unit_templates_exist_on_disk():
     assert "managed-%i" in managed_ls
 
 
+@pytest.mark.skipif(sys.platform == 'win32', reason='Uses POSIX pwd module for logstash user injection')
 def test_install_multi_instance_templates(tmp_path, monkeypatch):
     dests = {
         "lsagent_simulate_unit": str(tmp_path / "lsagent-simulate@.service"),

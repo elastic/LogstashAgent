@@ -637,6 +637,40 @@ class TestHealthState:
             supervisor_instance._check_memory_thresholds()
         assert supervisor_instance.is_healthy is False
 
+    def test_healthy_since_set_on_first_healthy_response(self, supervisor_instance):
+        """_healthy_since is recorded on the False->True transition."""
+        assert supervisor_instance._healthy_since is None
+        supervisor_instance.is_healthy = False
+        supervisor_instance.heap_max_gb = 4.0
+        before = time.monotonic()
+        with patch.object(supervisor_instance, "_get_jvm_heap_usage", return_value=50.0), \
+             patch.object(supervisor_instance, "_get_rss_memory_gb", return_value=3.0):
+            supervisor_instance._check_memory_thresholds()
+        assert supervisor_instance._healthy_since is not None
+        assert supervisor_instance._healthy_since >= before
+
+    def test_healthy_since_not_overwritten_while_already_healthy(self, supervisor_instance):
+        """_healthy_since stays fixed once set so warm-healthy duration keeps growing."""
+        supervisor_instance.is_healthy = True
+        supervisor_instance.heap_max_gb = 4.0
+        first = time.monotonic() - 10.0
+        supervisor_instance._healthy_since = first
+        with patch.object(supervisor_instance, "_get_jvm_heap_usage", return_value=50.0), \
+             patch.object(supervisor_instance, "_get_rss_memory_gb", return_value=3.0):
+            supervisor_instance._check_memory_thresholds()
+        assert supervisor_instance._healthy_since == first
+
+    def test_healthy_since_reset_on_restart(self, supervisor_instance):
+        """restart_logstash clears _healthy_since so the next start gets a fresh timestamp."""
+        supervisor_instance._healthy_since = time.monotonic()
+        with patch.object(supervisor_instance, "stop_logstash"), \
+             patch.object(supervisor_instance, "start_logstash"), \
+             patch("logstashagent.logstash_supervisor.time.sleep"), \
+             patch("logstashagent.slots") as ms:
+            ms.evict_all_slots_and_cleanup.return_value = []
+            supervisor_instance.restart_logstash("reset test")
+        assert supervisor_instance._healthy_since is None
+
 
 # ---- TestGlobalFunctions ----
 
