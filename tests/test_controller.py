@@ -202,6 +202,33 @@ class TestUpdateKeystore:
 
 
 
+class TestLogstashUnitName:
+    def test_explicit_unit_wins(self):
+        with patch.object(
+            controller.agent_state,
+            "get_state",
+            return_value={"logstash_unit": "ls-simulate@9", "mode": "host", "instance_id": 1},
+        ):
+            assert controller._logstash_unit_name() == "ls-simulate@9"
+
+    def test_host_alias_maps_to_managed_unit(self):
+        with patch.object(
+            controller.agent_state,
+            "get_state",
+            return_value={"mode": "host", "instance_id": 3},
+        ):
+            assert controller._logstash_unit_name() == "logstash-managed@3"
+
+    def test_default_and_agent_aliases_use_packaged_unit(self):
+        for mode in ("default", "agent", "packaged", None):
+            with patch.object(
+                controller.agent_state,
+                "get_state",
+                return_value={"mode": mode, "instance_id": 1},
+            ):
+                assert controller._logstash_unit_name() == "logstash"
+
+
 class TestRestartLogstash:
     @patch.object(controller.subprocess, "run")
     def test_systemctl_success_returns_true(self, mock_run):

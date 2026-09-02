@@ -1278,7 +1278,14 @@ def _logstash_unit_name() -> str:
     unit = state.get('logstash_unit')
     if unit:
         return unit
+    # Keep in sync with agent_state._MODE_ALIASES (do not import main).
+    _mode_aliases = {
+        'default': 'packaged',
+        'agent': 'packaged',
+        'host': 'managed',
+    }
     mode = (state.get('mode') or 'default').lower()
+    mode = _mode_aliases.get(mode, mode)
     instance_id = state.get('instance_id')
     if mode == 'managed' and instance_id is not None:
         return f'logstash-managed@{instance_id}'
