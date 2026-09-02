@@ -2,32 +2,39 @@
 #or more contributor license agreements. Licensed under the Elastic License;
 #you may not use this file except in compliance with the Elastic License.
 
-
-# Agent role / mode:
-#   default  - Enrolled production control-plane agent (systemctl logstash)
-#   simulate - Enrolled simulation agent (lsagent-simulate@N + ls-simulate@N)
-#   embedded - Docker-local simulation node (no enrollment; FastAPI + supervisor)
+# Agent role / mode (first-class):
+#   packaged  - Enrolled production agent (systemctl logstash + logstash-agent)
+#   managed   - Enrolled multi-instance N (/opt/logstash-agent/managed-N/)
+#   simulate  - Enrolled simulation N (/opt/logstash-agent/simulate-N/)
+#   embedded  - Docker-local simulation (no enrollment; FastAPI + supervisor)
 #
-# Legacy values still accepted and mapped:
-#   agent|host            -> default
-#   simulation + embedded -> embedded
-#   simulation + host     -> simulate (prefer re-enrolling under Simulate Policy)
-mode: default # default | simulate | embedded
+# CLI/config aliases (rewritten on load):
+#   default | agent -> packaged
+#   host            -> managed
+#
+# Precedence (multi-instance): systemd agent.env / Logstash env win when set.
+#   State dir:     LOGSTASH_AGENT_STATE_DIR          → --mode + --instance tree
+#   This yml path: LOGSTASH_AGENT_CONFIG             → instance / packaged path
+#   Mode:          CLI --mode / state / AGENT_MODE   → yml mode
+#   Agent API:     AGENT_API_PORT / LOGSTASH_AGENT_PORT → yml port
+#   Logstash API:  LOGSTASH_API_PORT                 → state / yml
+#   LS paths:      env LOGSTASH_BINARY, LOGSTASH_PATH_* → yml paths
+#   UI URL:        state / LOGSTASH_UI_URL           → yml logstash_ui_url
+#
+# Keep this file as a human-readable fallback. Do not duplicate secrets here;
+# keystore password lives in instance env as LOGSTASH_KEYSTORE_PASS.
+mode: packaged # packaged | managed | simulate | embedded
 
-# Only used when mode is embedded (or legacy simulation_mode)
-# simulation_mode: embedded  # deprecated; use mode: embedded|simulate
-
-# Linux package paths (default mode / system Logstash source)
+# Linux package paths (packaged mode / system Logstash)
 logstash_binary: /usr/share/logstash/bin/logstash
 logstash_settings: /etc/logstash
 logstash_log_path: /var/log/logstash
 
-# FastAPI agent API port (simulate / embedded)
-# Simulate instances use 9500+N from enrollment; embedded uses 9500
+# FastAPI agent API (simulate / embedded / managed). Packaged controller ignores this.
+# Simulate: 9500+N; managed: 9600+N; embedded: 9500
 port: 9500
 
-# Optional overrides after simulate enrollment (normally set from policy_config)
+# Optional overrides after multi-instance enrollment (normally from policy + agent.env)
 # instance_id: 1
 # agent_api_port: 9501
 # logstash_api_port: 9561
-# keystore_env_file: /opt/logstash-agent/simulate-1/env

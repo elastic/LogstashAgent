@@ -536,6 +536,9 @@ def write_config_file(
         config_content = f"""# LogstashAgent Configuration
 # Generated during installation ({policy_type} instance — host-coexistence safe)
 # Instance config lives under {path_root}/ so packaged /etc config is untouched.
+# Runtime prefers systemd agent.env (LOGSTASH_AGENT_*) and Logstash env
+# (LOGSTASH_BINARY, LOGSTASH_PATH_*) when those files exist. This yml is the
+# human-readable fallback and LOGSTASH_AGENT_CONFIG target.
 mode: {mode_name}
 instance_id: {instance_id}
 
@@ -582,6 +585,9 @@ logstash_ui_url: {logstash_ui_url}
         config_content = f"""# LogstashAgent Configuration
 # Generated during installation (PACKAGED / distro Logstash)
 # Multi-instance roles use their own yml under /opt/logstash-agent/{{managed,simulate}}-N/
+# Runtime prefers systemd agent.env (LOGSTASH_AGENT_*) and Logstash env
+# (LOGSTASH_BINARY, LOGSTASH_PATH_*) when those files exist. This yml is the
+# human-readable fallback and LOGSTASH_AGENT_CONFIG target.
 {path_comment}
 mode: packaged
 
