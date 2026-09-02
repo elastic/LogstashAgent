@@ -315,31 +315,31 @@ def normalize_agent_mode(config: dict) -> dict:
     """
     Normalize legacy mode/simulation_mode into mode:
       packaged | managed | simulate | embedded
-    (legacy aliases: default → packaged; agent|host → packaged)
+
+    Aliases:
+      default | agent -> packaged
+      host            -> managed
 
     Mapping:
-      packaged|managed|simulate|embedded|default  -> first-class (default kept as alias)
-      agent|host                                  -> packaged
+      packaged|managed|simulate|embedded          -> first-class
+      default|agent                               -> packaged
+      host                                        -> managed
       simulation + embedded (or missing)          -> embedded
       simulation + host                           -> simulate
-
-    When a legacy value is rewritten, sets config['_mode_legacy'] to a short
-    description of the original value (for startup logging).
     """
     if not config:
         return {'mode': 'embedded', '_mode_legacy': '(empty config)'}
-    # Drop prior annotation if re-normalizing
     config.pop('_mode_legacy', None)
 
     mode = str(config.get('mode', '') or '').lower()
     sim_mode = str(config.get('simulation_mode', '') or '').lower()
 
-    if mode in ('packaged', 'managed', 'simulate', 'embedded', 'default'):
+    if mode in FIRST_CLASS_MODES:
         config['mode'] = mode
         return config
-    if mode in ('agent', 'host'):
+    if mode in MODE_ALIASES:
         config['_mode_legacy'] = mode
-        config['mode'] = 'packaged'
+        config['mode'] = MODE_ALIASES[mode]
         return config
     if mode == 'simulation' or mode == '':
         if sim_mode == 'host':
@@ -354,7 +354,6 @@ def normalize_agent_mode(config: dict) -> dict:
             config['_mode_legacy'] = legacy
             config['mode'] = 'embedded'
         return config
-    # Unknown -> embedded (safest for docker-ish defaults)
     config['_mode_legacy'] = mode or '(unknown)'
     config['mode'] = 'embedded'
     return config
