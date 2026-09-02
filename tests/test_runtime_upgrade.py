@@ -234,6 +234,20 @@ def test_prepare_does_not_clobber_existing_snapshot(tmp_path):
     assert (snap / "meta.json").exists() is False
 
 
+def test_recover_discards_unreadable_snapshot(tmp_path):
+    tree = _managed_tree(tmp_path)
+    snap = tree["root"] / ".runtime-snapshot"
+    snap.mkdir()
+    (snap / "sentinel").write_text("keep-me\n", encoding="utf-8")
+    with patch.object(agent_state, "get_state", return_value=tree["state"]), patch.object(
+        controller, "restart_logstash", return_value=True
+    ) as rst:
+        ok = controller.recover_incomplete_runtime_upgrade()
+    rst.assert_not_called()
+    assert ok is False
+    assert not snap.exists()
+
+
 def test_rollback_keeps_snapshot_when_restart_fails(tmp_path):
     tree = _managed_tree(tmp_path)
     with patch.object(agent_state, "get_state", return_value=tree["state"]), patch(

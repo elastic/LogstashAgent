@@ -815,7 +815,8 @@ def recover_incomplete_runtime_upgrade() -> bool:
     try:
         meta = json.loads((snap / 'meta.json').read_text(encoding='utf-8'))
     except (OSError, json.JSONDecodeError) as e:
-        logger.error('Cannot recover runtime snapshot: %s', e)
+        logger.error('Cannot recover runtime snapshot: %s — discarding unreadable snapshot at %s', e, snap)
+        shutil.rmtree(snap, ignore_errors=True)
         return False
     desired = meta.get('desired') or {}
     cur_source = (state.get('logstash_source') or 'SYSTEM').upper()
