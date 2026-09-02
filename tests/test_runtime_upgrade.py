@@ -263,3 +263,74 @@ def test_rollback_keeps_snapshot_when_restart_fails(tmp_path):
     assert ok is False
     assert snap.is_dir()
     assert (tree["settings"] / "logstash.yml").read_text(encoding="utf-8") == "old-yml\n"
+
+
+def test_wait_for_logstash_api_succeeds_on_accessible():
+    with patch.object(
+        controller,
+        "get_logstash_api_status",
+        return_value={"accessible": True},
+    ) as poll:
+        assert controller.wait_for_logstash_api(9601, timeout=0.01) is True
+    poll.assert_called()
+
+
+def test_wait_for_logstash_api_times_out():
+    with patch.object(
+        controller,
+        "get_logstash_api_status",
+        return_value={"accessible": False},
+    ), patch.object(controller, "RUNTIME_UPGRADE_HEALTH_POLL", 0):
+        assert controller.wait_for_logstash_api(9601, timeout=0) is False
+
+
+def test_finalize_commits_when_api_up(tmp_path):
+    tree = _managed_tree(tmp_path)
+    prep = {
+        "ok": True,
+        "changed": True,
+        "desired_binary": str(tree["new_bin"]),
+        "snapshot_dir": str(tree["root"] / ".runtime-snapshot"),
+        "previous": {"api_port": 9601, "env_file": str(tree["env"])},
+        "source": "VERSION",
+        "version": "9.5.0",
+        "download_dir": str(tmp_path),
+    }
+    (tree["root"] / ".runtime-snapshot").mkdir()
+    (tree["root"] / ".runtime-snapshot" / "meta.json").write_text("{}", encoding="utf-8")
+    with patch.object(controller, "wait_for_logstash_api", return_value=True), patch.object(
+        controller, "commit_runtime_upgrade"
+    ) as commit, patch.object(controller, "rollback_runtime_upgrade") as rb:
+        assert controller.finalize_runtime_upgrade(prep, restart_ok=True) is True
+    commit.assert_called_once_with(prep)
+    rb.assert_not_called()
+
+
+def test_finalize_rolls_back_when_unhealthy(tmp_path):
+    tree = _managed_tree(tmp_path)
+    prep = {
+        "ok": True,
+        "changed": True,
+        "desired_binary": str(tree["new_bin"]),
+        "snapshot_dir": str(tree["root"] / ".runtime-snapshot"),
+        "previous": {"api_port": 9601},
+        "source": "VERSION",
+        "version": "9.5.0",
+    }
+    with patch.object(controller, "wait_for_logstash_api", return_value=False), patch.object(
+        controller, "commit_runtime_upgrade"
+    ) as commit, patch.object(controller, "rollback_runtime_upgrade", return_value=True) as rb:
+        assert controller.finalize_runtime_upgrade(prep, restart_ok=True) is False
+    commit.assert_not_called()
+    rb.assert_called_once()
+    assert rb.call_args.kwargs.get("restart", True) is True
+
+
+def test_finalize_rolls_back_when_restart_fails():
+    prep = {"changed": True, "previous": {"api_port": 9601}}
+    with patch.object(controller, "wait_for_logstash_api") as wait, patch.object(
+        controller, "rollback_runtime_upgrade", return_value=True
+    ) as rb:
+        assert controller.finalize_runtime_upgrade(prep, restart_ok=False) is False
+    wait.assert_not_called()
+    rb.assert_called_once()

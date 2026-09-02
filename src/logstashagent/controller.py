@@ -844,6 +844,35 @@ def recover_incomplete_runtime_upgrade() -> bool:
     return rollback_runtime_upgrade(prep, restart=True)
 
 
+def wait_for_logstash_api(api_port: int, timeout: float | None = None) -> bool:
+    """Poll node info until accessible or timeout (seconds)."""
+    limit = RUNTIME_UPGRADE_HEALTH_TIMEOUT if timeout is None else timeout
+    deadline = time.monotonic() + max(0.0, float(limit))
+    while True:
+        status = get_logstash_api_status(api_port)
+        if status.get('accessible'):
+            return True
+        if time.monotonic() >= deadline:
+            logger.error('Logstash API at port %s did not answer within %ss', api_port, limit)
+            return False
+        time.sleep(RUNTIME_UPGRADE_HEALTH_POLL)
+
+
+def finalize_runtime_upgrade(prep: dict, restart_ok: bool) -> bool:
+    """Commit if the new process answers; otherwise rollback. True = keep new pin."""
+    if not prep or not prep.get('changed'):
+        return True
+    if restart_ok:
+        previous = prep.get('previous') or {}
+        state = agent_state.get_state() or {}
+        api_port = int(previous.get('api_port') or state.get('logstash_api_port') or 9600)
+        if wait_for_logstash_api(api_port):
+            commit_runtime_upgrade(prep)
+            return True
+    rollback_runtime_upgrade(prep, restart=True)
+    return False
+
+
 def apply_logstash_runtime(runtime: dict) -> dict:
     """
     Apply policy Logstash binary source (SYSTEM vs VERSION download).
