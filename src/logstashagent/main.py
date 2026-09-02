@@ -35,9 +35,9 @@ def _argv_mode_hint() -> str | None:
     argv = sys.argv[1:]
     for i, a in enumerate(argv):
         if a == '--mode' and i + 1 < len(argv):
-            return str(argv[i + 1]).lower()
+            return canonical_agent_mode(argv[i + 1])
         if a.startswith('--mode='):
-            return a.split('=', 1)[1].lower()
+            return canonical_agent_mode(a.split('=', 1)[1])
     return None
 
 

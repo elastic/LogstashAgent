@@ -36,6 +36,13 @@ _LEGACY_PACKAGED_STATE_DIR = Path('/var/lib/logstash-agent')
 # Explicit override (tests / install relocate)
 _state_dir_override: Path | None = None
 
+# Tiny alias map (do not import main — cycle). Keep in sync with main.MODE_ALIASES.
+_MODE_ALIASES = {
+    'default': 'packaged',
+    'agent': 'packaged',
+    'host': 'managed',
+}
+
 
 def _peek_mode_and_instance_from_argv(argv: list[str] | None = None) -> tuple[str | None, int | None]:
     """Best-effort parse of --mode / --instance from argv (before argparse)."""
@@ -68,6 +75,8 @@ def _peek_mode_and_instance_from_argv(argv: list[str] | None = None) -> tuple[st
             i += 1
             continue
         i += 1
+    if mode:
+        mode = _MODE_ALIASES.get(mode, mode)
     return mode, instance
 
 

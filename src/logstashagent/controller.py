@@ -2713,18 +2713,23 @@ def run_controller():
         )
         _time.sleep(poll_sec)
 
-    # Confirm role for upgraded installs (no re-enroll required for default agents)
-    raw_mode = (state.get('mode') or 'default')
+    # Confirm role for upgraded installs (no re-enroll required for packaged agents)
+    raw_mode = (state.get('mode') or 'packaged')
     mode = str(raw_mode).lower()
-    if mode in ('agent', 'host'):
-        logger.info(f"mode=default (legacy '{mode}' mapped) [state]")
-        mode = 'default'
+    if mode in ('default', 'agent'):
+        logger.info(f"mode=packaged (legacy '{mode}' mapped) [state]")
+        mode = 'packaged'
         try:
-            agent_state.update_state('mode', 'default')
+            agent_state.update_state('mode', 'packaged')
         except Exception:
             pass
-    elif mode in ('default', 'simulate', 'embedded'):
-        logger.info(f"mode={mode} [state]")
+    elif mode == 'host':
+        logger.info("mode=managed (legacy 'host' mapped) [state]")
+        mode = 'managed'
+        try:
+            agent_state.update_state('mode', 'managed')
+        except Exception:
+            pass
     else:
         logger.info(f"mode={mode} [state]")
     
