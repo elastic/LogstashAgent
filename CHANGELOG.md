@@ -1,10 +1,27 @@
+## [0.5.2] - CLI modes, gated --help, env-vs-yml precedence - 09/02/2026
+
+Package version is **0.5.2**. Works with **LogstashUI 0.5.1 & 0.5.2**.
+
+### Changed
+
+- First-class CLI `--mode` values: **packaged**, **managed**, **simulate**, **embedded**. Aliases rewritten on load and argparse: `default`|`agent` → packaged, `host` → managed.
+- `--help`, admin commands, and `--enroll` no longer load agent yml or create `/etc/logstash` pipeline dirs.
+- Documented config precedence: systemd `agent.env` / Logstash env win over `logstash-agent.yml` when set (example yml, installer templates, README).
+
+### Fixed
+
+- systemd `logstash-agent@N` failed immediately: argparse rejected `--mode managed` (`invalid choice`). Units already passed managed; CLI validation had not.
+- `--mode host` now maps to **managed** (0.5.1 mapped it to packaged). Same rewrite in argv peek, controller startup logs, and Logstash unit name (`logstash-managed@N`).
+- `--enroll` no longer creates pipeline dirs; packaged/managed are included in simulation-style Logstash restart dispatch.
+
+
 ## [0.5.1] - Agent roles, multi-instance, TLS, pure-Python keystores - 08/31/2026
 
 Package version is **0.5.1**. Pair with **LogstashUI 0.5.1**.
 
 ### Roles and multi-instance
 
-- Modes: **`packaged`** (production; legacy `default` / `agent` map here), **`managed`** (legacy `host` maps here), **`simulate`**, **`embedded`**.
+- Modes: **`packaged`** (production; legacy `default` / `agent` / `host` map here), **`managed`**, **`simulate`**, **`embedded`**.
 - Controller waits for enrollment state on start (avoids permanent Offline when the unit starts before state relocate finishes); `get_or_create_agent_id` no longer wipes enrolled fields.
 - Simulate **N:** `/opt/logstash-agent/simulate-N/`, units `lsagent-simulate@N` / `ls-simulate@N`, ports **9500+N** / **9560+N**.
 - Managed **N:** `/opt/logstash-agent/managed-N/`, units `logstash-agent@N` / `logstash-managed@N`, ports **9600+N** / **9700+N**.
@@ -48,8 +65,6 @@ Package version is **0.5.1**. Pair with **LogstashUI 0.5.1**.
 
 ### Fixed
 
-- CLI `--mode` now accepts **packaged** and **managed** (units already passed `--mode managed`; argparse had not). Aliases: `default`|`agent` → packaged, `host` → managed.
-- `--help` and admin commands no longer load agent yml or create `/etc/logstash` pipeline dirs.
 - Fixed additional edge cases in cold-start sequencing that could cause the agent controller to report Offline on fresh installs.
 
 
