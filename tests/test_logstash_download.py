@@ -4,6 +4,8 @@
 
 import io
 import tarfile
+import threading
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -45,16 +47,7 @@ def test_resolve_binary_system_dir(tmp_path):
 
 def test_ensure_logstash_version_idempotent_extract(tmp_path):
     version = "9.4.3"
-    # Build a fake tarball layout: logstash-9.4.3/bin/logstash
-    raw = io.BytesIO()
-    with tarfile.open(fileobj=raw, mode="w:gz") as tar:
-        data = b"#!/bin/sh\necho logstash\n"
-        info = tarfile.TarInfo(name=f"logstash-{version}/bin/logstash")
-        info.size = len(data)
-        info.mode = 0o755
-        tar.addfile(info, io.BytesIO(data))
-    raw.seek(0)
-    tarball_bytes = raw.read()
+    tarball_bytes = _minimal_logstash_tarball(version)
 
     def fake_urlopen(url, timeout=60):
         class Resp:
@@ -195,3 +188,64 @@ def test_ensure_extracts_flat_not_nested(tmp_path):
     # Flat: <root>/logstash-9.4.3/bin/logstash — NOT <root>/9.4.3/logstash-9.4.3/...
     assert Path(binary) == tmp_path / f"logstash-{version}" / "bin" / "logstash"
     assert not (tmp_path / version).exists()
+
+
+def test_ensure_logstash_version_flock_serializes_extract(tmp_path):
+    """Two threads targeting the same missing version download once."""
+    version = "9.5.0"
+    tarball_bytes = _minimal_logstash_tarball(version)
+    downloads = []
+    started = threading.Event()
+    proceed = threading.Event()
+
+    def slow_download(url, dest, timeout=600):
+        downloads.append(url)
+        started.set()
+        assert proceed.wait(5), "first downloader stuck"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(tarball_bytes)
+
+    results = []
+    errors = []
+
+    def worker():
+        try:
+            results.append(
+                ld.ensure_logstash_version(
+                    version, str(tmp_path), platform_arch="linux-x86_64"
+                )
+            )
+        except Exception as e:
+            errors.append(e)
+
+    with patch.object(ld, "_download_file", side_effect=slow_download), patch.object(
+        ld, "_verify_sha512", return_value=None
+    ):
+        t1 = threading.Thread(target=worker)
+        t1.start()
+        assert started.wait(5)
+        t2 = threading.Thread(target=worker)
+        t2.start()
+        time.sleep(0.2)
+        assert len(downloads) == 1
+        proceed.set()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+
+    assert errors == []
+    assert len(downloads) == 1
+    assert len(results) == 2
+    assert results[0] == results[1]
+    assert Path(results[0]).is_file()
+
+
+def _minimal_logstash_tarball(version: str) -> bytes:
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w:gz") as tar:
+        data = b"#!/bin/sh\necho logstash\n"
+        info = tarfile.TarInfo(name=f"logstash-{version}/bin/logstash")
+        info.size = len(data)
+        info.mode = 0o755
+        tar.addfile(info, io.BytesIO(data))
+    raw.seek(0)
+    return raw.read()

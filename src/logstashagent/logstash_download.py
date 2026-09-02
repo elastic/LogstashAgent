@@ -9,6 +9,7 @@ when policy logstash_source=VERSION.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import logging
 import os
@@ -17,6 +18,7 @@ import shutil
 import tarfile
 import tempfile
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -210,6 +212,29 @@ def _verify_sha512(tarball: Path, sha_url: str) -> None:
     logger.info("✓ Verified SHA-512 for %s", tarball.name)
 
 
+def version_lock_path(download_root: str, version: str) -> Path:
+    safe = (version or "").strip().replace("/", "_").replace("..", "_")
+    return Path(download_root) / f".lock-logstash-{safe}"
+
+
+@contextmanager
+def _exclusive_version_lock(download_root: str, version: str):
+    """Exclusive flock for one Logstash version tree. Released on process death."""
+    root = Path(download_root)
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path = version_lock_path(download_root, version)
+    fh = open(lock_path, "a+")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        fh.close()
+
+
 def ensure_logstash_version(
     version: str,
     download_root: str = DEFAULT_DOWNLOAD_ROOT,
@@ -228,6 +253,22 @@ def ensure_logstash_version(
         raise LogstashDownloadError("logstash_version is empty")
 
     download_root = normalize_download_dir(download_root or DEFAULT_DOWNLOAD_ROOT)
+    with _exclusive_version_lock(download_root, version):
+        return _ensure_logstash_version_locked(
+            version,
+            download_root,
+            platform_arch=platform_arch,
+            force=force,
+        )
+
+
+def _ensure_logstash_version_locked(
+    version: str,
+    download_root: str = DEFAULT_DOWNLOAD_ROOT,
+    *,
+    platform_arch: Optional[str] = None,
+    force: bool = False,
+) -> Path:
     root = Path(download_root)
     install_dir = version_install_dir(version, download_root)
 
