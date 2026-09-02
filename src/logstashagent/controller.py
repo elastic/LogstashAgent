@@ -584,7 +584,7 @@ def _write_runtime_snapshot(state: dict, previous: dict, desired: dict) -> Path:
         raise RuntimeError('no path_root for runtime snapshot')
     snap = root / RUNTIME_SNAPSHOT_NAME
     if snap.exists():
-        shutil.rmtree(snap)
+        raise RuntimeError(f'refusing to overwrite existing runtime snapshot at {snap}')
     snap.mkdir(parents=True, exist_ok=True)
     settings = Path(state.get('settings_path') or '')
     settings_dest = snap / 'settings'
@@ -614,20 +614,24 @@ def _restore_runtime_snapshot(prep: dict) -> bool:
         logger.error('Invalid runtime snapshot meta: %s', e)
         return False
     previous = meta.get('previous') or prep.get('previous') or {}
-    settings = Path(previous.get('settings_path') or '')
-    src_settings = snap / 'settings'
-    if src_settings.is_dir() and settings:
-        settings.mkdir(parents=True, exist_ok=True)
-        for name in _SNAPSHOT_SETTING_FILES:
-            _copy_if_exists(src_settings / name, settings / name)
-        pipe_src = src_settings / 'pipelines'
-        if pipe_src.exists():
-            _copy_if_exists(pipe_src, settings / 'pipelines')
-    env_file = previous.get('env_file')
-    env_src = snap / 'env'
-    if env_file and env_src.is_file():
-        Path(env_file).parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(env_src, env_file)
+    try:
+        settings = Path(previous.get('settings_path') or '')
+        src_settings = snap / 'settings'
+        if src_settings.is_dir() and settings:
+            settings.mkdir(parents=True, exist_ok=True)
+            for name in _SNAPSHOT_SETTING_FILES:
+                _copy_if_exists(src_settings / name, settings / name)
+            pipe_src = src_settings / 'pipelines'
+            if pipe_src.exists():
+                _copy_if_exists(pipe_src, settings / 'pipelines')
+        env_file = previous.get('env_file')
+        env_src = snap / 'env'
+        if env_file and env_src.is_file():
+            Path(env_file).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(env_src, env_file)
+    except (OSError, shutil.Error) as e:
+        logger.error('Failed to restore runtime snapshot at %s: %s', snap, e)
+        return False
     return True
 
 
@@ -704,12 +708,13 @@ def prepare_runtime_upgrade(runtime: dict | None) -> dict:
         'api_port': state.get('logstash_api_port') or 9600,
     }
     desired = {'binary': binary, 'source': source, 'version': version, 'download_dir': download_dir}
+    root = _runtime_path_root(state)
+    preexisting_snapshot = bool(root is not None and (root / RUNTIME_SNAPSHOT_NAME).exists())
     try:
         snap = _write_runtime_snapshot(state, previous, desired)
     except Exception as e:
         logger.error('Runtime snapshot failed: %s', e, exc_info=True)
-        root = _runtime_path_root(state)
-        if root is not None:
+        if root is not None and not preexisting_snapshot:
             shutil.rmtree(root / RUNTIME_SNAPSHOT_NAME, ignore_errors=True)
         return _empty_runtime_prep(ok=False, error=str(e), source=source, version=version)
 
@@ -789,6 +794,7 @@ def rollback_runtime_upgrade(prep: dict, *, restart: bool = True) -> bool:
     if restart:
         if not restart_logstash():
             logger.error('Runtime upgrade rollback restored files but restart failed')
+            return False
     snap = prep.get('snapshot_dir')
     if snap:
         shutil.rmtree(snap, ignore_errors=True)
@@ -806,21 +812,32 @@ def recover_incomplete_runtime_upgrade() -> bool:
     snap = root / RUNTIME_SNAPSHOT_NAME
     if not snap.is_dir():
         return False
-    logger.warning('Incomplete runtime upgrade snapshot found at %s — rolling back', snap)
     try:
         meta = json.loads((snap / 'meta.json').read_text(encoding='utf-8'))
     except (OSError, json.JSONDecodeError) as e:
         logger.error('Cannot recover runtime snapshot: %s', e)
         return False
+    desired = meta.get('desired') or {}
+    cur_source = (state.get('logstash_source') or 'SYSTEM').upper()
+    cur_version = (state.get('logstash_version') or '').strip()
+    cur_binary = str(state.get('logstash_binary') or '')
+    desired_source = (desired.get('source') or 'SYSTEM').upper()
+    desired_version = (desired.get('version') or '').strip()
+    desired_binary = str(desired.get('binary') or '')
+    if cur_source == desired_source and cur_version == desired_version and cur_binary == desired_binary:
+        logger.info('Leftover runtime snapshot matches committed pin; discarding %s', snap)
+        shutil.rmtree(snap, ignore_errors=True)
+        return True
+    logger.warning('Incomplete runtime upgrade snapshot found at %s — rolling back', snap)
     prep = {
         'ok': True,
         'changed': True,
         'snapshot_dir': str(snap),
         'previous': meta.get('previous') or {},
-        'desired_binary': (meta.get('desired') or {}).get('binary'),
-        'source': (meta.get('desired') or {}).get('source'),
-        'version': (meta.get('desired') or {}).get('version'),
-        'download_dir': (meta.get('desired') or {}).get('download_dir'),
+        'desired_binary': desired.get('binary'),
+        'source': desired.get('source'),
+        'version': desired.get('version'),
+        'download_dir': desired.get('download_dir'),
         'error': None,
     }
     return rollback_runtime_upgrade(prep, restart=True)

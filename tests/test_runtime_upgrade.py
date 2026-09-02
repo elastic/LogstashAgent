@@ -164,3 +164,88 @@ def test_recover_restores_leftover_snapshot(tmp_path):
     rst.assert_called_once()
     assert (tree["settings"] / "logstash.yml").read_text(encoding="utf-8") == "old-yml\n"
     assert not Path(prep["snapshot_dir"]).exists()
+
+
+def _version_runtime(tmp_path: Path) -> dict:
+    return {
+        "source": "VERSION",
+        "version": "9.5.0",
+        "download_dir": str(tmp_path / "versions"),
+        "binary_path": "/usr/share/logstash/bin",
+    }
+
+
+def test_recover_discards_snapshot_when_state_matches_desired(tmp_path):
+    tree = _managed_tree(tmp_path)
+    with patch.object(agent_state, "get_state", return_value=tree["state"]), patch(
+        "logstashagent.logstash_download.resolve_binary_from_policy",
+        return_value=str(tree["new_bin"]),
+    ), patch("logstashagent.install_registry.register_logstash_version", return_value={}):
+        prep = controller.prepare_runtime_upgrade(_version_runtime(tmp_path))
+
+    (tree["settings"] / "logstash.yml").write_text("NEW\n", encoding="utf-8")
+    tree["state"]["logstash_source"] = "VERSION"
+    tree["state"]["logstash_version"] = "9.5.0"
+    tree["state"]["logstash_binary"] = str(tree["new_bin"])
+    with patch.object(agent_state, "get_state", return_value=tree["state"]), patch.object(
+        controller, "restart_logstash", return_value=True
+    ) as rst:
+        ok = controller.recover_incomplete_runtime_upgrade()
+    rst.assert_not_called()
+    assert ok is True
+    assert not Path(prep["snapshot_dir"]).exists()
+    assert (tree["settings"] / "logstash.yml").read_text(encoding="utf-8") == "NEW\n"
+
+
+def test_restore_io_failure_keeps_snapshot(tmp_path):
+    tree = _managed_tree(tmp_path)
+    with patch.object(agent_state, "get_state", return_value=tree["state"]), patch(
+        "logstashagent.logstash_download.resolve_binary_from_policy",
+        return_value=str(tree["new_bin"]),
+    ), patch("logstashagent.install_registry.register_logstash_version", return_value={}):
+        prep = controller.prepare_runtime_upgrade(_version_runtime(tmp_path))
+
+    snap = Path(prep["snapshot_dir"])
+    with patch.object(controller, "_copy_if_exists", side_effect=OSError("disk full")), patch.object(
+        controller, "restart_logstash", return_value=True
+    ) as rst:
+        ok = controller.rollback_runtime_upgrade(prep, restart=False)
+    rst.assert_not_called()
+    assert ok is False
+    assert snap.is_dir()
+    assert (snap / "meta.json").is_file()
+
+
+def test_prepare_does_not_clobber_existing_snapshot(tmp_path):
+    tree = _managed_tree(tmp_path)
+    snap = tree["root"] / ".runtime-snapshot"
+    snap.mkdir()
+    sentinel = snap / "sentinel"
+    sentinel.write_text("keep-me\n", encoding="utf-8")
+    with patch.object(agent_state, "get_state", return_value=tree["state"]), patch(
+        "logstashagent.logstash_download.resolve_binary_from_policy",
+        return_value=str(tree["new_bin"]),
+    ), patch("logstashagent.install_registry.register_logstash_version", return_value={}):
+        prep = controller.prepare_runtime_upgrade(_version_runtime(tmp_path))
+    assert prep["ok"] is False
+    assert prep["changed"] is False
+    assert sentinel.is_file()
+    assert sentinel.read_text(encoding="utf-8") == "keep-me\n"
+    assert (snap / "meta.json").exists() is False
+
+
+def test_rollback_keeps_snapshot_when_restart_fails(tmp_path):
+    tree = _managed_tree(tmp_path)
+    with patch.object(agent_state, "get_state", return_value=tree["state"]), patch(
+        "logstashagent.logstash_download.resolve_binary_from_policy",
+        return_value=str(tree["new_bin"]),
+    ), patch("logstashagent.install_registry.register_logstash_version", return_value={}):
+        prep = controller.prepare_runtime_upgrade(_version_runtime(tmp_path))
+
+    snap = Path(prep["snapshot_dir"])
+    (tree["settings"] / "logstash.yml").write_text("NEW\n", encoding="utf-8")
+    with patch.object(controller, "restart_logstash", return_value=False):
+        ok = controller.rollback_runtime_upgrade(prep, restart=True)
+    assert ok is False
+    assert snap.is_dir()
+    assert (tree["settings"] / "logstash.yml").read_text(encoding="utf-8") == "old-yml\n"
