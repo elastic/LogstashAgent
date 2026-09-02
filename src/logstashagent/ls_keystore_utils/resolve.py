@@ -173,8 +173,10 @@ def resolve_path_settings_from_env(
       3. :data:`settings.CANDIDATES` (``/etc/logstash``, then share config)
 
     Args:
-        require_writable: When True, skip directories that are not writable
-            (used by library helpers that create keystores).
+        require_writable: When True, skip directories that exist but are not
+            writable (used by library helpers that create keystores). Missing
+            directories are not treated as unwritable — they are skipped so
+            managed hosts without ``/etc/logstash`` still resolve.
 
     Returns:
         A directory path, or None if nothing matches.
@@ -187,7 +189,9 @@ def resolve_path_settings_from_env(
         if path.is_dir():
             if require_writable and not os.access(path, os.W_OK):
                 logger.debug("%s=%s is not writable", name, path)
-                continue
+                # Explicit path exists but is not writable — do not fall back
+                # to package /etc/logstash (wrong for managed / simulate).
+                return None
             return path.resolve()
         logger.debug("%s=%s is not a directory", name, configured)
 

@@ -7,12 +7,15 @@ Package version is **0.5.2**. Works with **LogstashUI 0.5.1 & 0.5.2**.
 - First-class CLI `--mode` values: **packaged**, **managed**, **simulate**, **embedded**. Aliases rewritten on load and argparse: `default`|`agent` → packaged, `host` → managed.
 - `--help`, admin commands, and `--enroll` no longer load agent yml or create `/etc/logstash` pipeline dirs.
 - Documented config precedence: systemd `agent.env` / Logstash env win over `logstash-agent.yml` when set (example yml, installer templates, README).
+- `resolve_path_settings_from_env(require_writable=True)`: missing directories are skipped; an explicit env path that exists but is not writable no longer falls back to `/etc/logstash`.
 
 ### Fixed
 
 - systemd `logstash-agent@N` failed immediately: argparse rejected `--mode managed` (`invalid choice`). Units already passed managed; CLI validation had not.
 - `--mode host` now maps to **managed** (0.5.1 mapped it to packaged). Same rewrite in argv peek, controller startup logs, and Logstash unit name (`logstash-managed@N`).
 - `--enroll` no longer creates pipeline dirs; packaged/managed are included in simulation-style Logstash restart dispatch.
+- Embedded supervisor records `_healthy_since` on first healthy API response and clears it on restart / sustained unresponsive (pipeline-bus warmup). Tests existed; the field never landed.
+- `restart_logstash` unit tests mock `systemctl_via_sudo` so they do not need a host `systemctl` (macOS/Windows).
 
 
 ## [0.5.1] - Agent roles, multi-instance, TLS, pure-Python keystores - 08/31/2026

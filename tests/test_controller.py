@@ -230,48 +230,42 @@ class TestLogstashUnitName:
 
 
 class TestRestartLogstash:
+    @patch.object(controller.agent_state, "get_state", return_value={})
+    @patch("logstashagent.installer.systemctl_via_sudo")
+    def test_systemctl_success_returns_true(self, mock_ctl, _state):
+        mock_ctl.return_value = MagicMock(returncode=0, stderr="")
+
+        assert controller.restart_logstash() is True
+
+        mock_ctl.assert_called_with("restart", "logstash", timeout=30)
+
+    @patch.object(controller.agent_state, "get_state", return_value={})
     @patch.object(controller.subprocess, "run")
-    def test_systemctl_success_returns_true(self, mock_run):
+    @patch("logstashagent.installer.systemctl_via_sudo", side_effect=FileNotFoundError())
+    def test_falls_back_to_service_command(self, _mock_ctl, mock_run, _state):
         mock_run.return_value = MagicMock(returncode=0, stderr="")
 
         assert controller.restart_logstash() is True
 
-        mock_run.assert_called_with(
-            ["sudo", "systemctl", "restart", "logstash"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-
-    @patch.object(controller.subprocess, "run")
-    def test_falls_back_to_service_command(self, mock_run):
-        mock_run.side_effect = [
-            FileNotFoundError(),
-            MagicMock(returncode=0, stderr=""),
-        ]
-
-        assert controller.restart_logstash() is True
-
-        assert mock_run.call_args_list[1][0][0] == [
+        assert mock_run.call_args_list[0][0][0] == [
             "sudo",
             "service",
             "logstash",
             "restart",
         ]
 
+    @patch.object(controller.agent_state, "get_state", return_value={})
     @patch.object(controller.subprocess, "run")
-    def test_returns_false_when_no_manager_succeeds(self, mock_run):
-        mock_run.side_effect = [
-            FileNotFoundError(),
-            FileNotFoundError(),
-        ]
+    @patch("logstashagent.installer.systemctl_via_sudo", side_effect=FileNotFoundError())
+    def test_returns_false_when_no_manager_succeeds(self, _mock_ctl, mock_run, _state):
+        mock_run.side_effect = FileNotFoundError()
 
         assert controller.restart_logstash() is False
 
-    @patch.object(controller.subprocess, "run")
-    def test_timeout_returns_false(self, mock_run):
-        mock_run.side_effect = subprocess.TimeoutExpired("cmd", 30)
+    @patch.object(controller.agent_state, "get_state", return_value={})
+    @patch("logstashagent.installer.systemctl_via_sudo")
+    def test_timeout_returns_false(self, mock_ctl, _state):
+        mock_ctl.side_effect = subprocess.TimeoutExpired("cmd", 30)
 
         assert controller.restart_logstash() is False
 
