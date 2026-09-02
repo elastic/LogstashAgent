@@ -26,9 +26,21 @@ Product documentation (roles, ports, coexistence, VERSION CLI) lives in the Logs
 | `embedded` | EMBEDDED | Docker/local sim without enrollment (FastAPI + supervisor). Ports **9500** / **9560**. |
 | `default` | (legacy) | Alias of packaged (still accepted). |
 
-Legacy `mode: agent|host` maps to **packaged** at startup (see logs: `mode=packaged (legacy '…' mapped)`).
+Legacy aliases (rewritten on load / CLI): `default` and `agent` → **packaged**; `host` → **managed**.
 
 **Host coexistence:** Packaged + Managed + Simulate can share one machine. Multi-instance state/config live under the instance tree (`LOGSTASH_AGENT_STATE_DIR` / `LOGSTASH_AGENT_CONFIG` in `agent.env`), not under packaged `/var/lib` or `/etc`.
+
+**Precedence** (multi-instance): systemd `agent.env` / Logstash env win when set.
+
+| Concern | Preferred (multi-instance) | Fallback |
+|---------|----------------------------|----------|
+| State dir | `LOGSTASH_AGENT_STATE_DIR` (`agent.env`) | `--mode` + `--instance` tree |
+| Agent yml path | `LOGSTASH_AGENT_CONFIG` (`agent.env`) | instance / packaged path |
+| Mode | CLI `--mode` / state / `AGENT_MODE` | yml `mode` |
+| Agent API port | `AGENT_API_PORT` / `LOGSTASH_AGENT_PORT` | yml `port` / state |
+| Logstash API port | `LOGSTASH_API_PORT` | state / yml |
+| Logstash binary & paths | Logstash env (`LOGSTASH_BINARY`, `LOGSTASH_PATH_*`) | yml / state |
+| UI URL | state / `LOGSTASH_UI_URL` | yml `logstash_ui_url` |
 
 **Upgrade:** Existing production agents keep working **without re-enroll** after package upgrade. Use a **Simulate** or **Managed** policy token when adding multi-instance roles.
 

@@ -4,7 +4,7 @@ Package version is **0.5.1**. Pair with **LogstashUI 0.5.1**.
 
 ### Roles and multi-instance
 
-- Modes: **`packaged`** (production; legacy `default` / `agent` / `host` map here), **`managed`**, **`simulate`**, **`embedded`**.
+- Modes: **`packaged`** (production; legacy `default` / `agent` map here), **`managed`** (legacy `host` maps here), **`simulate`**, **`embedded`**.
 - Controller waits for enrollment state on start (avoids permanent Offline when the unit starts before state relocate finishes); `get_or_create_agent_id` no longer wipes enrolled fields.
 - Simulate **N:** `/opt/logstash-agent/simulate-N/`, units `lsagent-simulate@N` / `ls-simulate@N`, ports **9500+N** / **9560+N**.
 - Managed **N:** `/opt/logstash-agent/managed-N/`, units `logstash-agent@N` / `logstash-managed@N`, ports **9600+N** / **9700+N**.
@@ -48,6 +48,8 @@ Package version is **0.5.1**. Pair with **LogstashUI 0.5.1**.
 
 ### Fixed
 
+- CLI `--mode` now accepts **packaged** and **managed** (units already passed `--mode managed`; argparse had not). Aliases: `default`|`agent` → packaged, `host` → managed.
+- `--help` and admin commands no longer load agent yml or create `/etc/logstash` pipeline dirs.
 - Fixed additional edge cases in cold-start sequencing that could cause the agent controller to report Offline on fresh installs.
 
 
