@@ -58,8 +58,30 @@ _ADMIN_CLI = (
     or 'ensure-version' in sys.argv
     or 'prune-versions' in sys.argv
 )
+_ADMIN_COMMANDS = (
+    'install', 'uninstall', 'list-instances', 'list-versions',
+    'ensure-version', 'prune-versions', 'configure', 'setup-simulate',
+    'recover-simulate', 'upgrade',
+)
+
+
+def _is_lightweight_cli(argv: list[str] | None = None) -> bool:
+    """True when we must not load yml, create agent_id, or makedirs pipeline dirs."""
+    argv = list(argv if argv is not None else sys.argv[1:])
+    if '-h' in argv or '--help' in argv:
+        return True
+    if '--run' in argv:
+        return False
+    for a in argv:
+        if a in _ADMIN_COMMANDS:
+            return True
+    return False
+
+
+_LIGHTWEIGHT_CLI = _is_lightweight_cli()
 _SKIP_SIMULATION_IMPORTS = bool(
     _ADMIN_CLI
+    or _LIGHTWEIGHT_CLI
     or (
         '--run' in sys.argv
         and (_CLI_MODE_HINT is None or _CLI_MODE_HINT not in _SIM_FASTAPI_MODES)
@@ -185,17 +207,14 @@ def _get_version():
 
 AGENT_VERSION = _get_version()
 
-# Resolve per-instance state early (LOGSTASH_AGENT_STATE_DIR / --mode --instance)
-# so Packaged and managed-N/simulate-N do not share agent_id on one host.
-agent_state.refresh_state_paths()
-
-# Initialize agent state (generates agent_id on first run)
-AGENT_ID = agent_state.get_or_create_agent_id()
-
-# Save version to agent state
-agent_state.update_state('agent_version', AGENT_VERSION)
-logger.info(f"LogstashAgent version: {AGENT_VERSION}")
-logger.info(f"Agent state dir: {agent_state.STATE_DIR}")
+# Placeholders so FastAPI routes can close over names; filled by ensure_runtime_init.
+AGENT_ID: str | None = None
+AGENT_CONFIG: dict = {}
+LOGSTASH_PATHS: dict = {}
+PIPELINES_YML_PATH = ''
+PIPELINES_DIR = ''
+METADATA_DIR = ''
+_RUNTIME_READY = False
 
 # Load agent configuration
 # Check for config in current directory first (native mode)
@@ -1133,17 +1152,6 @@ def _atexit_shutdown_supervisor():
     logstash_supervisor.shutdown_supervisor()
 
 
-# Global config
-AGENT_CONFIG = normalize_agent_mode(load_agent_config())
-if AGENT_CONFIG.get('_mode_legacy'):
-    log_resolved_agent_mode(
-        AGENT_CONFIG.get('mode', 'embedded'),
-        legacy=AGENT_CONFIG.get('_mode_legacy'),
-        source='config',
-    )
-else:
-    log_resolved_agent_mode(AGENT_CONFIG.get('mode', 'embedded'), source='config')
-
 app = FastAPI(title="logstashagent API", version="0.0.1")
 
 # Request queue for simulation requests during Logstash restarts
@@ -1306,14 +1314,39 @@ def get_logstash_log_dir() -> str:
     )
     return log_dir
 
-LOGSTASH_PATHS = get_logstash_paths()
-PIPELINES_YML_PATH = LOGSTASH_PATHS['pipelines_yml']
-PIPELINES_DIR = LOGSTASH_PATHS['conf_d']
-METADATA_DIR = LOGSTASH_PATHS['metadata']
 
-# Ensure directories exist
-os.makedirs(PIPELINES_DIR, exist_ok=True)
-os.makedirs(METADATA_DIR, exist_ok=True)
+def ensure_runtime_init(*, create_pipeline_dirs: bool = True) -> None:
+    """Load config, agent_id, and pipeline dirs. No-op if already initialized."""
+    global AGENT_ID, AGENT_CONFIG, LOGSTASH_PATHS
+    global PIPELINES_YML_PATH, PIPELINES_DIR, METADATA_DIR, _RUNTIME_READY
+    if _RUNTIME_READY:
+        return
+    agent_state.refresh_state_paths()
+    AGENT_ID = agent_state.get_or_create_agent_id()
+    agent_state.update_state('agent_version', AGENT_VERSION)
+    logger.info(f"LogstashAgent version: {AGENT_VERSION}")
+    logger.info(f"Agent state dir: {agent_state.STATE_DIR}")
+    AGENT_CONFIG = normalize_agent_mode(load_agent_config())
+    if AGENT_CONFIG.get('_mode_legacy'):
+        log_resolved_agent_mode(
+            AGENT_CONFIG.get('mode', 'embedded'),
+            legacy=AGENT_CONFIG.get('_mode_legacy'),
+            source='config',
+        )
+    else:
+        log_resolved_agent_mode(AGENT_CONFIG.get('mode', 'embedded'), source='config')
+    LOGSTASH_PATHS = get_logstash_paths()
+    PIPELINES_YML_PATH = LOGSTASH_PATHS['pipelines_yml']
+    PIPELINES_DIR = LOGSTASH_PATHS['conf_d']
+    METADATA_DIR = LOGSTASH_PATHS['metadata']
+    if create_pipeline_dirs:
+        os.makedirs(PIPELINES_DIR, exist_ok=True)
+        os.makedirs(METADATA_DIR, exist_ok=True)
+    _RUNTIME_READY = True
+
+
+if not _LIGHTWEIGHT_CLI:
+    ensure_runtime_init(create_pipeline_dirs=True)
 
 
 def _validate_pipeline_id(pipeline_id: str) -> None:
@@ -3610,6 +3643,7 @@ if __name__ == "__main__":
                 sys.exit(0)
 
         try:
+            ensure_runtime_init(create_pipeline_dirs=False)
             installer.perform_installation(
                 enroll_token=args.enroll,
                 logstash_ui_url=args.logstash_ui_url,
@@ -3943,6 +3977,7 @@ if __name__ == "__main__":
                 sys.exit(0)
 
         try:
+            ensure_runtime_init(create_pipeline_dirs=False)
             enrollment.perform_enrollment(
                 encoded_token=args.enroll,
                 logstash_ui_url=args.logstash_ui_url,
@@ -3956,6 +3991,8 @@ if __name__ == "__main__":
     # Setup file logging for normal operation (not install/uninstall/upgrade)
     # This creates the log file with the correct user permissions
     setup_file_logging()
+
+    ensure_runtime_init(create_pipeline_dirs=True)
 
     # CLI overrides for mode / instance
     if getattr(args, 'mode', None):

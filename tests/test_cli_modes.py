@@ -67,3 +67,50 @@ class TestParseModeArgument:
         monkeypatch.setattr(sys, "argv", ["logstash-agent", "--mode", "banana"])
         with pytest.raises(SystemExit):
             main.parse_arguments()
+
+
+class TestLightweightCli:
+    def test_help_flag(self):
+        assert main._is_lightweight_cli(["--help"]) is True
+        assert main._is_lightweight_cli(["-h"]) is True
+
+    def test_admin_commands(self):
+        assert main._is_lightweight_cli(["install", "--enroll", "x", "--logstash-ui-url", "http://x"]) is True
+        assert main._is_lightweight_cli(["list-instances"]) is True
+        assert main._is_lightweight_cli(["uninstall", "--purge"]) is True
+
+    def test_run_is_not_lightweight(self):
+        assert main._is_lightweight_cli(["--run", "--mode", "managed", "--instance", "1"]) is False
+
+    def test_bare_invocation_is_not_lightweight(self):
+        # python -m logstashagent.main  (starts FastAPI) must still init
+        assert main._is_lightweight_cli([]) is False
+
+
+class TestHelpSubprocess:
+    def test_help_exits_zero_lists_first_class_modes(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "logstashagent.main", "--help"],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            env={**__import__("os").environ, "PYTHONPATH": str(REPO_ROOT / "src")},
+        )
+        assert result.returncode == 0, result.stderr
+        out = result.stdout
+        for token in ("packaged", "managed", "simulate", "embedded"):
+            assert token in out
+        assert "default|agent" in out or "aliases" in out.lower()
+
+    def test_help_does_not_probe_config_or_etc_logstash(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "logstashagent.main", "--help"],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            env={**__import__("os").environ, "PYTHONPATH": str(REPO_ROOT / "src")},
+        )
+        combined = result.stdout + result.stderr
+        assert "Config file" not in combined
+        assert "/etc/logstash" not in combined
+        assert "using embedded mode defaults" not in combined
