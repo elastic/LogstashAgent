@@ -82,9 +82,28 @@ class TestLightweightCli:
     def test_run_is_not_lightweight(self):
         assert main._is_lightweight_cli(["--run", "--mode", "managed", "--instance", "1"]) is False
 
+    def test_enroll_is_lightweight(self):
+        assert main._is_lightweight_cli(["--enroll", "TOKEN", "--logstash-ui-url", "http://x"]) is True
+        assert main._is_lightweight_cli(["--enroll=TOKEN"]) is True
+
     def test_bare_invocation_is_not_lightweight(self):
         # python -m logstashagent.main  (starts FastAPI) must still init
         assert main._is_lightweight_cli([]) is False
+
+
+class TestRestartLogstashForSim:
+    def test_canonical_modes_use_controller(self, monkeypatch):
+        from logstashagent import controller
+
+        calls = []
+        monkeypatch.setattr(controller, "restart_logstash", lambda: calls.append("ctrl") or True)
+
+        for mode in ("packaged", "managed", "simulate", "default", "host"):
+            calls.clear()
+            monkeypatch.setattr(main.agent_state, "get_state", lambda m=mode: {"mode": m})
+            monkeypatch.setattr(main, "AGENT_CONFIG", {})
+            assert main._restart_logstash_for_sim() is True
+            assert calls == ["ctrl"], mode
 
 
 class TestHelpSubprocess:

@@ -75,6 +75,8 @@ def _is_lightweight_cli(argv: list[str] | None = None) -> bool:
     for a in argv:
         if a in _ADMIN_COMMANDS:
             return True
+        if a == '--enroll' or a.startswith('--enroll='):
+            return True
     return False
 
 
@@ -2961,8 +2963,9 @@ def _restart_logstash_for_sim() -> bool:
     from logstashagent import controller as _controller
 
     state = agent_state.get_state()
-    mode = (state.get("mode") or AGENT_CONFIG.get("mode") or "").lower()
-    if mode in ("simulate", "default", "agent", "host") or state.get("logstash_unit"):
+    mode = canonical_agent_mode(state.get("mode") or AGENT_CONFIG.get("mode") or "") or ""
+    # packaged: system logstash unit; simulate/managed: instance unit
+    if mode in ("simulate", "packaged", "managed") or state.get("logstash_unit"):
         return bool(_controller.restart_logstash())
     try:
         sup = logstash_supervisor.get_supervisor()
