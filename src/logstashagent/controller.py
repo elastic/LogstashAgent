@@ -13,6 +13,7 @@ import hashlib
 import base64
 import subprocess
 import os
+import shutil
 from pathlib import Path
 from datetime import datetime, timezone
 from cryptography.fernet import Fernet
@@ -514,6 +515,315 @@ def update_env_logstash_binary(env_file: Optional[str], binary: str) -> bool:
     except Exception as e:
         logger.error(f"Failed to update LOGSTASH_BINARY in {env_file}: {e}")
         return False
+
+
+RUNTIME_SNAPSHOT_NAME = '.runtime-snapshot'
+RUNTIME_UPGRADE_HEALTH_TIMEOUT = 180.0
+RUNTIME_UPGRADE_HEALTH_POLL = 2.0
+
+_SNAPSHOT_SETTING_FILES = (
+    'logstash.yml',
+    'jvm.options',
+    'log4j2.properties',
+    'pipelines.yml',
+    'logstash.keystore',
+)
+
+
+def _empty_runtime_prep(**overrides) -> dict:
+    prep = {
+        'ok': True,
+        'changed': False,
+        'desired_binary': None,
+        'snapshot_dir': None,
+        'previous': {},
+        'error': None,
+        'source': None,
+        'version': None,
+        'download_dir': None,
+    }
+    prep.update(overrides)
+    return prep
+
+
+def _canonical_run_mode(mode: str | None) -> str:
+    raw = (mode or '').strip().lower()
+    if raw in ('default', 'agent'):
+        return 'packaged'
+    if raw == 'host':
+        return 'managed'
+    return raw
+
+
+def _runtime_path_root(state: dict) -> Path | None:
+    raw = (state.get('path_root') or '').strip()
+    if raw:
+        return Path(raw)
+    env_file = (state.get('keystore_env_file') or '').strip()
+    if env_file.replace('\\', '/').endswith('/env'):
+        return Path(env_file).parent
+    settings = (state.get('settings_path') or '').strip()
+    if settings:
+        return Path(settings)
+    return None
+
+
+def _copy_if_exists(src: Path, dest: Path) -> None:
+    if src.is_file():
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+    elif src.is_dir():
+        if dest.exists():
+            shutil.rmtree(dest)
+        shutil.copytree(src, dest)
+
+
+def _write_runtime_snapshot(state: dict, previous: dict, desired: dict) -> Path:
+    root = _runtime_path_root(state)
+    if root is None:
+        raise RuntimeError('no path_root for runtime snapshot')
+    snap = root / RUNTIME_SNAPSHOT_NAME
+    if snap.exists():
+        shutil.rmtree(snap)
+    snap.mkdir(parents=True, exist_ok=True)
+    settings = Path(state.get('settings_path') or '')
+    settings_dest = snap / 'settings'
+    settings_dest.mkdir(parents=True, exist_ok=True)
+    if settings.is_dir() or str(settings):
+        for name in _SNAPSHOT_SETTING_FILES:
+            _copy_if_exists(settings / name, settings_dest / name)
+        _copy_if_exists(settings / 'pipelines', settings_dest / 'pipelines')
+    env_file = previous.get('env_file')
+    if env_file and Path(env_file).is_file():
+        shutil.copy2(env_file, snap / 'env')
+    meta = {
+        'previous': previous,
+        'desired': desired,
+    }
+    (snap / 'meta.json').write_text(json.dumps(meta, indent=2) + '\n', encoding='utf-8')
+    return snap
+
+
+def _restore_runtime_snapshot(prep: dict) -> bool:
+    snap = Path(prep.get('snapshot_dir') or '')
+    if not snap.is_dir():
+        return False
+    try:
+        meta = json.loads((snap / 'meta.json').read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError) as e:
+        logger.error('Invalid runtime snapshot meta: %s', e)
+        return False
+    previous = meta.get('previous') or prep.get('previous') or {}
+    settings = Path(previous.get('settings_path') or '')
+    src_settings = snap / 'settings'
+    if src_settings.is_dir() and settings:
+        settings.mkdir(parents=True, exist_ok=True)
+        for name in _SNAPSHOT_SETTING_FILES:
+            _copy_if_exists(src_settings / name, settings / name)
+        pipe_src = src_settings / 'pipelines'
+        if pipe_src.exists():
+            _copy_if_exists(pipe_src, settings / 'pipelines')
+    env_file = previous.get('env_file')
+    env_src = snap / 'env'
+    if env_file and env_src.is_file():
+        Path(env_file).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(env_src, env_file)
+    return True
+
+
+def prepare_runtime_upgrade(runtime: dict | None) -> dict:
+    """
+    Download/resolve the desired Logstash binary and snapshot current config.
+
+    Does not flip LOGSTASH_BINARY or agent-state pin fields.
+    """
+    if not runtime or runtime is False:
+        return _empty_runtime_prep()
+    state = agent_state.get_state() or {}
+    mode = _canonical_run_mode(state.get('mode'))
+    if mode not in ('managed', 'simulate'):
+        return _empty_runtime_prep()
+
+    from .logstash_download import (
+        resolve_binary_from_policy,
+        LogstashDownloadError,
+        DEFAULT_DOWNLOAD_ROOT,
+        normalize_download_dir,
+    )
+
+    source = (runtime.get('source') or 'SYSTEM').upper()
+    version = (runtime.get('version') or '').strip()
+    download_dir = normalize_download_dir(
+        (runtime.get('download_dir') or DEFAULT_DOWNLOAD_ROOT).strip()
+    )
+    binary_path = runtime.get('binary_path') or '/usr/share/logstash/bin'
+
+    try:
+        binary = str(
+            resolve_binary_from_policy(
+                logstash_source=source,
+                logstash_version=version,
+                logstash_download_dir=download_dir,
+                binary_path=binary_path,
+            )
+        )
+    except LogstashDownloadError as e:
+        logger.error('Logstash runtime prepare failed: %s', e)
+        return _empty_runtime_prep(ok=False, error=str(e), source=source, version=version)
+    except Exception as e:
+        logger.error('Unexpected error preparing logstash_runtime: %s', e, exc_info=True)
+        return _empty_runtime_prep(ok=False, error=str(e), source=source, version=version)
+
+    if source == 'VERSION' and version:
+        try:
+            from logstashagent import install_registry as _reg
+
+            _reg.register_logstash_version(
+                version=version,
+                binary=binary,
+                download_dir=download_dir,
+                used_by=state.get('agent_id') or state.get('deployment_id'),
+            )
+        except Exception as e:
+            logger.debug('Could not record VERSION tree in install registry: %s', e)
+
+    prev_binary = str(state.get('logstash_binary') or '')
+    prev_source = (state.get('logstash_source') or 'SYSTEM').upper()
+    prev_version = (state.get('logstash_version') or '').strip()
+    if prev_binary == binary and prev_source == source and prev_version == version:
+        return _empty_runtime_prep(
+            desired_binary=binary, source=source, version=version, download_dir=download_dir
+        )
+
+    previous = {
+        'binary': prev_binary,
+        'source': prev_source,
+        'version': prev_version,
+        'env_file': state.get('keystore_env_file'),
+        'settings_path': state.get('settings_path'),
+        'api_port': state.get('logstash_api_port') or 9600,
+    }
+    desired = {'binary': binary, 'source': source, 'version': version, 'download_dir': download_dir}
+    try:
+        snap = _write_runtime_snapshot(state, previous, desired)
+    except Exception as e:
+        logger.error('Runtime snapshot failed: %s', e, exc_info=True)
+        root = _runtime_path_root(state)
+        if root is not None:
+            shutil.rmtree(root / RUNTIME_SNAPSHOT_NAME, ignore_errors=True)
+        return _empty_runtime_prep(ok=False, error=str(e), source=source, version=version)
+
+    logger.info('Runtime upgrade prepared: %s -> %s snapshot=%s', prev_binary, binary, snap)
+    return {
+        'ok': True,
+        'changed': True,
+        'desired_binary': binary,
+        'snapshot_dir': str(snap),
+        'previous': previous,
+        'error': None,
+        'source': source,
+        'version': version,
+        'download_dir': download_dir,
+    }
+
+
+def flip_runtime_env(prep: dict) -> bool:
+    if not prep or not prep.get('changed'):
+        return True
+    env_file = (prep.get('previous') or {}).get('env_file')
+    binary = prep.get('desired_binary')
+    return update_env_logstash_binary(env_file, binary)
+
+
+def commit_runtime_upgrade(prep: dict) -> None:
+    if not prep or not prep.get('changed'):
+        return
+    source = prep.get('source') or 'SYSTEM'
+    version = (prep.get('version') or '').strip()
+    binary = prep.get('desired_binary')
+    download_dir = prep.get('download_dir')
+    bin_dir = str(Path(binary).parent) if binary and Path(binary).name in ('logstash', 'logstash.bat') else binary
+    agent_state.update_state('logstash_source', source)
+    agent_state.update_state('logstash_version', version)
+    if download_dir:
+        agent_state.update_state('logstash_download_dir', download_dir)
+    if bin_dir:
+        agent_state.update_state('binary_path', bin_dir)
+    if binary:
+        agent_state.update_state('logstash_binary', binary)
+    if source == 'VERSION' and version:
+        agent_state.update_state('logstash_version_resolved', version)
+    elif source == 'SYSTEM':
+        agent_state.update_state('logstash_version_resolved', '')
+    state = agent_state.get_state() or {}
+    try:
+        from logstashagent import install_registry as _reg
+
+        role = _canonical_run_mode(state.get('mode'))
+        iid = state.get('instance_id')
+        if role in ('managed', 'simulate') and iid is not None:
+            key = _reg.instance_key(role, int(iid))
+            reg = _reg.load_registry()
+            inst = (reg.get('instances') or {}).get(key)
+            if inst:
+                inst['logstash_source'] = source
+                inst['logstash_version'] = version
+                inst['logstash_binary'] = binary
+                reg['instances'][key] = inst
+                _reg.save_registry(reg)
+    except Exception as e:
+        logger.debug('Could not stamp instance VERSION pin: %s', e)
+    snap = prep.get('snapshot_dir')
+    if snap:
+        shutil.rmtree(snap, ignore_errors=True)
+    logger.info('Runtime upgrade committed: binary=%s version=%s', binary, version or '(none)')
+
+
+def rollback_runtime_upgrade(prep: dict, *, restart: bool = True) -> bool:
+    if not prep or not prep.get('changed'):
+        return True
+    restored = _restore_runtime_snapshot(prep)
+    if not restored:
+        logger.error('Runtime upgrade rollback failed to restore snapshot at %s', prep.get('snapshot_dir'))
+        return False
+    if restart:
+        if not restart_logstash():
+            logger.error('Runtime upgrade rollback restored files but restart failed')
+    snap = prep.get('snapshot_dir')
+    if snap:
+        shutil.rmtree(snap, ignore_errors=True)
+    logger.warning('Runtime upgrade rolled back to binary=%s', (prep.get('previous') or {}).get('binary'))
+    return True
+
+
+def recover_incomplete_runtime_upgrade() -> bool:
+    state = agent_state.get_state() or {}
+    if _canonical_run_mode(state.get('mode')) not in ('managed', 'simulate'):
+        return False
+    root = _runtime_path_root(state)
+    if root is None:
+        return False
+    snap = root / RUNTIME_SNAPSHOT_NAME
+    if not snap.is_dir():
+        return False
+    logger.warning('Incomplete runtime upgrade snapshot found at %s — rolling back', snap)
+    try:
+        meta = json.loads((snap / 'meta.json').read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError) as e:
+        logger.error('Cannot recover runtime snapshot: %s', e)
+        return False
+    prep = {
+        'ok': True,
+        'changed': True,
+        'snapshot_dir': str(snap),
+        'previous': meta.get('previous') or {},
+        'desired_binary': (meta.get('desired') or {}).get('binary'),
+        'source': (meta.get('desired') or {}).get('source'),
+        'version': (meta.get('desired') or {}).get('version'),
+        'download_dir': (meta.get('desired') or {}).get('download_dir'),
+        'error': None,
+    }
+    return rollback_runtime_upgrade(prep, restart=True)
 
 
 def apply_logstash_runtime(runtime: dict) -> dict:
