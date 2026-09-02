@@ -39,3 +39,31 @@ class TestCliModeType:
 
         with pytest.raises(argparse.ArgumentTypeError):
             main.cli_mode_type("banana")
+
+
+class TestParseModeArgument:
+    def _parse(self, monkeypatch, *argv):
+        monkeypatch.setattr(sys, "argv", ["logstash-agent", *argv])
+        return main.parse_arguments()
+
+    def test_accepts_managed(self, monkeypatch):
+        args = self._parse(monkeypatch, "--run", "--mode", "managed", "--instance", "2")
+        assert args.mode == "managed"
+        assert args.instance == 2
+
+    def test_accepts_packaged(self, monkeypatch):
+        args = self._parse(monkeypatch, "--mode", "packaged")
+        assert args.mode == "packaged"
+
+    def test_default_alias_stored_as_packaged(self, monkeypatch):
+        args = self._parse(monkeypatch, "--mode", "default")
+        assert args.mode == "packaged"
+
+    def test_host_alias_stored_as_managed(self, monkeypatch):
+        args = self._parse(monkeypatch, "--mode", "host")
+        assert args.mode == "managed"
+
+    def test_rejects_unknown(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", ["logstash-agent", "--mode", "banana"])
+        with pytest.raises(SystemExit):
+            main.parse_arguments()

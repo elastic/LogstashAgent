@@ -3552,10 +3552,14 @@ Examples:
 
     parser.add_argument(
         '--mode',
-        type=str,
-        choices=['default', 'simulate', 'embedded'],
+        type=cli_mode_type,
+        choices=list(FIRST_CLASS_MODES),
         default=None,
-        help='Agent role: default (production), simulate (enrolled sim), embedded (docker sim)'
+        help=(
+            'Agent role: packaged (production), managed (enrolled instance N), '
+            'simulate (enrolled sim N), embedded (docker sim). '
+            'Aliases: default|agent→packaged, host→managed'
+        ),
     )
 
     parser.add_argument(
@@ -3563,7 +3567,7 @@ Examples:
         type=int,
         metavar='N',
         default=None,
-        help='Simulate instance number N (for --mode simulate / lsagent-simulate@N)'
+        help='Instance number N for --mode managed|simulate (logstash-agent@N / lsagent-simulate@N)',
     )
 
     parser.add_argument(
