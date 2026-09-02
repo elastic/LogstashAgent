@@ -9,6 +9,24 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 import sys
 
+FIRST_CLASS_MODES = ('packaged', 'managed', 'simulate', 'embedded')
+MODE_ALIASES = {
+    'default': 'packaged',
+    'agent': 'packaged',
+    'host': 'managed',
+}
+
+
+def canonical_agent_mode(value: str | None) -> str | None:
+    """Map CLI/config aliases to a first-class mode. Unknown values returned lowercased."""
+    if value is None:
+        return None
+    raw = str(value).strip().lower()
+    if not raw:
+        return None
+    return MODE_ALIASES.get(raw, raw)
+
+
 # slots starts a cleanup thread on import when mode looks like simulation.
 # Skip for enroll/install/admin and for packaged --run (controller only).
 # Do NOT skip for --run --mode simulate|managed|embedded — those serve FastAPI
@@ -74,6 +92,19 @@ if not _SKIP_SIMULATION_IMPORTS:
     from logstashagent import slots
 import argparse
 import asyncio
+
+
+def cli_mode_type(value: str) -> str:
+    """argparse type=: accept first-class modes plus aliases; store canonical name."""
+    mapped = canonical_agent_mode(value)
+    if mapped not in FIRST_CLASS_MODES:
+        raise argparse.ArgumentTypeError(
+            f"invalid mode {value!r} (choose from {', '.join(FIRST_CLASS_MODES)}; "
+            "aliases: default|agent→packaged, host→managed)"
+        )
+    return mapped
+
+
 import atexit
 import base64
 import threading
