@@ -8,6 +8,7 @@ Package version is **0.5.2**. Works with **LogstashUI 0.5.1 & 0.5.2**.
 - `--help`, admin commands, and `--enroll` no longer load agent yml or create `/etc/logstash` pipeline dirs.
 - Documented config precedence: systemd `agent.env` / Logstash env win over `logstash-agent.yml` when set (example yml, installer templates, README).
 - `resolve_path_settings_from_env(require_writable=True)`: missing directories are skipped; an explicit env path that exists but is not writable no longer falls back to `/etc/logstash`.
+- Managed/simulate policy deploys download a VERSION pin (and flock the extract) **before** writing yml/jvm/log4j2/keystore/pipelines. `LOGSTASH_BINARY` flips immediately before the single restart.
 
 ### Fixed
 
@@ -16,6 +17,7 @@ Package version is **0.5.2**. Works with **LogstashUI 0.5.1 & 0.5.2**.
 - `--enroll` no longer creates pipeline dirs; packaged/managed are included in simulation-style Logstash restart dispatch.
 - Embedded supervisor records `_healthy_since` on first healthy API response and clears it on restart / sustained unresponsive (pipeline-bus warmup). Tests existed; the field never landed.
 - `restart_logstash` unit tests mock `systemctl_via_sudo` so they do not need a host `systemctl` (macOS/Windows).
+- Logstash pin changes (`VERSION` X→Y and `SYSTEM` ↔ `VERSION`) snapshot instance config+env, wait 180s for the API after restart, and restore the snapshot plus the previous binary if the new process never answers. Incomplete snapshots roll back on controller start / next check-in.
 
 
 ## [0.5.1] - Agent roles, multi-instance, TLS, pure-Python keystores - 08/31/2026
