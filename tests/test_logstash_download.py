@@ -6,12 +6,43 @@ import io
 import tarfile
 import threading
 import time
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from logstashagent import logstash_download as ld
+
+_UI_BASE = "https://logstashui.example:8443"
+_UI_KEY = "test-api-key-abc"
+
+
+def _urlopen_url(req) -> str:
+    return req.full_url if hasattr(req, "full_url") else str(req)
+
+
+def _urlopen_headers(req) -> dict:
+    if hasattr(req, "headers"):
+        return {str(k).lower(): v for k, v in req.headers.items()}
+    return {}
+
+
+@pytest.fixture(autouse=True)
+def _clear_via_ui_env(monkeypatch):
+    monkeypatch.delenv("LOGSTASH_AGENT_LOGSTASH_VIA_UI", raising=False)
+
+
+def test_version_is_present(tmp_path):
+    version = "9.4.3"
+    assert ld.version_is_present("", str(tmp_path)) is False
+    assert ld.version_is_present(version, str(tmp_path)) is False
+    assert not (tmp_path / f"logstash-{version}").exists()
+
+    binary = tmp_path / f"logstash-{version}" / "bin" / "logstash"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    assert ld.version_is_present(version, str(tmp_path)) is True
 
 
 def test_artifact_filename_and_url():
@@ -20,6 +51,216 @@ def test_artifact_filename_and_url():
     url = ld.artifact_url("9.4.3", "linux-x86_64")
     assert url.endswith(name)
     assert "artifacts.elastic.co" in url
+
+
+def test_artifact_url_via_ui_env(monkeypatch):
+    monkeypatch.setenv("LOGSTASH_AGENT_LOGSTASH_VIA_UI", "true")
+    state = {
+        "logstash_ui_url": _UI_BASE,
+        "api_key": _UI_KEY,
+        "logstash_via_ui": False,
+    }
+    with patch("logstashagent.agent_state.get_state", return_value=state):
+        url = ld.artifact_url("9.4.3", "linux-x86_64")
+    name = ld.artifact_filename("9.4.3", "linux-x86_64")
+    assert url == f"{_UI_BASE}/ConnectionManager/LogstashArtifact/{name}"
+    assert "artifacts.elastic.co" not in url
+
+
+def test_via_ui_env_wins_over_state(monkeypatch):
+    state_on = {
+        "logstash_ui_url": _UI_BASE,
+        "api_key": _UI_KEY,
+        "logstash_via_ui": True,
+    }
+    state_off = {
+        "logstash_ui_url": _UI_BASE,
+        "api_key": _UI_KEY,
+        "logstash_via_ui": False,
+    }
+    name = ld.artifact_filename("9.4.3", "linux-x86_64")
+
+    monkeypatch.setenv("LOGSTASH_AGENT_LOGSTASH_VIA_UI", "0")
+    with patch("logstashagent.agent_state.get_state", return_value=state_on):
+        assert ld.logstash_via_ui_enabled(state_on) is False
+        url = ld.artifact_url("9.4.3", "linux-x86_64")
+    assert "artifacts.elastic.co" in url
+    assert url.endswith(name)
+
+    monkeypatch.setenv("LOGSTASH_AGENT_LOGSTASH_VIA_UI", "false")
+    with patch("logstashagent.agent_state.get_state", return_value=state_on):
+        assert ld.logstash_via_ui_enabled(state_on) is False
+        url = ld.artifact_url("9.4.3", "linux-x86_64")
+    assert "artifacts.elastic.co" in url
+
+    monkeypatch.setenv("LOGSTASH_AGENT_LOGSTASH_VIA_UI", "true")
+    with patch("logstashagent.agent_state.get_state", return_value=state_off):
+        assert ld.logstash_via_ui_enabled(state_off) is True
+        url = ld.artifact_url("9.4.3", "linux-x86_64")
+    assert url == f"{_UI_BASE}/ConnectionManager/LogstashArtifact/{name}"
+    assert "artifacts.elastic.co" not in url
+
+
+def test_via_ui_state_used_when_env_unset(monkeypatch):
+    monkeypatch.delenv("LOGSTASH_AGENT_LOGSTASH_VIA_UI", raising=False)
+    state = {
+        "logstash_ui_url": _UI_BASE,
+        "api_key": _UI_KEY,
+        "logstash_via_ui": "yes",
+    }
+    with patch("logstashagent.agent_state.get_state", return_value=state):
+        assert ld.logstash_via_ui_enabled() is True
+        url = ld.artifact_url("9.4.3", "linux-x86_64")
+    name = ld.artifact_filename("9.4.3", "linux-x86_64")
+    assert url == f"{_UI_BASE}/ConnectionManager/LogstashArtifact/{name}"
+
+
+def test_via_ui_missing_url_or_api_key_raises(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOGSTASH_AGENT_LOGSTASH_VIA_UI", "true")
+    with patch("logstashagent.agent_state.get_state", return_value={}):
+        with pytest.raises(ld.LogstashDownloadError):
+            ld.artifact_url("9.4.3", "linux-x86_64")
+        with pytest.raises(ld.LogstashDownloadError):
+            ld.ensure_logstash_version(
+                "9.4.3", str(tmp_path), platform_arch="linux-x86_64"
+            )
+    with patch(
+        "logstashagent.agent_state.get_state",
+        return_value={"logstash_ui_url": _UI_BASE},
+    ):
+        with pytest.raises(ld.LogstashDownloadError):
+            ld.ensure_logstash_version(
+                "9.4.3", str(tmp_path), platform_arch="linux-x86_64"
+            )
+
+
+def test_artifact_url_flag_off_is_elastic(monkeypatch):
+    monkeypatch.delenv("LOGSTASH_AGENT_LOGSTASH_VIA_UI", raising=False)
+    with patch(
+        "logstashagent.agent_state.get_state",
+        return_value={"logstash_via_ui": False, "logstash_ui_url": _UI_BASE},
+    ):
+        url = ld.artifact_url("9.4.3", "linux-x86_64")
+    assert "artifacts.elastic.co" in url
+    assert "ConnectionManager/LogstashArtifact" not in url
+
+
+def _fake_tarball_urlopen(tarball_bytes, seen, *, expect_ui=False):
+    def fake_urlopen(req, timeout=60):
+        url = _urlopen_url(req)
+        headers = _urlopen_headers(req)
+        seen.append({"url": url, "headers": headers, "timeout": timeout, "req": req})
+        if expect_ui:
+            assert "artifacts.elastic.co" not in url
+            assert "/ConnectionManager/LogstashArtifact/" in url
+            assert headers.get("authorization") == f"ApiKey {_UI_KEY}"
+        else:
+            assert "artifacts.elastic.co" in url
+            assert "authorization" not in headers
+
+        class Stream:
+            def __enter__(self):
+                return io.BytesIO(tarball_bytes)
+
+            def __exit__(self, *a):
+                return False
+
+        class Resp:
+            def read(self):
+                import hashlib
+
+                h = hashlib.sha512(tarball_bytes).hexdigest()
+                return f"{h}  logstash.tar.gz".encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        if url.endswith(".sha512"):
+            return Resp()
+        return Stream()
+
+    return fake_urlopen
+
+
+def test_ensure_logstash_version_via_ui_sends_apikey(tmp_path, monkeypatch):
+    version = "9.4.3"
+    tarball_bytes = _minimal_logstash_tarball(version)
+    monkeypatch.setenv("LOGSTASH_AGENT_LOGSTASH_VIA_UI", "true")
+    seen = []
+    state = {"logstash_ui_url": _UI_BASE, "api_key": _UI_KEY, "logstash_via_ui": False}
+    with patch("logstashagent.agent_state.get_state", return_value=state), patch.object(
+        ld.urllib.request, "urlopen", side_effect=_fake_tarball_urlopen(
+            tarball_bytes, seen, expect_ui=True
+        )
+    ):
+        binary = ld.ensure_logstash_version(
+            version, str(tmp_path), platform_arch="linux-x86_64"
+        )
+    assert Path(binary).is_file()
+    tar_hits = [s for s in seen if not s["url"].endswith(".sha512")]
+    sha_hits = [s for s in seen if s["url"].endswith(".sha512")]
+    assert tar_hits and sha_hits
+    name = ld.artifact_filename(version, "linux-x86_64")
+    assert tar_hits[0]["url"] == (
+        f"{_UI_BASE}/ConnectionManager/LogstashArtifact/{name}"
+    )
+    assert sha_hits[0]["url"] == tar_hits[0]["url"] + ".sha512"
+    assert sha_hits[0]["url"].startswith(_UI_BASE)
+    assert sha_hits[0]["timeout"] == 600
+    assert tar_hits[0]["timeout"] == 600
+    for hit in seen:
+        assert hit["headers"].get("authorization") == f"ApiKey {_UI_KEY}"
+
+
+def test_ensure_logstash_version_flag_off_no_apikey(tmp_path, monkeypatch):
+    version = "9.4.3"
+    tarball_bytes = _minimal_logstash_tarball(version)
+    monkeypatch.setenv("LOGSTASH_AGENT_LOGSTASH_VIA_UI", "false")
+    seen = []
+    with patch("logstashagent.agent_state.get_state", return_value={
+        "logstash_via_ui": True,
+        "logstash_ui_url": _UI_BASE,
+        "api_key": _UI_KEY,
+    }), patch.object(
+        ld.urllib.request,
+        "urlopen",
+        side_effect=_fake_tarball_urlopen(tarball_bytes, seen, expect_ui=False),
+    ):
+        binary = ld.ensure_logstash_version(
+            version, str(tmp_path), platform_arch="linux-x86_64"
+        )
+    assert Path(binary).is_file()
+    assert seen
+    for hit in seen:
+        assert "artifacts.elastic.co" in hit["url"]
+        assert "authorization" not in hit["headers"]
+
+
+@pytest.mark.parametrize("status", [404, 502])
+def test_via_ui_http_error_no_elastic_fallback(tmp_path, monkeypatch, status):
+    version = "9.4.3"
+    monkeypatch.setenv("LOGSTASH_AGENT_LOGSTASH_VIA_UI", "true")
+    elastic_hits = []
+
+    def fake_urlopen(req, timeout=60):
+        url = _urlopen_url(req)
+        if "artifacts.elastic.co" in url:
+            elastic_hits.append(url)
+            pytest.fail("must not fall back to artifacts.elastic.co")
+        raise urllib.error.HTTPError(url, status, "err", hdrs=None, fp=None)
+
+    state = {"logstash_ui_url": _UI_BASE, "api_key": _UI_KEY}
+    with patch("logstashagent.agent_state.get_state", return_value=state), patch.object(
+        ld.urllib.request, "urlopen", side_effect=fake_urlopen
+    ):
+        with pytest.raises(ld.LogstashDownloadError):
+            ld.ensure_logstash_version(
+                version, str(tmp_path), platform_arch="linux-x86_64"
+            )
+    assert elastic_hits == []
 
 
 def test_detect_platform_arch_known():

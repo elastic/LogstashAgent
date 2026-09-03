@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_DOWNLOAD_ROOT = "/opt/logstash-agent/logstash-versions"
 _LEGACY_DOWNLOAD_ROOT = "/opt/LogstashAgent/logstash-versions"
 ARTIFACTS_BASE = "https://artifacts.elastic.co/downloads/logstash"
+VIA_UI_ENV = "LOGSTASH_AGENT_LOGSTASH_VIA_UI"
+_TRUTHY_FLAGS = {"1", "true", "yes", "on"}
 
 
 class LogstashDownloadError(Exception):
@@ -66,9 +68,68 @@ def artifact_filename(version: str, platform_arch: Optional[str] = None) -> str:
     return f"logstash-{version}-{platform_arch}.tar.gz"
 
 
-def artifact_url(version: str, platform_arch: Optional[str] = None) -> str:
+def _flag_is_true(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in _TRUTHY_FLAGS
+
+
+def _agent_state() -> dict:
+    try:
+        from logstashagent import agent_state as _as
+
+        return _as.get_state() or {}
+    except Exception:
+        return {}
+
+
+def logstash_via_ui_enabled(state: Optional[dict] = None) -> bool:
+    """Env ``LOGSTASH_AGENT_LOGSTASH_VIA_UI`` wins over state ``logstash_via_ui``."""
+    if VIA_UI_ENV in os.environ:
+        return _flag_is_true(os.environ.get(VIA_UI_ENV))
+    if state is None:
+        state = _agent_state()
+    return _flag_is_true((state or {}).get("logstash_via_ui"))
+
+
+def artifact_url(
+    version: str,
+    platform_arch: Optional[str] = None,
+    *,
+    via_ui: Optional[bool] = None,
+    logstash_ui_url: Optional[str] = None,
+    state: Optional[dict] = None,
+) -> str:
     name = artifact_filename(version, platform_arch)
-    return f"{ARTIFACTS_BASE}/{name}"
+    if via_ui is None:
+        via_ui = logstash_via_ui_enabled(state)
+    if not via_ui:
+        return f"{ARTIFACTS_BASE}/{name}"
+    base = (logstash_ui_url or "").strip()
+    if not base:
+        st = state if state is not None else _agent_state()
+        base = ((st or {}).get("logstash_ui_url") or "").strip()
+    if not base:
+        raise LogstashDownloadError(
+            "logstash_via_ui is enabled but logstash_ui_url is missing"
+        )
+    return f"{base.rstrip('/')}/ConnectionManager/LogstashArtifact/{name}"
+
+
+def _via_ui_auth_headers(
+    api_key: Optional[str] = None, state: Optional[dict] = None
+) -> dict:
+    key = (api_key or "").strip()
+    if not key:
+        st = state if state is not None else _agent_state()
+        key = ((st or {}).get("api_key") or "").strip()
+    if not key:
+        raise LogstashDownloadError(
+            "logstash_via_ui is enabled but api_key is missing"
+        )
+    return {"Authorization": f"ApiKey {key}"}
 
 
 def version_dir_name(version: str) -> str:
@@ -138,6 +199,15 @@ def resolve_logstash_binary(
     )
 
 
+def version_is_present(version: str, download_dir: str) -> bool:
+    """True if ``resolve_logstash_binary`` finds a file; False on LogstashDownloadError."""
+    try:
+        resolve_logstash_binary(version, download_dir)
+        return True
+    except LogstashDownloadError:
+        return False
+
+
 def chown_tree_to_logstash(path: Path | str) -> None:
     """
     Recursively chown a VERSION tree (or download root) to logstash:logstash.
@@ -172,11 +242,16 @@ def chown_tree_to_logstash(path: Path | str) -> None:
     logger.info("✓ Ownership set to logstash on %s", path)
 
 
-def _download_file(url: str, dest: Path, timeout: int = 600) -> None:
+def _download_file(
+    url: str, dest: Path, timeout: int = 600, headers: Optional[dict] = None
+) -> None:
     logger.info("Downloading %s -> %s", url, dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
+    target: str | urllib.request.Request = (
+        urllib.request.Request(url, headers=headers) if headers else url
+    )
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp, open(dest, "wb") as out:
+        with urllib.request.urlopen(target, timeout=timeout) as resp, open(dest, "wb") as out:
             shutil.copyfileobj(resp, out)
     except Exception as exc:
         raise LogstashDownloadError(f"Download failed for {url}: {exc}") from exc
@@ -190,13 +265,21 @@ def _sha512_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def _verify_sha512(tarball: Path, sha_url: str) -> None:
+def _verify_sha512(
+    tarball: Path,
+    sha_url: str,
+    timeout: int = 60,
+    headers: Optional[dict] = None,
+) -> None:
     """
     Verify tarball against Elastic .sha512 sidecar when available.
     Non-fatal if the sidecar cannot be fetched (log warning).
     """
+    target: str | urllib.request.Request = (
+        urllib.request.Request(sha_url, headers=headers) if headers else sha_url
+    )
     try:
-        with urllib.request.urlopen(sha_url, timeout=60) as resp:
+        with urllib.request.urlopen(target, timeout=timeout) as resp:
             text = resp.read().decode("utf-8", errors="replace").strip()
     except Exception as exc:
         logger.warning("Could not fetch checksum %s: %s (skipping verify)", sha_url, exc)
@@ -241,6 +324,8 @@ def ensure_logstash_version(
     *,
     platform_arch: Optional[str] = None,
     force: bool = False,
+    logstash_ui_url: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> Path:
     """
     Ensure Logstash ``version`` is present under download_root.
@@ -259,6 +344,8 @@ def ensure_logstash_version(
             download_root,
             platform_arch=platform_arch,
             force=force,
+            logstash_ui_url=logstash_ui_url,
+            api_key=api_key,
         )
 
 
@@ -268,6 +355,8 @@ def _ensure_logstash_version_locked(
     *,
     platform_arch: Optional[str] = None,
     force: bool = False,
+    logstash_ui_url: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> Path:
     root = Path(download_root)
     install_dir = version_install_dir(version, download_root)
@@ -283,8 +372,18 @@ def _ensure_logstash_version_locked(
             pass
 
     platform_arch = platform_arch or detect_platform_arch()
-    url = artifact_url(version, platform_arch)
+    via_ui = logstash_via_ui_enabled()
+    state = _agent_state() if via_ui else None
+    url = artifact_url(
+        version,
+        platform_arch,
+        via_ui=via_ui,
+        logstash_ui_url=logstash_ui_url,
+        state=state,
+    )
     sha_url = url + ".sha512"
+    headers = _via_ui_auth_headers(api_key, state=state) if via_ui else None
+    sha_timeout = 600 if via_ui else 60
 
     # Extract into download_root so the tarball top-level becomes
     #   logstash-versions/logstash-<version>/
@@ -294,8 +393,12 @@ def _ensure_logstash_version_locked(
     with tempfile.TemporaryDirectory(prefix="ls-download-") as tmp:
         tmp_path = Path(tmp)
         tarball = tmp_path / artifact_filename(version, platform_arch)
-        _download_file(url, tarball)
-        _verify_sha512(tarball, sha_url)
+        if headers:
+            _download_file(url, tarball, headers=headers)
+            _verify_sha512(tarball, sha_url, timeout=sha_timeout, headers=headers)
+        else:
+            _download_file(url, tarball)
+            _verify_sha512(tarball, sha_url)
 
         # Remove partial/legacy trees for this version before extract
         legacy_nested = root / version
