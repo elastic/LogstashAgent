@@ -35,13 +35,18 @@ def _join_version_downloads(timeout: float = 2.0) -> None:
         return
     for t in list(threads.values()):
         t.join(timeout=timeout)
-    threads.clear()
 
 
 @pytest.fixture(autouse=True)
 def _cleanup_version_download_threads():
     yield
     _join_version_downloads()
+    threads = getattr(controller, "_VERSION_DOWNLOAD_THREADS", None)
+    if threads is not None:
+        threads.clear()
+    status = getattr(controller, "_VERSION_DOWNLOAD_STATUS", None)
+    if status is not None:
+        status.clear()
 
 
 def _download_threads() -> dict:
@@ -203,12 +208,15 @@ def test_prepare_missing_tree_holds_without_snapshot(tmp_path):
     ) as resolve:
         prep = controller.prepare_runtime_upgrade(runtime)
         started = list(_download_threads().values())
+        mem = dict(getattr(controller, "_VERSION_DOWNLOAD_STATUS", {}))
         _join_version_downloads()
     assert prep["ok"] is True
     assert prep["changed"] is False
     assert prep.get("held") is True
     assert not (tree["root"] / ".runtime-snapshot").exists()
-    assert started and started[0].daemon is True
+    assert mem.get("9.6.0")
+    if started:
+        assert started[0].daemon is True
     resolve.assert_not_called()
     rd = state.get("runtime_download") or {}
     assert rd.get("status") in ("pending", "running", "ready")
@@ -911,7 +919,15 @@ def test_prepare_snapshots_when_version_tree_present(tmp_path):
 
 def test_via_ui_download_failure_stamps_failed_no_config_apply(tmp_path):
     base, state, yml = _gcc_state(tmp_path)
-    get_state, update_state = _bind_state(state)
+    stamps = []
+
+    def get_state():
+        return state
+
+    def update_state(key, value):
+        state[key] = value
+        if key == "runtime_download" and isinstance(value, dict):
+            stamps.append(dict(value))
 
     def boom(version, download_dir, **kwargs):
         raise LogstashDownloadError("HTTP 404")
@@ -933,17 +949,14 @@ def test_via_ui_download_failure_stamps_failed_no_config_apply(tmp_path):
     ), patch.object(controller.requests, "post", return_value=resp):
         controller.get_config_changes()
         _join_version_downloads()
-        assert yml.read_text(encoding="utf-8") == "old\n"
-        rd = state.get("runtime_download") or {}
-        assert rd.get("status") == "failed"
-        assert "404" in (rd.get("error") or "")
-        rst.assert_not_called()
-        assert state.get("revision_number") != 3
-
         controller.get_config_changes()
         _join_version_downloads()
         assert yml.read_text(encoding="utf-8") == "old\n"
-        assert (state.get("runtime_download") or {}).get("status") == "failed"
+        rst.assert_not_called()
+        assert state.get("revision_number") != 3
+        failed = [s for s in stamps if s.get("status") == "failed"]
+        assert failed
+        assert "404" in (failed[-1].get("error") or "")
 
 
 @pytest.mark.parametrize("mode", ["packaged", "embedded"])
@@ -1097,3 +1110,156 @@ def test_check_in_status_blob_includes_runtime_download(tmp_path):
     assert rd["status"] == "failed"
     assert rd["version"] == "9.5.0"
     assert rd["error"] == "HTTP 404"
+
+
+def test_check_in_flushes_finished_download_into_status_blob(tmp_path):
+    tree = _managed_tree(tmp_path)
+    state = dict(tree["state"])
+    state.update({
+        "enrolled": True,
+        "logstash_ui_url": "http://localhost:8000",
+        "api_key": "k",
+        "connection_id": "c",
+        "settings_path": str(tree["settings"]) + "/",
+        "logs_path": str(tmp_path / "logs") + "/",
+        "binary_path": str(tmp_path / "bin"),
+    })
+    get_state, update_state = _bind_state(state)
+    captured = {}
+
+    def post(*args, **kwargs):
+        captured["json"] = kwargs.get("json")
+        raise RuntimeError("stop-after-blob")
+
+    def boom(version, download_dir, **kwargs):
+        raise LogstashDownloadError("HTTP 503")
+
+    runtime = {
+        "source": "VERSION",
+        "version": "9.6.0",
+        "download_dir": str(tmp_path / "versions"),
+        "binary_path": "/x",
+    }
+    with patch.object(agent_state, "get_state", side_effect=get_state), patch.object(
+        agent_state, "update_state", side_effect=update_state
+    ), patch(
+        "logstashagent.logstash_download.ensure_logstash_version",
+        side_effect=_ensure_off_controller_thread(boom),
+    ), patch.object(controller, "recover_incomplete_runtime_upgrade"), patch.object(
+        controller.requests, "post", side_effect=post
+    ):
+        controller.prepare_runtime_upgrade(runtime)
+        _join_version_downloads()
+        try:
+            controller.check_in()
+        except RuntimeError:
+            pass
+    rd = (captured.get("json") or {}).get("status_blob", {}).get("runtime_download") or {}
+    assert rd.get("status") == "failed"
+    assert rd.get("version") == "9.6.0"
+    assert "503" in (rd.get("error") or "")
+
+
+def test_download_worker_does_not_call_update_state(tmp_path):
+    tree = _managed_tree(tmp_path)
+    state = dict(tree["state"])
+    controller_ident = threading.get_ident()
+    update_calls = []
+
+    def get_state():
+        return state
+
+    def update_state(key, value):
+        update_calls.append(
+            (threading.get_ident(), key, dict(value) if isinstance(value, dict) else value)
+        )
+        state[key] = value
+
+    runtime = {
+        "source": "VERSION",
+        "version": "9.6.0",
+        "download_dir": str(tmp_path / "versions"),
+        "binary_path": "/x",
+    }
+    def boom(version, download_dir, **kwargs):
+        raise LogstashDownloadError("HTTP 503")
+
+    with patch.object(agent_state, "get_state", side_effect=get_state), patch.object(
+        agent_state, "update_state", side_effect=update_state
+    ), patch(
+        "logstashagent.logstash_download.ensure_logstash_version",
+        side_effect=_ensure_off_controller_thread(boom),
+    ):
+        prep = controller.prepare_runtime_upgrade(runtime)
+        assert prep.get("held") is True
+        _join_version_downloads()
+        worker_updates = [c for c in update_calls if c[0] != controller_ident]
+        assert worker_updates == []
+        assert any(
+            ident == controller_ident
+            and key == "runtime_download"
+            and (val or {}).get("status") in ("pending", "running")
+            for ident, key, val in update_calls
+        )
+        prep2 = controller.prepare_runtime_upgrade(runtime)
+        assert prep2.get("held") is True
+        failed = [
+            val
+            for ident, key, val in update_calls
+            if ident == controller_ident
+            and key == "runtime_download"
+            and (val or {}).get("status") == "failed"
+        ]
+        assert failed
+        assert "503" in (failed[-1].get("error") or "")
+        _join_version_downloads()
+
+
+def test_prepare_holds_while_inflight_even_if_tree_present(tmp_path):
+    tree = _managed_tree(tmp_path)
+    download_dir = tmp_path / "versions"
+    version = "9.6.0"
+    runtime = {
+        "source": "VERSION",
+        "version": version,
+        "download_dir": str(download_dir),
+        "binary_path": "/usr/share/logstash/bin",
+    }
+    state = dict(tree["state"])
+    get_state, update_state = _bind_state(state)
+    block = threading.Event()
+
+    def blocked_ensure(ver, dest, **kwargs):
+        block.wait(timeout=5)
+        return Path(dest) / f"logstash-{ver}" / "bin" / "logstash"
+
+    with patch.object(agent_state, "get_state", side_effect=get_state), patch.object(
+        agent_state, "update_state", side_effect=update_state
+    ), patch(
+        "logstashagent.logstash_download.ensure_logstash_version",
+        side_effect=_ensure_off_controller_thread(blocked_ensure),
+    ), patch(
+        "logstashagent.logstash_download.resolve_binary_from_policy"
+    ) as resolve, patch(
+        "logstashagent.install_registry.register_logstash_version", return_value={}
+    ):
+        try:
+            prep = controller.prepare_runtime_upgrade(runtime)
+            assert prep.get("held") is True
+            new_bin = _place_version_tree(download_dir, version)
+            from logstashagent.logstash_download import version_is_present
+
+            assert version_is_present(version, str(download_dir)) is True
+            prep2 = controller.prepare_runtime_upgrade(runtime)
+            assert prep2.get("held") is True
+            resolve.assert_not_called()
+        finally:
+            block.set()
+            _join_version_downloads()
+
+        resolve.return_value = str(new_bin)
+        prep3 = controller.prepare_runtime_upgrade(runtime)
+    assert prep3.get("held") is not True
+    assert prep3["ok"] is True
+    assert prep3["changed"] is True
+    controller.rollback_runtime_upgrade(prep3, restart=False)

@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import uuid
 from pathlib import Path
 import logging
@@ -25,6 +26,8 @@ import logging
 from . import encryption
 
 logger = logging.getLogger(__name__)
+
+_STATE_IO_LOCK = threading.RLock()
 
 # Keys that should be encrypted when stored
 ENCRYPTED_KEYS = {'api_key', 'keystore_password'}
@@ -220,6 +223,56 @@ def get_or_create_agent_id() -> str:
     return agent_id
 
 
+def _atomic_write_json(path: Path, data: dict) -> None:
+    """Write JSON via a temp file + ``os.replace`` so readers never see a truncate."""
+    tmp = path.with_name(path.name + '.tmp')
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _load_state_unlocked() -> dict:
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        with open(STATE_FILE, 'r', encoding='utf-8') as f:
+            state = json.load(f)
+        if not isinstance(state, dict):
+            return {}
+        for key in ENCRYPTED_KEYS:
+            if key in state and state[key]:
+                try:
+                    state[key] = encryption.decrypt_credential(state[key])
+                except Exception as e:
+                    logger.error(f"Failed to decrypt {key}: {e}")
+        return state
+    except (json.JSONDecodeError, IOError) as e:
+        logger.error(f"Failed to read state.json: {e}")
+        return {}
+
+
+def _dump_state_unlocked(state: dict) -> None:
+    state_to_save = state.copy()
+    for encrypted_key in ENCRYPTED_KEYS:
+        if encrypted_key in state_to_save and state_to_save[encrypted_key]:
+            try:
+                state_to_save[encrypted_key] = encryption.encrypt_credential(
+                    state_to_save[encrypted_key]
+                )
+            except Exception as e:
+                logger.error(f"Failed to encrypt {encrypted_key}: {e}")
+    _atomic_write_json(STATE_FILE, state_to_save)
+
+
 def get_state() -> dict:
     """
     Get the full state dictionary from state.json
@@ -229,25 +282,8 @@ def get_state() -> dict:
         dict: The state dictionary, or empty dict if file doesn't exist
     """
     refresh_state_paths()
-    if STATE_FILE.exists():
-        try:
-            with open(STATE_FILE, 'r') as f:
-                state = json.load(f)
-
-            # Decrypt encrypted fields
-            for key in ENCRYPTED_KEYS:
-                if key in state and state[key]:
-                    try:
-                        state[key] = encryption.decrypt_credential(state[key])
-                    except Exception as e:
-                        logger.error(f"Failed to decrypt {key}: {e}")
-                        # Keep encrypted value if decryption fails
-
-            return state
-        except (json.JSONDecodeError, IOError) as e:
-            logger.error(f"Failed to read state.json: {e}")
-            return {}
-    return {}
+    with _STATE_IO_LOCK:
+        return _load_state_unlocked()
 
 
 def update_state(key: str, value):
@@ -261,30 +297,14 @@ def update_state(key: str, value):
     """
     refresh_state_paths()
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Load existing state (this will decrypt encrypted values)
-    state = get_state()
-
-    # Update the key
-    state[key] = value
-
-    # Encrypt sensitive fields before saving
-    state_to_save = state.copy()
-    for encrypted_key in ENCRYPTED_KEYS:
-        if encrypted_key in state_to_save and state_to_save[encrypted_key]:
-            try:
-                state_to_save[encrypted_key] = encryption.encrypt_credential(state_to_save[encrypted_key])
-            except Exception as e:
-                logger.error(f"Failed to encrypt {encrypted_key}: {e}")
-                # Save unencrypted if encryption fails
-
-    # Save back to file
-    try:
-        with open(STATE_FILE, 'w') as f:
-            json.dump(state_to_save, f, indent=2)
-        logger.debug(f"Updated state: {key} ({STATE_FILE})")
-    except IOError as e:
-        logger.error(f"Failed to update state.json: {e}")
+    with _STATE_IO_LOCK:
+        state = _load_state_unlocked()
+        state[key] = value
+        try:
+            _dump_state_unlocked(state)
+            logger.debug(f"Updated state: {key} ({STATE_FILE})")
+        except IOError as e:
+            logger.error(f"Failed to update state.json: {e}")
 
 
 def relocate_state_to(dest_dir: str | Path, *, leave_source: bool = False) -> Path:

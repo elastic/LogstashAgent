@@ -523,6 +523,7 @@ RUNTIME_UPGRADE_HEALTH_POLL = 2.0
 
 _VERSION_DOWNLOAD_LOCK = threading.Lock()
 _VERSION_DOWNLOAD_THREADS: dict[str, threading.Thread] = {}
+_VERSION_DOWNLOAD_STATUS: dict[str, dict] = {}
 _IGNORED_VERSION_PINS: set[str] = set()
 
 _SNAPSHOT_SETTING_FILES = (
@@ -556,10 +557,95 @@ def _empty_runtime_prep(**overrides) -> dict:
     return prep
 
 
-def _stamp_runtime_download(**fields) -> None:
+def _stamp_runtime_download(fields: dict, *, overwrite: bool = False) -> None:
     current = dict((agent_state.get_state() or {}).get('runtime_download') or {})
-    current.update(fields)
+    new_ver = fields.get('version')
+    cur_ver = current.get('version')
+    if not overwrite and cur_ver and new_ver and cur_ver != new_ver:
+        return
+    if overwrite:
+        current = dict(fields)
+    else:
+        current.update(fields)
     agent_state.update_state('runtime_download', current)
+
+
+def _set_download_memory(version: str, **fields) -> dict:
+    with _VERSION_DOWNLOAD_LOCK:
+        cur = dict(_VERSION_DOWNLOAD_STATUS.get(version) or {})
+        cur.update(fields)
+        cur['version'] = version
+        _VERSION_DOWNLOAD_STATUS[version] = cur
+        return dict(cur)
+
+
+def _download_thread_alive(version: str) -> threading.Thread | None:
+    with _VERSION_DOWNLOAD_LOCK:
+        t = _VERSION_DOWNLOAD_THREADS.get(version)
+        if t is not None and t.is_alive():
+            return t
+        return None
+
+
+def _download_memory(version: str) -> dict | None:
+    with _VERSION_DOWNLOAD_LOCK:
+        st = _VERSION_DOWNLOAD_STATUS.get(version)
+        return dict(st) if st else None
+
+
+def _flush_runtime_download(version: str, download_dir: str | None = None) -> None:
+    """Persist in-memory worker status onto agent_state (controller thread only)."""
+    mem = _download_memory(version)
+    alive = _download_thread_alive(version)
+    ddir = download_dir or (mem or {}).get('dir') or ''
+    if alive is not None:
+        blob = {
+            'status': (mem or {}).get('status') or 'running',
+            'version': version,
+            'dir': ddir,
+            'error': None,
+            'started_at': (mem or {}).get('started_at'),
+        }
+        _stamp_runtime_download(blob)
+        return
+    if not mem:
+        return
+    present = False
+    if ddir:
+        from .logstash_download import version_is_present
+
+        present = version_is_present(version, ddir)
+    if present:
+        blob = {
+            'status': 'ready',
+            'version': version,
+            'dir': ddir,
+            'error': None,
+            'started_at': mem.get('started_at'),
+        }
+    else:
+        blob = {
+            'status': 'failed',
+            'version': version,
+            'dir': ddir,
+            'error': mem.get('error'),
+            'started_at': mem.get('started_at'),
+        }
+    _stamp_runtime_download(blob)
+
+
+def _flush_runtime_downloads_for_checkin() -> None:
+    with _VERSION_DOWNLOAD_LOCK:
+        versions = list(_VERSION_DOWNLOAD_STATUS.keys())
+    state = agent_state.get_state() or {}
+    rd = state.get('runtime_download') or {}
+    ver = (rd.get('version') or '').strip()
+    if ver and ver not in versions:
+        versions.append(ver)
+    ddir = rd.get('dir') or state.get('logstash_download_dir') or ''
+    for v in versions:
+        mem = _download_memory(v)
+        _flush_runtime_download(v, (mem or {}).get('dir') or ddir)
 
 
 def _maybe_persist_via_ui(payload) -> None:
@@ -573,20 +659,25 @@ def _maybe_persist_via_ui(payload) -> None:
 
 def _version_download_worker(version: str, download_dir: str) -> None:
     try:
-        _stamp_runtime_download(
-            status='running', version=version, dir=download_dir, error=None
+        _set_download_memory(
+            version, status='running', dir=download_dir, error=None
         )
         from .logstash_download import ensure_logstash_version
 
         ensure_logstash_version(version, download_dir)
-        _stamp_runtime_download(
-            status='ready', version=version, dir=download_dir, error=None
+        _set_download_memory(
+            version, status='ready', dir=download_dir, error=None
         )
     except Exception as e:
         logger.error('VERSION download failed for %s: %s', version, e)
-        _stamp_runtime_download(
-            status='failed', version=version, dir=download_dir, error=str(e)
+        _set_download_memory(
+            version, status='failed', dir=download_dir, error=str(e)
         )
+    finally:
+        with _VERSION_DOWNLOAD_LOCK:
+            cur = _VERSION_DOWNLOAD_THREADS.get(version)
+            if cur is threading.current_thread():
+                _VERSION_DOWNLOAD_THREADS.pop(version, None)
 
 
 def _start_version_download(version: str, download_dir: str) -> threading.Thread:
@@ -594,13 +685,15 @@ def _start_version_download(version: str, download_dir: str) -> threading.Thread
         existing = _VERSION_DOWNLOAD_THREADS.get(version)
         if existing is not None and existing.is_alive():
             return existing
-        _stamp_runtime_download(
-            status='pending',
-            version=version,
-            dir=download_dir,
-            error=None,
-            started_at=datetime.now(timezone.utc).isoformat(),
-        )
+        started_at = datetime.now(timezone.utc).isoformat()
+        _VERSION_DOWNLOAD_STATUS[version] = {
+            'status': 'pending',
+            'version': version,
+            'dir': download_dir,
+            'error': None,
+            'started_at': started_at,
+        }
+        blob = dict(_VERSION_DOWNLOAD_STATUS[version])
         t = threading.Thread(
             target=_version_download_worker,
             args=(version, download_dir),
@@ -609,7 +702,8 @@ def _start_version_download(version: str, download_dir: str) -> threading.Thread
         )
         _VERSION_DOWNLOAD_THREADS[version] = t
         t.start()
-        return t
+    _stamp_runtime_download(blob, overwrite=True)
+    return t
 
 
 def _canonical_run_mode(mode: str | None) -> str:
@@ -745,16 +839,23 @@ def prepare_runtime_upgrade(runtime: dict | None) -> dict:
     )
     binary_path = runtime.get('binary_path') or '/usr/share/logstash/bin'
 
-    if source == 'VERSION' and version and not version_is_present(version, download_dir):
-        _start_version_download(version, download_dir)
-        logger.info(
-            'VERSION tree %s not present under %s — holding policy revision',
-            version,
-            download_dir,
-        )
-        return _empty_runtime_prep(
-            held=True, source=source, version=version, download_dir=download_dir
-        )
+    if source == 'VERSION' and version:
+        inflight = _download_thread_alive(version)
+        present = version_is_present(version, download_dir)
+        if inflight is not None or not present:
+            _flush_runtime_download(version, download_dir)
+            if inflight is None:
+                _start_version_download(version, download_dir)
+            logger.info(
+                'Holding policy revision until VERSION %s download finishes (present=%s inflight=%s)',
+                version,
+                present,
+                inflight is not None,
+            )
+            return _empty_runtime_prep(
+                held=True, source=source, version=version, download_dir=download_dir
+            )
+        _flush_runtime_download(version, download_dir)
 
     try:
         binary = str(
@@ -2802,7 +2903,9 @@ def check_in():
             return None
 
         recover_incomplete_runtime_upgrade()
-        
+        _flush_runtime_downloads_for_checkin()
+        state = agent_state.get_state() or state
+
         # Get paths from state
         settings_path = state.get('settings_path', '')
         logs_path = state.get('logs_path', '')
