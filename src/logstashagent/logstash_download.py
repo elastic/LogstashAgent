@@ -132,6 +132,12 @@ def _via_ui_auth_headers(
     return {"Authorization": f"ApiKey {key}"}
 
 
+def _ssl_context():
+    from logstashagent.tls_trust import build_ssl_context
+
+    return build_ssl_context()
+
+
 def version_dir_name(version: str) -> str:
     """Directory name for an extracted release (matches Elastic tarball top-level)."""
     v = (version or "").strip()
@@ -251,7 +257,9 @@ def _download_file(
         urllib.request.Request(url, headers=headers) if headers else url
     )
     try:
-        with urllib.request.urlopen(target, timeout=timeout) as resp, open(dest, "wb") as out:
+        with urllib.request.urlopen(
+            target, timeout=timeout, context=_ssl_context()
+        ) as resp, open(dest, "wb") as out:
             shutil.copyfileobj(resp, out)
     except Exception as exc:
         raise LogstashDownloadError(f"Download failed for {url}: {exc}") from exc
@@ -270,18 +278,27 @@ def _verify_sha512(
     sha_url: str,
     timeout: int = 60,
     headers: Optional[dict] = None,
+    required: bool = False,
 ) -> None:
     """
-    Verify tarball against Elastic .sha512 sidecar when available.
-    Non-fatal if the sidecar cannot be fetched (log warning).
+    Verify tarball against the .sha512 sidecar at ``sha_url`` (same origin as the artifact).
+
+    When ``required`` is False (Elastic), sidecar fetch failure is non-fatal.
+    When True (via-UI), fetch failure raises LogstashDownloadError.
     """
     target: str | urllib.request.Request = (
         urllib.request.Request(sha_url, headers=headers) if headers else sha_url
     )
     try:
-        with urllib.request.urlopen(target, timeout=timeout) as resp:
+        with urllib.request.urlopen(
+            target, timeout=timeout, context=_ssl_context()
+        ) as resp:
             text = resp.read().decode("utf-8", errors="replace").strip()
     except Exception as exc:
+        if required:
+            raise LogstashDownloadError(
+                f"Could not fetch checksum {sha_url}: {exc}"
+            ) from exc
         logger.warning("Could not fetch checksum %s: %s (skipping verify)", sha_url, exc)
         return
 
@@ -393,12 +410,14 @@ def _ensure_logstash_version_locked(
     with tempfile.TemporaryDirectory(prefix="ls-download-") as tmp:
         tmp_path = Path(tmp)
         tarball = tmp_path / artifact_filename(version, platform_arch)
-        if headers:
-            _download_file(url, tarball, headers=headers)
-            _verify_sha512(tarball, sha_url, timeout=sha_timeout, headers=headers)
-        else:
-            _download_file(url, tarball)
-            _verify_sha512(tarball, sha_url)
+        _download_file(url, tarball, headers=headers)
+        _verify_sha512(
+            tarball,
+            sha_url,
+            timeout=sha_timeout,
+            headers=headers,
+            required=via_ui,
+        )
 
         # Remove partial/legacy trees for this version before extract
         legacy_nested = root / version

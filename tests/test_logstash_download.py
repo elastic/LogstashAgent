@@ -146,10 +146,10 @@ def test_artifact_url_flag_off_is_elastic(monkeypatch):
 
 
 def _fake_tarball_urlopen(tarball_bytes, seen, *, expect_ui=False):
-    def fake_urlopen(req, timeout=60):
+    def fake_urlopen(req, timeout=60, context=None):
         url = _urlopen_url(req)
         headers = _urlopen_headers(req)
-        seen.append({"url": url, "headers": headers, "timeout": timeout, "req": req})
+        seen.append({"url": url, "headers": headers, "timeout": timeout, "req": req, "context": context})
         if expect_ui:
             assert "artifacts.elastic.co" not in url
             assert "/ConnectionManager/LogstashArtifact/" in url
@@ -245,7 +245,7 @@ def test_via_ui_http_error_no_elastic_fallback(tmp_path, monkeypatch, status):
     monkeypatch.setenv("LOGSTASH_AGENT_LOGSTASH_VIA_UI", "true")
     elastic_hits = []
 
-    def fake_urlopen(req, timeout=60):
+    def fake_urlopen(req, timeout=60, context=None):
         url = _urlopen_url(req)
         if "artifacts.elastic.co" in url:
             elastic_hits.append(url)
@@ -261,6 +261,115 @@ def test_via_ui_http_error_no_elastic_fallback(tmp_path, monkeypatch, status):
                 version, str(tmp_path), platform_arch="linux-x86_64"
             )
     assert elastic_hits == []
+
+
+def test_via_ui_urlopen_uses_ssl_context(tmp_path, monkeypatch):
+    version = "9.4.3"
+    tarball_bytes = _minimal_logstash_tarball(version)
+    monkeypatch.setenv("LOGSTASH_AGENT_LOGSTASH_VIA_UI", "true")
+    fake_ctx = object()
+    seen = []
+
+    def fake_urlopen(req, timeout=60, context=None):
+        url = _urlopen_url(req)
+        seen.append({"url": url, "context": context})
+        class Stream:
+            def __enter__(self):
+                return io.BytesIO(tarball_bytes)
+
+            def __exit__(self, *a):
+                return False
+
+        class Resp:
+            def read(self):
+                import hashlib
+
+                h = hashlib.sha512(tarball_bytes).hexdigest()
+                return f"{h}  logstash.tar.gz".encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        if url.endswith(".sha512"):
+            return Resp()
+        return Stream()
+
+    state = {"logstash_ui_url": _UI_BASE, "api_key": _UI_KEY}
+    with patch("logstashagent.tls_trust.build_ssl_context", return_value=fake_ctx), patch(
+        "logstashagent.agent_state.get_state", return_value=state
+    ), patch.object(ld.urllib.request, "urlopen", side_effect=fake_urlopen):
+        binary = ld.ensure_logstash_version(
+            version, str(tmp_path), platform_arch="linux-x86_64"
+        )
+    assert Path(binary).is_file()
+    assert seen
+    for hit in seen:
+        assert hit["context"] is fake_ctx
+
+
+@pytest.mark.parametrize("status", [404, 502])
+def test_via_ui_sha512_http_error_is_fatal(tmp_path, monkeypatch, status):
+    version = "9.4.3"
+    tarball_bytes = _minimal_logstash_tarball(version)
+    monkeypatch.setenv("LOGSTASH_AGENT_LOGSTASH_VIA_UI", "true")
+    elastic_hits = []
+
+    def fake_urlopen(req, timeout=60, context=None):
+        url = _urlopen_url(req)
+        if "artifacts.elastic.co" in url:
+            elastic_hits.append(url)
+            pytest.fail("must not fall back to artifacts.elastic.co")
+        if url.endswith(".sha512"):
+            raise urllib.error.HTTPError(url, status, "err", hdrs=None, fp=None)
+
+        class Stream:
+            def __enter__(self):
+                return io.BytesIO(tarball_bytes)
+
+            def __exit__(self, *a):
+                return False
+
+        return Stream()
+
+    state = {"logstash_ui_url": _UI_BASE, "api_key": _UI_KEY}
+    with patch("logstashagent.agent_state.get_state", return_value=state), patch.object(
+        ld.urllib.request, "urlopen", side_effect=fake_urlopen
+    ):
+        with pytest.raises(ld.LogstashDownloadError):
+            ld.ensure_logstash_version(
+                version, str(tmp_path), platform_arch="linux-x86_64"
+            )
+    assert elastic_hits == []
+    assert not (tmp_path / f"logstash-{version}").exists()
+
+
+def test_elastic_sha512_fetch_failure_skips_verify(tmp_path, monkeypatch):
+    version = "9.4.3"
+    tarball_bytes = _minimal_logstash_tarball(version)
+    monkeypatch.setenv("LOGSTASH_AGENT_LOGSTASH_VIA_UI", "false")
+
+    def fake_urlopen(req, timeout=60, context=None):
+        url = _urlopen_url(req)
+        if url.endswith(".sha512"):
+            raise urllib.error.HTTPError(url, 404, "err", hdrs=None, fp=None)
+
+        class Stream:
+            def __enter__(self):
+                return io.BytesIO(tarball_bytes)
+
+            def __exit__(self, *a):
+                return False
+
+        return Stream()
+
+    with patch.object(ld.urllib.request, "urlopen", side_effect=fake_urlopen):
+        binary = ld.ensure_logstash_version(
+            version, str(tmp_path), platform_arch="linux-x86_64"
+        )
+    assert Path(binary).is_file()
 
 
 def test_detect_platform_arch_known():
@@ -290,7 +399,7 @@ def test_ensure_logstash_version_idempotent_extract(tmp_path):
     version = "9.4.3"
     tarball_bytes = _minimal_logstash_tarball(version)
 
-    def fake_urlopen(url, timeout=60):
+    def fake_urlopen(url, timeout=60, context=None):
         class Resp:
             def read(self):
                 if url.endswith(".sha512"):
@@ -397,7 +506,7 @@ def test_ensure_extracts_flat_not_nested(tmp_path):
     raw.seek(0)
     tarball_bytes = raw.read()
 
-    def fake_urlopen(url, timeout=60):
+    def fake_urlopen(url, timeout=60, context=None):
         class Stream:
             def __enter__(self):
                 return io.BytesIO(tarball_bytes)
@@ -439,7 +548,7 @@ def test_ensure_logstash_version_flock_serializes_extract(tmp_path):
     started = threading.Event()
     proceed = threading.Event()
 
-    def slow_download(url, dest, timeout=600):
+    def slow_download(url, dest, timeout=600, **_kwargs):
         downloads.append(url)
         started.set()
         assert proceed.wait(5), "first downloader stuck"
