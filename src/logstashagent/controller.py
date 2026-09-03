@@ -521,6 +521,10 @@ RUNTIME_SNAPSHOT_NAME = '.runtime-snapshot'
 RUNTIME_UPGRADE_HEALTH_TIMEOUT = 180.0
 RUNTIME_UPGRADE_HEALTH_POLL = 2.0
 
+_VERSION_DOWNLOAD_LOCK = threading.Lock()
+_VERSION_DOWNLOAD_THREADS: dict[str, threading.Thread] = {}
+_IGNORED_VERSION_PINS: set[str] = set()
+
 _SNAPSHOT_SETTING_FILES = (
     'logstash.yml',
     'jvm.options',
@@ -539,6 +543,7 @@ def _empty_runtime_prep(**overrides) -> dict:
     prep = {
         'ok': True,
         'changed': False,
+        'held': False,
         'desired_binary': None,
         'snapshot_dir': None,
         'previous': {},
@@ -549,6 +554,62 @@ def _empty_runtime_prep(**overrides) -> dict:
     }
     prep.update(overrides)
     return prep
+
+
+def _stamp_runtime_download(**fields) -> None:
+    current = dict((agent_state.get_state() or {}).get('runtime_download') or {})
+    current.update(fields)
+    agent_state.update_state('runtime_download', current)
+
+
+def _maybe_persist_via_ui(payload) -> None:
+    if not isinstance(payload, dict):
+        return
+    if 'logstash_via_ui' in payload:
+        agent_state.update_state('logstash_via_ui', payload['logstash_via_ui'])
+    elif 'via_ui' in payload:
+        agent_state.update_state('logstash_via_ui', payload['via_ui'])
+
+
+def _version_download_worker(version: str, download_dir: str) -> None:
+    try:
+        _stamp_runtime_download(
+            status='running', version=version, dir=download_dir, error=None
+        )
+        from .logstash_download import ensure_logstash_version
+
+        ensure_logstash_version(version, download_dir)
+        _stamp_runtime_download(
+            status='ready', version=version, dir=download_dir, error=None
+        )
+    except Exception as e:
+        logger.error('VERSION download failed for %s: %s', version, e)
+        _stamp_runtime_download(
+            status='failed', version=version, dir=download_dir, error=str(e)
+        )
+
+
+def _start_version_download(version: str, download_dir: str) -> threading.Thread:
+    with _VERSION_DOWNLOAD_LOCK:
+        existing = _VERSION_DOWNLOAD_THREADS.get(version)
+        if existing is not None and existing.is_alive():
+            return existing
+        _stamp_runtime_download(
+            status='pending',
+            version=version,
+            dir=download_dir,
+            error=None,
+            started_at=datetime.now(timezone.utc).isoformat(),
+        )
+        t = threading.Thread(
+            target=_version_download_worker,
+            args=(version, download_dir),
+            daemon=True,
+            name=f'logstash-download-{version}',
+        )
+        _VERSION_DOWNLOAD_THREADS[version] = t
+        t.start()
+        return t
 
 
 def _canonical_run_mode(mode: str | None) -> str:
@@ -644,15 +705,29 @@ def _restore_runtime_snapshot(prep: dict) -> bool:
 
 def prepare_runtime_upgrade(runtime: dict | None) -> dict:
     """
-    Download/resolve the desired Logstash binary and snapshot current config.
+    Resolve the desired Logstash binary and snapshot current config.
 
-    Does not flip LOGSTASH_BINARY or agent-state pin fields.
+    Missing VERSION trees start one background download and hold the revision
+    (ok=True, changed=False, held=True). Does not flip LOGSTASH_BINARY or
+    agent-state pin fields.
     """
     if not runtime or runtime is False:
         return _empty_runtime_prep()
     state = agent_state.get_state() or {}
     mode = _canonical_run_mode(state.get('mode'))
+    _maybe_persist_via_ui(runtime)
     if mode not in ('managed', 'simulate'):
+        source = (runtime.get('source') or '').upper()
+        if source == 'VERSION':
+            ver = (runtime.get('version') or '').strip() or '(none)'
+            key = f'{mode}:{ver}'
+            if key not in _IGNORED_VERSION_PINS:
+                _IGNORED_VERSION_PINS.add(key)
+                logger.warning(
+                    'Ignoring VERSION pin %s in %s mode (no download)',
+                    ver,
+                    mode or 'unknown',
+                )
         return _empty_runtime_prep()
 
     from .logstash_download import (
@@ -660,6 +735,7 @@ def prepare_runtime_upgrade(runtime: dict | None) -> dict:
         LogstashDownloadError,
         DEFAULT_DOWNLOAD_ROOT,
         normalize_download_dir,
+        version_is_present,
     )
 
     source = (runtime.get('source') or 'SYSTEM').upper()
@@ -668,6 +744,17 @@ def prepare_runtime_upgrade(runtime: dict | None) -> dict:
         (runtime.get('download_dir') or DEFAULT_DOWNLOAD_ROOT).strip()
     )
     binary_path = runtime.get('binary_path') or '/usr/share/logstash/bin'
+
+    if source == 'VERSION' and version and not version_is_present(version, download_dir):
+        _start_version_download(version, download_dir)
+        logger.info(
+            'VERSION tree %s not present under %s — holding policy revision',
+            version,
+            download_dir,
+        )
+        return _empty_runtime_prep(
+            held=True, source=source, version=version, download_dir=download_dir
+        )
 
     try:
         binary = str(
@@ -729,6 +816,7 @@ def prepare_runtime_upgrade(runtime: dict | None) -> dict:
     return {
         'ok': True,
         'changed': True,
+        'held': False,
         'desired_binary': binary,
         'snapshot_dir': str(snap),
         'previous': previous,
@@ -2116,6 +2204,12 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
                         f"logstash_runtime apply failed: {runtime_prep.get('error')}"
                     )
                     rollout_aborted = True
+                elif runtime_prep.get('held'):
+                    logger.info(
+                        "Holding policy revision until Logstash %s is downloaded",
+                        runtime_prep.get('version') or 'VERSION',
+                    )
+                    rollout_aborted = True
                 elif runtime_prep.get('changed'):
                     files_updated = True
                     requires_restart = True
@@ -2267,7 +2361,12 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
                 rollback_runtime_upgrade(runtime_prep, restart=False)
 
             if rollout_aborted:
-                logger.error(f"Rollout aborted due to failures: {failed_operations}")
+                if runtime_prep.get('held') and not failed_operations:
+                    logger.info(
+                        "Rollout held pending VERSION download (revision not bumped)"
+                    )
+                else:
+                    logger.error(f"Rollout aborted due to failures: {failed_operations}")
             elif files_updated:
                 if requires_restart:
                     if files_existed:
@@ -2851,6 +2950,7 @@ def check_in():
             'logstash_binary': state.get('logstash_binary') or '',
             'logstash_download_dir': state.get('logstash_download_dir') or '',
             'last_runtime_apply': state.get('last_runtime_apply'),
+            'runtime_download': state.get('runtime_download'),
         }
 
         api_port = state.get('api_port', 9600)
@@ -2956,6 +3056,7 @@ def check_in():
         
         if result.get('success'):
             logger.info("Check-in successful")
+            _maybe_persist_via_ui(result)
 
             try:
                 from logstashagent import tls_server
