@@ -2,13 +2,19 @@
 
 Package version is **0.5.2**. Works with **LogstashUI 0.5.1 & 0.5.2**.
 
+### Added
+
+- Check-in `status_blob` includes `runtime_download` (`pending|running|ready|failed`, version, error). No progress bars.
+- Optional `LOGSTASH_AGENT_LOGSTASH_VIA_UI` (default false; env wins over state `logstash_via_ui`): tarball + `.sha512` from `{logstash_ui_url}/ConnectionManager/LogstashArtifact/{filename}` with `Authorization: ApiKey`, product-CA trust, no Elastic fallback when on.
+
 ### Changed
 
 - First-class CLI `--mode` values: **packaged**, **managed**, **simulate**, **embedded**. Aliases rewritten on load and argparse: `default`|`agent` → packaged, `host` → managed.
 - `--help`, admin commands, and `--enroll` no longer load agent yml or create `/etc/logstash` pipeline dirs.
 - Documented config precedence: systemd `agent.env` / Logstash env win over `logstash-agent.yml` when set (example yml, installer templates, README).
 - `resolve_path_settings_from_env(require_writable=True)`: missing directories are skipped; an explicit env path that exists but is not writable no longer falls back to `/etc/logstash`.
-- Managed/simulate policy deploys download a VERSION pin (and flock the extract) **before** writing yml/jvm/log4j2/keystore/pipelines. `LOGSTASH_BINARY` flips immediately before the single restart.
+- Missing VERSION tree: start a **background** download (per-version flock still in ensure) and **hold the whole policy revision** (no yml/jvm/log4j2/keystore/pipelines, no revision bump) until the tree exists. Next check-in after ready: snapshot → apply → flip `LOGSTASH_BINARY` immediately before the single restart.
+- Packaged/embedded: VERSION pin is a no-op (log once, no download). UI policy should not attach VERSION pins to those roles.
 
 ### Fixed
 
