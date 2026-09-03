@@ -533,6 +533,63 @@ def test_pipeline_only_skips_finalize(tmp_path):
     rst.assert_not_called()
 
 
+def test_merged_plan_aborted_does_not_flip_or_restart(tmp_path):
+    tree = _managed_tree(tmp_path)
+    prep = {
+        "ok": True,
+        "changed": True,
+        "desired_binary": str(tree["new_bin"]),
+        "snapshot_dir": str(tree["root"] / ".runtime-snapshot"),
+        "previous": {"env_file": str(tree["env"]), "api_port": 9601},
+        "source": "VERSION",
+        "version": "9.5.0",
+    }
+    policy_res = {
+        "ran": True,
+        "files_updated": True,
+        "requires_restart": True,
+        "failed_operations": ["logstash.yml write failed"],
+        "aborted": True,
+        "current_revision": 9,
+        "runtime_prep": prep,
+    }
+    plan = {"keystore": {"set": {}, "delete": []}, "pipelines": {"set": {}, "delete": []}}
+    with patch.object(agent_state, "get_state", return_value=tree["state"]), patch.object(
+        agent_state, "update_state"
+    ) as upd, patch.object(controller, "flip_runtime_env") as flip, patch.object(
+        controller, "restart_logstash"
+    ) as rst, patch.object(controller, "rollback_runtime_upgrade", return_value=True) as rb:
+        controller._apply_merged_plan(str(tree["settings"]) + "/", plan, policy_res, None)
+    flip.assert_not_called()
+    rst.assert_not_called()
+    rb.assert_called_once()
+    assert rb.call_args.kwargs.get("restart", True) is False
+    rev_calls = [c for c in upd.call_args_list if c[0] and c[0][0] == "revision_number"]
+    assert rev_calls == []
+
+
+def test_merged_plan_aborted_without_runtime_change_does_not_restart(tmp_path):
+    tree = _managed_tree(tmp_path)
+    policy_res = {
+        "ran": True,
+        "files_updated": True,
+        "requires_restart": True,
+        "failed_operations": ["logstash.yml write failed"],
+        "aborted": True,
+        "current_revision": 9,
+        "runtime_prep": controller._empty_runtime_prep(),
+    }
+    plan = {"keystore": {"set": {}, "delete": []}, "pipelines": {"set": {}, "delete": []}}
+    with patch.object(agent_state, "get_state", return_value=tree["state"]), patch.object(
+        agent_state, "update_state"
+    ), patch.object(controller, "flip_runtime_env") as flip, patch.object(
+        controller, "restart_logstash"
+    ) as rst:
+        controller._apply_merged_plan(str(tree["settings"]) + "/", plan, policy_res, None)
+    flip.assert_not_called()
+    rst.assert_not_called()
+
+
 def test_system_to_version_uses_prepare_path(tmp_path):
     tree = _managed_tree(tmp_path)
     tree["state"]["logstash_source"] = "SYSTEM"

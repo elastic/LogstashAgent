@@ -1805,7 +1805,7 @@ def _apply_merged_plan(settings_path, plan, policy_res, snmp_res):
     if runtime_prep.get('changed') and (not writes_ok or (policy_res or {}).get('aborted')):
         rollback_runtime_upgrade(runtime_prep, restart=False)
         upgrade_rolled_back = True
-    elif requires_restart and writes_ok:
+    elif requires_restart and writes_ok and not (policy_res or {}).get('aborted'):
         if runtime_prep.get('changed') and not flip_runtime_env(runtime_prep):
             logger.error('Failed to flip LOGSTASH_BINARY — restoring snapshot')
             rollback_runtime_upgrade(runtime_prep, restart=False)
@@ -2233,10 +2233,6 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
                             failed_operations.append('pipelines update failed')
                             rollout_aborted = True
 
-            if rollout_aborted and runtime_prep.get('changed'):
-                logger.error("Config apply failed after runtime prepare — restoring snapshot (no env flip)")
-                rollback_runtime_upgrade(runtime_prep, restart=False)
-
             if plan is not None:
                 # Merge mode: the caller applies the merged keystore/pipeline plan,
                 # restarts once, and finalizes the revision / last_policy_apply.
@@ -2254,6 +2250,10 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
                     'snmp_changes': result.get('snmp_changes'),
                     'runtime_prep': runtime_prep,
                 }
+
+            if rollout_aborted and runtime_prep.get('changed'):
+                logger.error("Config apply failed after runtime prepare — restoring snapshot (no env flip)")
+                rollback_runtime_upgrade(runtime_prep, restart=False)
 
             if rollout_aborted:
                 logger.error(f"Rollout aborted due to failures: {failed_operations}")
