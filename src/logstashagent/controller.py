@@ -2069,17 +2069,38 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
             failed_operations = []
             rollout_aborted = False
 
-            # Update logstash.yml if changed
-            logstash_yml_content = changes.get('logstash_yml')
-            if logstash_yml_content and logstash_yml_content != False:
-                logger.info("Configuration change found for logstash.yml")
-                if update_logstash_yml(settings_path, logstash_yml_content):
+            runtime_prep = _empty_runtime_prep()
+            runtime = changes.get('logstash_runtime')
+            if runtime and runtime != False:
+                logger.info("Logstash runtime change detected (source/version/binary) — prepare first")
+                runtime_prep = prepare_runtime_upgrade(runtime)
+                if not runtime_prep.get('ok'):
+                    logger.error(
+                        "Failed to prepare logstash_runtime: %s — aborting rollout",
+                        runtime_prep.get('error'),
+                    )
+                    failed_operations.append(
+                        f"logstash_runtime apply failed: {runtime_prep.get('error')}"
+                    )
+                    rollout_aborted = True
+                elif runtime_prep.get('changed'):
                     files_updated = True
                     requires_restart = True
-                else:
-                    logger.error("Failed to update logstash.yml - aborting rollout")
-                    failed_operations.append('logstash.yml write failed')
-                    rollout_aborted = True
+                    if runtime_prep.get('desired_binary'):
+                        binary_path = str(Path(runtime_prep['desired_binary']).parent)
+
+            # Update logstash.yml if changed
+            if not rollout_aborted:
+                logstash_yml_content = changes.get('logstash_yml')
+                if logstash_yml_content and logstash_yml_content != False:
+                    logger.info("Configuration change found for logstash.yml")
+                    if update_logstash_yml(settings_path, logstash_yml_content):
+                        files_updated = True
+                        requires_restart = True
+                    else:
+                        logger.error("Failed to update logstash.yml - aborting rollout")
+                        failed_operations.append('logstash.yml write failed')
+                        rollout_aborted = True
 
             # Update jvm.options if changed
             if not rollout_aborted:
@@ -2112,29 +2133,6 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
                 logger.info(f"Configuration change found for settings_path: {changes.get('settings_path')}")
             if changes.get('logs_path') and changes.get('logs_path') != False:
                 logger.info(f"Configuration change found for logs_path: {changes.get('logs_path')}")
-
-            # Apply Logstash binary source (SYSTEM vs VERSION download) before keystore/pipelines
-            if not rollout_aborted:
-                runtime = changes.get('logstash_runtime')
-                if runtime and runtime != False:
-                    logger.info("Logstash runtime change detected (source/version/binary)")
-                    rt_result = apply_logstash_runtime(runtime)
-                    if rt_result.get('success'):
-                        files_updated = True
-                        if rt_result.get('requires_restart'):
-                            requires_restart = True
-                        # Prefer server binary_path state already updated inside apply
-                        if rt_result.get('binary'):
-                            binary_path = str(Path(rt_result['binary']).parent)
-                    else:
-                        logger.error(
-                            "Failed to apply logstash_runtime: %s — aborting rollout",
-                            rt_result.get('error'),
-                        )
-                        failed_operations.append(
-                            f"logstash_runtime apply failed: {rt_result.get('error')}"
-                        )
-                        rollout_aborted = True
 
             # Handle keystore password change/clear (must run BEFORE keystore key changes)
             # Protocol: false=no-op, null=clear to unauth, string=encrypted set/rotate
@@ -2213,6 +2211,10 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
                             failed_operations.append('pipelines update failed')
                             rollout_aborted = True
 
+            if rollout_aborted and runtime_prep.get('changed'):
+                logger.error("Config apply failed after runtime prepare — restoring snapshot (no env flip)")
+                rollback_runtime_upgrade(runtime_prep, restart=False)
+
             if plan is not None:
                 # Merge mode: the caller applies the merged keystore/pipeline plan,
                 # restarts once, and finalizes the revision / last_policy_apply.
@@ -2228,6 +2230,7 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
                     'failed_operations': failed_operations,
                     'aborted': rollout_aborted,
                     'snmp_changes': result.get('snmp_changes'),
+                    'runtime_prep': runtime_prep,
                 }
 
             if rollout_aborted:

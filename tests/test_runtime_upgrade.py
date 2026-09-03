@@ -334,3 +334,88 @@ def test_finalize_rolls_back_when_restart_fails():
         assert controller.finalize_runtime_upgrade(prep, restart_ok=False) is False
     wait.assert_not_called()
     rb.assert_called_once()
+
+
+def _gcc_state(tmp_path: Path) -> tuple[str, dict, Path]:
+    settings = tmp_path / "config"
+    settings.mkdir()
+    yml = settings / "logstash.yml"
+    yml.write_text("old\n", encoding="utf-8")
+    base = str(settings).replace("\\", "/") + "/"
+    root = tmp_path / "managed-1"
+    root.mkdir(exist_ok=True)
+    env = root / "env"
+    env.write_text("LOGSTASH_BINARY=/old\n", encoding="utf-8")
+    state = {
+        "logstash_ui_url": "http://localhost:8000",
+        "api_key": "k",
+        "connection_id": "c",
+        "settings_path": base,
+        "mode": "managed",
+        "path_root": str(root),
+        "keystore_env_file": str(env),
+        "logstash_source": "VERSION",
+        "logstash_version": "9.4.3",
+        "logstash_binary": "/old",
+    }
+    return base, state, yml
+
+
+def test_prepare_runs_before_yml_write(tmp_path):
+    base, state, yml = _gcc_state(tmp_path)
+    order = []
+
+    def prep(runtime):
+        order.append("prep")
+        return controller._empty_runtime_prep(ok=True, changed=False)
+
+    def write_yml(settings_path, content):
+        order.append("yml")
+        return True
+
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {
+        "success": True,
+        "changes": {
+            "logstash_yml": "new\n",
+            "logstash_runtime": {"source": "VERSION", "version": "9.5.0"},
+        },
+        "current_revision": 3,
+    }
+    with patch.object(agent_state, "get_state", return_value=state), patch.object(
+        agent_state, "update_state"
+    ), patch.object(controller, "prepare_runtime_upgrade", side_effect=prep), patch.object(
+        controller, "update_logstash_yml", side_effect=write_yml
+    ), patch.object(controller, "restart_logstash", return_value=True), patch.object(
+        controller.requests, "post", return_value=resp
+    ):
+        controller.get_config_changes()
+    assert order == ["prep", "yml"]
+
+
+def test_prepare_failure_does_not_write_yml(tmp_path):
+    base, state, yml = _gcc_state(tmp_path)
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {
+        "success": True,
+        "changes": {
+            "logstash_yml": "new\n",
+            "logstash_runtime": {"source": "VERSION", "version": "9.5.0"},
+        },
+        "current_revision": 3,
+    }
+    failed = controller._empty_runtime_prep(ok=False, error="network down")
+    with patch.object(agent_state, "get_state", return_value=state), patch.object(
+        agent_state, "update_state"
+    ) as upd, patch.object(
+        controller, "prepare_runtime_upgrade", return_value=failed
+    ), patch.object(controller, "restart_logstash") as rst, patch.object(
+        controller.requests, "post", return_value=resp
+    ):
+        controller.get_config_changes()
+    assert yml.read_text(encoding="utf-8") == "old\n"
+    rst.assert_not_called()
+    rev_calls = [c for c in upd.call_args_list if c[0] and c[0][0] == "revision_number"]
+    assert rev_calls == []
