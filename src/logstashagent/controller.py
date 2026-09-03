@@ -528,6 +528,11 @@ _SNAPSHOT_SETTING_FILES = (
     'pipelines.yml',
     'logstash.keystore',
 )
+# Pipeline .conf files live in conf.d (update_pipelines). Copy pipelines/ too if present.
+_SNAPSHOT_SETTING_DIRS = (
+    'pipelines',
+    'conf.d',
+)
 
 
 def _empty_runtime_prep(**overrides) -> dict:
@@ -592,7 +597,8 @@ def _write_runtime_snapshot(state: dict, previous: dict, desired: dict) -> Path:
     if settings.is_dir() or str(settings):
         for name in _SNAPSHOT_SETTING_FILES:
             _copy_if_exists(settings / name, settings_dest / name)
-        _copy_if_exists(settings / 'pipelines', settings_dest / 'pipelines')
+        for dirname in _SNAPSHOT_SETTING_DIRS:
+            _copy_if_exists(settings / dirname, settings_dest / dirname)
     env_file = previous.get('env_file')
     if env_file and Path(env_file).is_file():
         shutil.copy2(env_file, snap / 'env')
@@ -621,9 +627,10 @@ def _restore_runtime_snapshot(prep: dict) -> bool:
             settings.mkdir(parents=True, exist_ok=True)
             for name in _SNAPSHOT_SETTING_FILES:
                 _copy_if_exists(src_settings / name, settings / name)
-            pipe_src = src_settings / 'pipelines'
-            if pipe_src.exists():
-                _copy_if_exists(pipe_src, settings / 'pipelines')
+            for dirname in _SNAPSHOT_SETTING_DIRS:
+                dir_src = src_settings / dirname
+                if dir_src.exists():
+                    _copy_if_exists(dir_src, settings / dirname)
         env_file = previous.get('env_file')
         env_src = snap / 'env'
         if env_file and env_src.is_file():
@@ -1771,21 +1778,25 @@ def _apply_merged_plan(settings_path, plan, policy_res, snmp_res):
 
     ks_ok = True
     pl_ok = True
+    aborted = bool((policy_res or {}).get('aborted'))
 
-    # Keystore first — pipelines may reference these keys. Single batched
-    # keystore write covers both policy and SNMP keys (pure-Python by default).
-    if ks_has:
-        logger.info(f"Merged keystore apply: {len(ks['set'])} set, {len(ks['delete'])} delete")
-        ks_ok = update_keystore(settings_path, ks)
-        if not ks_ok:
-            logger.error("Merged keystore apply failed")
+    # Do not apply keystore/pipelines after an aborted config rollout.
+    # Restore the runtime snapshot first (existing rollback branch below).
+    if not aborted:
+        # Keystore first — pipelines may reference these keys. Single batched
+        # keystore write covers both policy and SNMP keys (pure-Python by default).
+        if ks_has:
+            logger.info(f"Merged keystore apply: {len(ks['set'])} set, {len(ks['delete'])} delete")
+            ks_ok = update_keystore(settings_path, ks)
+            if not ks_ok:
+                logger.error("Merged keystore apply failed")
 
-    # Pipelines — single pipelines.yml rewrite covering policy + SNMP.
-    if pl_has:
-        logger.info(f"Merged pipeline apply: {len(pl['set'])} set, {len(pl['delete'])} delete")
-        pl_ok = update_pipelines(settings_path, pl)
-        if not pl_ok:
-            logger.error("Merged pipeline apply failed")
+        # Pipelines — single pipelines.yml rewrite covering policy + SNMP.
+        if pl_has:
+            logger.info(f"Merged pipeline apply: {len(pl['set'])} set, {len(pl['delete'])} delete")
+            pl_ok = update_pipelines(settings_path, pl)
+            if not pl_ok:
+                logger.error("Merged pipeline apply failed")
 
     # Restart is required for config-file / keystore-password changes (policy
     # channel) or whenever keystore VALUES were added/updated. Pipeline changes
@@ -1802,10 +1813,10 @@ def _apply_merged_plan(settings_path, plan, policy_res, snmp_res):
     upgrade_rolled_back = False
 
     writes_ok = keystore_apply_ok and ((not pl_has) or pl_ok)
-    if runtime_prep.get('changed') and (not writes_ok or (policy_res or {}).get('aborted')):
+    if runtime_prep.get('changed') and (not writes_ok or aborted):
         rollback_runtime_upgrade(runtime_prep, restart=False)
         upgrade_rolled_back = True
-    elif requires_restart and writes_ok and not (policy_res or {}).get('aborted'):
+    elif requires_restart and writes_ok and not aborted:
         if runtime_prep.get('changed') and not flip_runtime_env(runtime_prep):
             logger.error('Failed to flip LOGSTASH_BINARY — restoring snapshot')
             rollback_runtime_upgrade(runtime_prep, restart=False)
@@ -1823,36 +1834,37 @@ def _apply_merged_plan(settings_path, plan, policy_res, snmp_res):
                 if runtime_prep.get('changed'):
                     finalize_runtime_upgrade(runtime_prep, restart_ok=False)
                     upgrade_rolled_back = True
-    elif pl_has and pl_ok and not ks['set'] and not runtime_prep.get('changed'):
+    elif pl_has and pl_ok and not ks['set'] and not runtime_prep.get('changed') and not aborted:
         logger.info("Pipeline-only changes applied - Logstash restart not required")
 
     # --- Update SNMP hash namespaces (only for parts that applied cleanly) ---
     if snmp_res and snmp_res.get('ran'):
-        if (snmp_res.get('pipeline_set') or snmp_res.get('pipeline_delete_names')) and pl_ok:
-            snmp_pl_state = agent_state.get_state().get('snmp_pipelines', {})
-            for name in snmp_res.get('pipeline_delete_names', []):
-                snmp_pl_state.pop(name, None)
-            for name, phash in (snmp_res.get('pipeline_set') or {}).items():
-                snmp_pl_state[name] = phash
-            agent_state.update_state('snmp_pipelines', snmp_pl_state)
-            logger.info(
-                f"Applied SNMP pipeline changes: {len(snmp_res.get('pipeline_set') or {})} set, "
-                f"{len(snmp_res.get('pipeline_delete_names') or [])} delete"
-            )
-        if (snmp_res.get('keystore_set_names') or snmp_res.get('keystore_delete_names')) \
-                and ks_ok and not snmp_res.get('keystore_skipped'):
-            regular_ks = agent_state.get_state().get('keystore', {})
-            snmp_ks_state = agent_state.get_state().get('snmp_keystore', {})
-            for name in snmp_res.get('keystore_delete_names', []):
-                snmp_ks_state.pop(name, None)
-            for name in snmp_res.get('keystore_set_names', []):
-                if name in regular_ks:
-                    snmp_ks_state[name] = regular_ks[name]
-            agent_state.update_state('snmp_keystore', snmp_ks_state)
-            logger.info(
-                f"Applied SNMP keystore changes: {len(snmp_res.get('keystore_set_names') or [])} set, "
-                f"{len(snmp_res.get('keystore_delete_names') or [])} delete"
-            )
+        if not upgrade_rolled_back and not aborted:
+            if (snmp_res.get('pipeline_set') or snmp_res.get('pipeline_delete_names')) and pl_ok:
+                snmp_pl_state = agent_state.get_state().get('snmp_pipelines', {})
+                for name in snmp_res.get('pipeline_delete_names', []):
+                    snmp_pl_state.pop(name, None)
+                for name, phash in (snmp_res.get('pipeline_set') or {}).items():
+                    snmp_pl_state[name] = phash
+                agent_state.update_state('snmp_pipelines', snmp_pl_state)
+                logger.info(
+                    f"Applied SNMP pipeline changes: {len(snmp_res.get('pipeline_set') or {})} set, "
+                    f"{len(snmp_res.get('pipeline_delete_names') or [])} delete"
+                )
+            if (snmp_res.get('keystore_set_names') or snmp_res.get('keystore_delete_names')) \
+                    and ks_ok and not snmp_res.get('keystore_skipped'):
+                regular_ks = agent_state.get_state().get('keystore', {})
+                snmp_ks_state = agent_state.get_state().get('snmp_keystore', {})
+                for name in snmp_res.get('keystore_delete_names', []):
+                    snmp_ks_state.pop(name, None)
+                for name in snmp_res.get('keystore_set_names', []):
+                    if name in regular_ks:
+                        snmp_ks_state[name] = regular_ks[name]
+                agent_state.update_state('snmp_keystore', snmp_ks_state)
+                logger.info(
+                    f"Applied SNMP keystore changes: {len(snmp_res.get('keystore_set_names') or [])} set, "
+                    f"{len(snmp_res.get('keystore_delete_names') or [])} delete"
+                )
 
         # Record this source's independent apply status (Phase 2). Note:
         # `keystore_skipped` is checked directly because in that case
@@ -1884,7 +1896,6 @@ def _apply_merged_plan(settings_path, plan, policy_res, snmp_res):
         if upgrade_rolled_back:
             policy_failed.append('logstash runtime upgrade rolled back')
 
-        aborted = policy_res.get('aborted', False)
         policy_files_updated = policy_res.get('files_updated', False)
 
         # Bump revision unless the rollout aborted or a policy change failed to

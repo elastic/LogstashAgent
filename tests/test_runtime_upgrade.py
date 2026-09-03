@@ -14,13 +14,16 @@ def _managed_tree(tmp_path: Path) -> dict:
     root = tmp_path / "managed-1"
     settings = root / "config"
     pipes = settings / "pipelines"
+    confd = settings / "conf.d"
     pipes.mkdir(parents=True)
+    confd.mkdir(parents=True)
     (settings / "logstash.yml").write_text("old-yml\n", encoding="utf-8")
     (settings / "jvm.options").write_text("-Xms1g\n", encoding="utf-8")
     (settings / "log4j2.properties").write_text("status=error\n", encoding="utf-8")
     (settings / "pipelines.yml").write_text("[]\n", encoding="utf-8")
     (settings / "logstash.keystore").write_bytes(b"ks")
     (pipes / "main.conf").write_text("input{}\n", encoding="utf-8")
+    (confd / "main.conf").write_text("input{}\n", encoding="utf-8")
     env = root / "env"
     env.write_text("LOGSTASH_BINARY=/old/bin/logstash\n", encoding="utf-8")
     new_bin = tmp_path / "logstash-9.5.0" / "bin" / "logstash"
@@ -62,8 +65,11 @@ def test_prepare_snapshots_then_rollback_restores(tmp_path):
     assert (snap / "meta.json").is_file()
     assert (snap / "env").read_text(encoding="utf-8").startswith("LOGSTASH_BINARY=/old")
     assert (snap / "settings" / "logstash.yml").read_text(encoding="utf-8") == "old-yml\n"
+    assert (snap / "settings" / "conf.d" / "main.conf").read_text(encoding="utf-8") == "input{}\n"
 
     (tree["settings"] / "logstash.yml").write_text("NEW\n", encoding="utf-8")
+    (tree["settings"] / "conf.d" / "main.conf").write_text("NEW-CONF\n", encoding="utf-8")
+    (tree["settings"] / "conf.d" / "extra.conf").write_text("extra\n", encoding="utf-8")
     tree["env"].write_text("LOGSTASH_BINARY=/new\n", encoding="utf-8")
 
     with patch.object(controller, "restart_logstash", return_value=True) as rst:
@@ -71,6 +77,8 @@ def test_prepare_snapshots_then_rollback_restores(tmp_path):
     rst.assert_not_called()
     assert ok is True
     assert (tree["settings"] / "logstash.yml").read_text(encoding="utf-8") == "old-yml\n"
+    assert (tree["settings"] / "conf.d" / "main.conf").read_text(encoding="utf-8") == "input{}\n"
+    assert not (tree["settings"] / "conf.d" / "extra.conf").exists()
     assert "LOGSTASH_BINARY=/old/bin/logstash" in tree["env"].read_text(encoding="utf-8")
     assert not snap.exists()
 
@@ -558,10 +566,14 @@ def test_merged_plan_aborted_does_not_flip_or_restart(tmp_path):
         agent_state, "update_state"
     ) as upd, patch.object(controller, "flip_runtime_env") as flip, patch.object(
         controller, "restart_logstash"
-    ) as rst, patch.object(controller, "rollback_runtime_upgrade", return_value=True) as rb:
+    ) as rst, patch.object(controller, "rollback_runtime_upgrade", return_value=True) as rb, patch.object(
+        controller, "update_keystore"
+    ) as uks, patch.object(controller, "update_pipelines") as upl:
         controller._apply_merged_plan(str(tree["settings"]) + "/", plan, policy_res, None)
     flip.assert_not_called()
     rst.assert_not_called()
+    uks.assert_not_called()
+    upl.assert_not_called()
     rb.assert_called_once()
     assert rb.call_args.kwargs.get("restart", True) is False
     rev_calls = [c for c in upd.call_args_list if c[0] and c[0][0] == "revision_number"]
@@ -579,15 +591,74 @@ def test_merged_plan_aborted_without_runtime_change_does_not_restart(tmp_path):
         "current_revision": 9,
         "runtime_prep": controller._empty_runtime_prep(),
     }
-    plan = {"keystore": {"set": {}, "delete": []}, "pipelines": {"set": {}, "delete": []}}
+    plan = {
+        "keystore": {"set": {"k": "v"}, "delete": []},
+        "pipelines": {"set": {"p": {"lscl": "input{}"}}, "delete": []},
+    }
     with patch.object(agent_state, "get_state", return_value=tree["state"]), patch.object(
         agent_state, "update_state"
     ), patch.object(controller, "flip_runtime_env") as flip, patch.object(
         controller, "restart_logstash"
-    ) as rst:
+    ) as rst, patch.object(controller, "update_keystore") as uks, patch.object(
+        controller, "update_pipelines"
+    ) as upl:
         controller._apply_merged_plan(str(tree["settings"]) + "/", plan, policy_res, None)
     flip.assert_not_called()
     rst.assert_not_called()
+    uks.assert_not_called()
+    upl.assert_not_called()
+
+
+def test_merged_plan_aborted_does_not_apply_keystore_or_pipelines(tmp_path):
+    tree = _managed_tree(tmp_path)
+    prep = {
+        "ok": True,
+        "changed": True,
+        "desired_binary": str(tree["new_bin"]),
+        "snapshot_dir": str(tree["root"] / ".runtime-snapshot"),
+        "previous": {"env_file": str(tree["env"]), "api_port": 9601},
+        "source": "VERSION",
+        "version": "9.5.0",
+    }
+    policy_res = {
+        "ran": True,
+        "files_updated": True,
+        "requires_restart": True,
+        "failed_operations": ["logstash.yml write failed"],
+        "aborted": True,
+        "current_revision": 9,
+        "runtime_prep": prep,
+    }
+    plan = {
+        "keystore": {"set": {"k": "v"}, "delete": []},
+        "pipelines": {"set": {"p": {"lscl": "input{}"}}, "delete": []},
+    }
+    snmp_res = {
+        "ran": True,
+        "pipeline_set": {"p": "hash"},
+        "pipeline_delete_names": [],
+        "keystore_set_names": ["k"],
+        "keystore_delete_names": [],
+        "keystore_skipped": False,
+    }
+    tree["state"]["snmp_pipelines"] = {}
+    tree["state"]["snmp_keystore"] = {}
+    tree["state"]["keystore"] = {"k": "v"}
+    with patch.object(agent_state, "get_state", return_value=tree["state"]), patch.object(
+        agent_state, "update_state"
+    ) as upd, patch.object(controller, "flip_runtime_env") as flip, patch.object(
+        controller, "restart_logstash"
+    ) as rst, patch.object(controller, "rollback_runtime_upgrade", return_value=True) as rb, patch.object(
+        controller, "update_keystore"
+    ) as uks, patch.object(controller, "update_pipelines") as upl:
+        controller._apply_merged_plan(str(tree["settings"]) + "/", plan, policy_res, snmp_res)
+    uks.assert_not_called()
+    upl.assert_not_called()
+    flip.assert_not_called()
+    rst.assert_not_called()
+    rb.assert_called_once()
+    snmp_calls = [c for c in upd.call_args_list if c[0] and c[0][0] in ("snmp_pipelines", "snmp_keystore")]
+    assert snmp_calls == []
 
 
 def test_system_to_version_uses_prepare_path(tmp_path):
