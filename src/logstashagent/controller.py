@@ -1790,20 +1790,40 @@ def _apply_merged_plan(settings_path, plan, policy_res, snmp_res):
     # Restart is required for config-file / keystore-password changes (policy
     # channel) or whenever keystore VALUES were added/updated. Pipeline changes
     # and pure keystore deletes reload dynamically — no restart.
+    runtime_prep = (policy_res or {}).get('runtime_prep') or _empty_runtime_prep()
     requires_restart = bool(ks['set'])
     if policy_res:
         requires_restart = requires_restart or policy_res.get('requires_restart', False)
+    if runtime_prep.get('changed'):
+        requires_restart = True
 
     keystore_apply_ok = (not ks_has) or ks_ok
     restart_failed = False
-    if requires_restart and keystore_apply_ok:
-        logger.info("Applying merged changes — restarting Logstash once...")
-        if restart_logstash():
-            logger.info("Logstash restart completed successfully")
+    upgrade_rolled_back = False
+
+    writes_ok = keystore_apply_ok and ((not pl_has) or pl_ok)
+    if runtime_prep.get('changed') and (not writes_ok or (policy_res or {}).get('aborted')):
+        rollback_runtime_upgrade(runtime_prep, restart=False)
+        upgrade_rolled_back = True
+    elif requires_restart and writes_ok:
+        if runtime_prep.get('changed') and not flip_runtime_env(runtime_prep):
+            logger.error('Failed to flip LOGSTASH_BINARY — restoring snapshot')
+            rollback_runtime_upgrade(runtime_prep, restart=False)
+            upgrade_rolled_back = True
         else:
-            logger.error("Logstash restart failed - manual intervention may be required")
-            restart_failed = True
-    elif pl_has and pl_ok and not ks['set']:
+            logger.info("Applying merged changes — restarting Logstash once...")
+            if restart_logstash():
+                logger.info("Logstash restart completed successfully")
+                if runtime_prep.get('changed'):
+                    if not finalize_runtime_upgrade(runtime_prep, restart_ok=True):
+                        upgrade_rolled_back = True
+            else:
+                logger.error("Logstash restart failed - manual intervention may be required")
+                restart_failed = True
+                if runtime_prep.get('changed'):
+                    finalize_runtime_upgrade(runtime_prep, restart_ok=False)
+                    upgrade_rolled_back = True
+    elif pl_has and pl_ok and not ks['set'] and not runtime_prep.get('changed'):
         logger.info("Pipeline-only changes applied - Logstash restart not required")
 
     # --- Update SNMP hash namespaces (only for parts that applied cleanly) ---
@@ -1861,6 +1881,8 @@ def _apply_merged_plan(settings_path, plan, policy_res, snmp_res):
             policy_failed.append('pipelines update failed')
         if restart_failed:
             policy_failed.append('logstash restart failed')
+        if upgrade_rolled_back:
+            policy_failed.append('logstash runtime upgrade rolled back')
 
         aborted = policy_res.get('aborted', False)
         policy_files_updated = policy_res.get('files_updated', False)
@@ -2236,21 +2258,28 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
             if rollout_aborted:
                 logger.error(f"Rollout aborted due to failures: {failed_operations}")
             elif files_updated:
-                # All updates succeeded — restart if needed and increment revision
                 if requires_restart:
                     if files_existed:
-                        logger.info("Configuration files updated, restarting Logstash service...")
-                        if restart_logstash():
-                            logger.info("Logstash restart completed successfully")
-                        else:
-                            logger.error("Logstash restart failed - manual intervention may be required")
-                            failed_operations.append('logstash restart failed')
+                        flipped = True
+                        if runtime_prep.get('changed'):
+                            flipped = flip_runtime_env(runtime_prep)
+                            if not flipped:
+                                rollback_runtime_upgrade(runtime_prep, restart=False)
+                                failed_operations.append('logstash runtime upgrade rolled back')
+                        if flipped:
+                            logger.info("Configuration files updated, restarting Logstash service...")
+                            restart_ok = restart_logstash()
+                            if not restart_ok:
+                                logger.error("Logstash restart failed - manual intervention may be required")
+                                failed_operations.append('logstash restart failed')
+                            if runtime_prep.get('changed'):
+                                if not finalize_runtime_upgrade(runtime_prep, restart_ok=restart_ok):
+                                    failed_operations.append('logstash runtime upgrade rolled back')
                     else:
                         logger.info("Configuration files created - Logstash restart skipped (files didn't exist previously)")
                 else:
                     logger.info("Pipeline-only changes applied - Logstash restart not required")
 
-                # Update agent's revision number to match server after successful changes
                 if not failed_operations:
                     server_revision = result.get('current_revision')
                     if server_revision is not None:

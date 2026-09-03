@@ -419,3 +419,155 @@ def test_prepare_failure_does_not_write_yml(tmp_path):
     rst.assert_not_called()
     rev_calls = [c for c in upd.call_args_list if c[0] and c[0][0] == "revision_number"]
     assert rev_calls == []
+
+
+def test_merged_plan_flips_env_then_finalizes_commit(tmp_path):
+    tree = _managed_tree(tmp_path)
+    prep = {
+        "ok": True,
+        "changed": True,
+        "desired_binary": str(tree["new_bin"]),
+        "snapshot_dir": str(tree["root"] / ".runtime-snapshot"),
+        "previous": {
+            "env_file": str(tree["env"]),
+            "api_port": 9601,
+            "settings_path": str(tree["settings"]) + "/",
+        },
+        "source": "VERSION",
+        "version": "9.5.0",
+        "download_dir": str(tmp_path),
+    }
+    policy_res = {
+        "ran": True,
+        "files_updated": True,
+        "requires_restart": True,
+        "failed_operations": [],
+        "aborted": False,
+        "current_revision": 9,
+        "runtime_prep": prep,
+    }
+    plan = {"keystore": {"set": {}, "delete": []}, "pipelines": {"set": {}, "delete": []}}
+    order = []
+
+    def flip(p):
+        order.append("flip")
+        return True
+
+    def rst():
+        order.append("restart")
+        return True
+
+    def fin(p, restart_ok):
+        order.append("final")
+        assert restart_ok is True
+        return True
+
+    with patch.object(agent_state, "get_state", return_value=tree["state"]), patch.object(
+        agent_state, "update_state"
+    ), patch.object(controller, "flip_runtime_env", side_effect=flip), patch.object(
+        controller, "restart_logstash", side_effect=rst
+    ), patch.object(controller, "finalize_runtime_upgrade", side_effect=fin):
+        controller._apply_merged_plan(str(tree["settings"]) + "/", plan, policy_res, None)
+    assert order == ["flip", "restart", "final"]
+
+
+def test_merged_plan_unhealthy_does_not_bump_revision(tmp_path):
+    tree = _managed_tree(tmp_path)
+    prep = {
+        "ok": True,
+        "changed": True,
+        "desired_binary": str(tree["new_bin"]),
+        "snapshot_dir": str(tree["root"] / ".runtime-snapshot"),
+        "previous": {"env_file": str(tree["env"]), "api_port": 9601},
+        "source": "VERSION",
+        "version": "9.5.0",
+    }
+    policy_res = {
+        "ran": True,
+        "files_updated": True,
+        "requires_restart": True,
+        "failed_operations": [],
+        "aborted": False,
+        "current_revision": 9,
+        "runtime_prep": prep,
+    }
+    plan = {"keystore": {"set": {}, "delete": []}, "pipelines": {"set": {}, "delete": []}}
+    with patch.object(agent_state, "get_state", return_value=tree["state"]), patch.object(
+        agent_state, "update_state"
+    ) as upd, patch.object(controller, "flip_runtime_env", return_value=True), patch.object(
+        controller, "restart_logstash", return_value=True
+    ), patch.object(controller, "finalize_runtime_upgrade", return_value=False):
+        controller._apply_merged_plan(str(tree["settings"]) + "/", plan, policy_res, None)
+    rev_calls = [c for c in upd.call_args_list if c[0] and c[0][0] == "revision_number"]
+    assert rev_calls == []
+    last = [c[0][1] for c in upd.call_args_list if c[0] and c[0][0] == "last_policy_apply"]
+    assert last and last[-1]["success"] is False
+    assert "logstash runtime upgrade rolled back" in last[-1]["failed_operations"]
+
+
+def test_pipeline_only_skips_finalize(tmp_path):
+    tree = _managed_tree(tmp_path)
+    policy_res = {
+        "ran": True,
+        "files_updated": True,
+        "requires_restart": False,
+        "failed_operations": [],
+        "aborted": False,
+        "current_revision": 4,
+        "runtime_prep": controller._empty_runtime_prep(),
+    }
+    plan = {
+        "keystore": {"set": {}, "delete": []},
+        "pipelines": {"set": {"p": "conf"}, "delete": []},
+    }
+    with patch.object(agent_state, "get_state", return_value=tree["state"]), patch.object(
+        agent_state, "update_state"
+    ), patch.object(controller, "update_pipelines", return_value=True), patch.object(
+        controller, "flip_runtime_env"
+    ) as flip, patch.object(controller, "finalize_runtime_upgrade") as fin, patch.object(
+        controller, "restart_logstash"
+    ) as rst:
+        controller._apply_merged_plan(str(tree["settings"]) + "/", plan, policy_res, None)
+    flip.assert_not_called()
+    fin.assert_not_called()
+    rst.assert_not_called()
+
+
+def test_system_to_version_uses_prepare_path(tmp_path):
+    tree = _managed_tree(tmp_path)
+    tree["state"]["logstash_source"] = "SYSTEM"
+    tree["state"]["logstash_version"] = ""
+    tree["state"]["logstash_binary"] = "/usr/share/logstash/bin/logstash"
+    runtime = {
+        "source": "VERSION",
+        "version": "9.5.0",
+        "download_dir": str(tmp_path / "versions"),
+        "binary_path": "/usr/share/logstash/bin",
+    }
+    with patch.object(agent_state, "get_state", return_value=tree["state"]), patch(
+        "logstashagent.logstash_download.resolve_binary_from_policy",
+        return_value=str(tree["new_bin"]),
+    ) as resolve, patch("logstashagent.install_registry.register_logstash_version", return_value={}):
+        prep = controller.prepare_runtime_upgrade(runtime)
+    assert prep["changed"] is True
+    resolve.assert_called_once()
+    assert resolve.call_args.kwargs["logstash_source"] == "VERSION"
+    # Leftover snapshot would block the second prepare (helpers refuse overwrite).
+    controller.rollback_runtime_upgrade(prep, restart=False)
+
+    runtime_sys = {
+        "source": "SYSTEM",
+        "version": "",
+        "download_dir": str(tmp_path / "versions"),
+        "binary_path": "/usr/share/logstash/bin",
+    }
+    sys_bin = tmp_path / "usr" / "share" / "logstash" / "bin" / "logstash"
+    sys_bin.parent.mkdir(parents=True)
+    sys_bin.write_text("x", encoding="utf-8")
+    with patch.object(agent_state, "get_state", return_value=tree["state"]), patch(
+        "logstashagent.logstash_download.resolve_binary_from_policy",
+        return_value=str(sys_bin),
+    ) as resolve2:
+        prep2 = controller.prepare_runtime_upgrade(runtime_sys)
+    assert prep2["changed"] is True
+    assert resolve2.call_args.kwargs["logstash_source"] == "SYSTEM"
