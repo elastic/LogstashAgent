@@ -2690,6 +2690,8 @@ def check_in():
         if not all([logstash_ui_url, api_key, connection_id]):
             logger.error("Missing required enrollment data. Please re-enroll the agent.")
             return None
+
+        recover_incomplete_runtime_upgrade()
         
         # Get paths from state
         settings_path = state.get('settings_path', '')
@@ -3138,6 +3140,7 @@ def run_controller():
     if state.get('logstash_unit'):
         logger.info(f"Logstash unit: {state.get('logstash_unit')}")
     logger.info("=" * 60)
+    recover_incomplete_runtime_upgrade()
     logger.info("Starting check-in loop (every 60 seconds)")
     logger.info("Press Ctrl+C to stop")
     logger.info("=" * 60)

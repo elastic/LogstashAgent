@@ -628,3 +628,27 @@ def test_system_to_version_uses_prepare_path(tmp_path):
         prep2 = controller.prepare_runtime_upgrade(runtime_sys)
     assert prep2["changed"] is True
     assert resolve2.call_args.kwargs["logstash_source"] == "SYSTEM"
+
+
+def test_check_in_recovers_before_work(tmp_path):
+    tree = _managed_tree(tmp_path)
+    tree["state"].update({
+        "enrolled": True,
+        "logstash_ui_url": "http://localhost:8000",
+        "api_key": "k",
+        "connection_id": "c",
+        "settings_path": str(tree["settings"]) + "/",
+        "logs_path": str(tmp_path / "logs") + "/",
+        "binary_path": str(tmp_path / "bin"),
+    })
+    rec = MagicMock()
+    with patch.object(agent_state, "get_state", return_value=tree["state"]), patch.object(
+        controller, "recover_incomplete_runtime_upgrade", rec
+    ), patch.object(
+        controller.requests, "post", side_effect=RuntimeError("stop-after-recover")
+    ):
+        try:
+            controller.check_in()
+        except RuntimeError:
+            pass
+    rec.assert_called()
