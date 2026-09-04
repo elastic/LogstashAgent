@@ -4072,7 +4072,11 @@ if __name__ == "__main__":
             if ssl_kw:
                 logger.info("%s FastAPI serving HTTPS (product-CA cert)", agent_mode.capitalize())
             else:
-                logger.warning("%s FastAPI serving HTTP (no agent server cert yet)", agent_mode.capitalize())
+                logger.warning(
+                    "%s FastAPI serving HTTP (LOGSTASH_AGENT_TLS off, UI not https, "
+                    "or product CA not pinned)",
+                    agent_mode.capitalize(),
+                )
             uvicorn.run(app, host="0.0.0.0", port=int(agent_port), **ssl_kw)
             sys.exit(0)
 
@@ -4112,8 +4116,8 @@ if __name__ == "__main__":
         logger.info("Agent FastAPI serving HTTPS on %s:%s (product-CA cert)", host, port)
     else:
         logger.warning(
-            "Agent FastAPI serving HTTP on %s:%s — set LOGSTASH_UI_URL + "
-            "LOGSTASHUI_AGENT_CSR_SECRET or enroll to obtain a server cert",
+            "Agent FastAPI serving HTTP on %s:%s — LOGSTASH_AGENT_TLS off, "
+            "UI URL not https, or product CA not pinned",
             host,
             port,
         )
