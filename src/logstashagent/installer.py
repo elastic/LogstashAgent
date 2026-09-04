@@ -690,68 +690,44 @@ def installed_agent_version() -> str | None:
     return None
 
 
-def install_binary():
-    """
-    Copy the current executable to /opt/logstash-agent/bin/logstash-agent
-    For PyInstaller bundles, also copies the _internal directory with dependencies
-    """
-    logger.info("Installing binary...")
+def source_agent_version() -> str:
+    """Version of the running package being installed."""
+    try:
+        from importlib.metadata import PackageNotFoundError, version
 
-    # Check if we're running as a PyInstaller bundle
-    if getattr(sys, 'frozen', False):
-        # Running as PyInstaller bundle
-        source_binary = sys.executable
-        source_dir = os.path.dirname(source_binary)
+        return version("LogstashAgent")
+    except PackageNotFoundError:
+        return "0.0.0+unknown"
 
-        # Copy the main executable
-        shutil.copy2(source_binary, INSTALL_PATHS['binary'])
-        os.chmod(INSTALL_PATHS['binary'], 0o755)
-        logger.info(f"✓ Installed binary to {INSTALL_PATHS['binary']}")
 
-        # Check for _internal directory (PyInstaller dependencies)
-        internal_source = os.path.join(source_dir, '_internal')
-        if os.path.exists(internal_source):
-            internal_dest = os.path.join(INSTALL_PATHS['binary_dir'], '_internal')
-
-            # Remove existing _internal if it exists
-            if os.path.exists(internal_dest):
-                shutil.rmtree(internal_dest)
-
-            # Copy the entire _internal directory
-            shutil.copytree(internal_source, internal_dest)
-            logger.info(f"✓ Installed PyInstaller dependencies to {internal_dest}")
-
-            # Set SELinux context for _internal directory on RHEL/CentOS
+def _install_binary_atomic(src: str, dest: str) -> None:
+    """Copy src to dest via ``{dest}.new`` + rename (never copy2 onto dest)."""
+    temp_binary = f"{dest}.new"
+    try:
+        shutil.copy2(src, temp_binary)
+        os.chmod(temp_binary, 0o755)
+        os.rename(temp_binary, dest)
+    except OSError:
+        if os.path.exists(temp_binary):
             try:
-                result = subprocess.run(
-                    ['which', 'restorecon'],
-                    capture_output=True,
-                    check=False
-                )
-                if result.returncode == 0:
-                    subprocess.run(
-                        ['restorecon', '-Rv', internal_dest],
-                        check=False,
-                        capture_output=True
-                    )
-                    logger.debug(f"Set SELinux context for {internal_dest}")
-            except Exception as e:
-                logger.error(f"Failed to set SELinux context for {internal_dest}: {e}")
-        else:
-            logger.warning("_internal directory not found - this may be a onefile build")
-    else:
-        # Running as Python script - this shouldn't happen in production
-        # but we'll handle it for testing
-        logger.warning("Running from Python script, not a compiled binary")
-        logger.warning("In production, this should be a PyInstaller executable")
-        source_binary = sys.executable
+                os.remove(temp_binary)
+            except OSError:
+                pass
+        raise
 
-        # Copy the binary
-        shutil.copy2(source_binary, INSTALL_PATHS['binary'])
-        os.chmod(INSTALL_PATHS['binary'], 0o755)
-        logger.info(f"✓ Installed binary to {INSTALL_PATHS['binary']}")
 
-    # Set SELinux context for RHEL/CentOS systems
+def _install_pyinstaller_internal(source_binary: str) -> None:
+    """Copy PyInstaller ``_internal`` next to dest when present."""
+    source_dir = os.path.dirname(source_binary)
+    internal_source = os.path.join(source_dir, '_internal')
+    if not os.path.exists(internal_source):
+        logger.warning("_internal directory not found - this may be a onefile build")
+        return
+    internal_dest = os.path.join(INSTALL_PATHS['binary_dir'], '_internal')
+    if os.path.exists(internal_dest):
+        shutil.rmtree(internal_dest)
+    shutil.copytree(internal_source, internal_dest)
+    logger.info(f"✓ Installed PyInstaller dependencies to {internal_dest}")
     try:
         result = subprocess.run(
             ['which', 'restorecon'],
@@ -760,13 +736,96 @@ def install_binary():
         )
         if result.returncode == 0:
             subprocess.run(
-                ['restorecon', '-v', INSTALL_PATHS['binary']],
+                ['restorecon', '-Rv', internal_dest],
                 check=False,
                 capture_output=True,
             )
-            logger.info(f"✓ Set SELinux context for {INSTALL_PATHS['binary']}")
+            logger.debug(f"Set SELinux context for {internal_dest}")
+    except Exception as e:
+        logger.error(f"Failed to set SELinux context for {internal_dest}: {e}")
+
+
+def _restorecon_binary(dest: str) -> None:
+    """Best-effort SELinux restorecon on the installed binary."""
+    try:
+        result = subprocess.run(
+            ['which', 'restorecon'],
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            subprocess.run(
+                ['restorecon', '-v', dest],
+                check=False,
+                capture_output=True,
+            )
+            logger.info(f"✓ Set SELinux context for {dest}")
     except Exception as e:
         logger.debug(f"SELinux context setting skipped: {e}")
+
+
+def install_binary():
+    """
+    Copy the current executable to /opt/logstash-agent/bin/logstash-agent
+    For PyInstaller bundles, also copies the _internal directory with dependencies
+    """
+    logger.info("Installing binary...")
+
+    frozen = getattr(sys, 'frozen', False)
+    source_binary = sys.executable
+    if not frozen:
+        logger.warning("Running from Python script, not a compiled binary")
+        logger.warning("In production, this should be a PyInstaller executable")
+
+    dest = INSTALL_PATHS['binary']
+
+    if os.path.exists(dest):
+        try:
+            same = os.path.samefile(source_binary, dest)
+        except OSError:
+            same = False
+        if same:
+            logger.info(
+                "Source and destination are the same file (%s); skipping binary copy",
+                dest,
+            )
+            return
+
+        installed = installed_agent_version()
+        if not installed:
+            raise InstallError(
+                f"Cannot determine installed agent version at {dest}; "
+                "refusing to overwrite unknown binary"
+            )
+        src_ver = source_agent_version()
+        cmp = compare_agent_versions(installed, src_ver)
+        if cmp == 0:
+            logger.info(
+                "Installed agent version %s matches source; skipping binary copy",
+                installed,
+            )
+            return
+        if cmp > 0:
+            logger.warning(
+                "Installed agent version %s is newer than source %s; "
+                "skipping binary copy (will not downgrade)",
+                installed,
+                src_ver,
+            )
+            return
+        logger.info(
+            "Installed agent version %s is older than source %s; "
+            "leaving existing binary in place",
+            installed,
+            src_ver,
+        )
+        return
+
+    _install_binary_atomic(source_binary, dest)
+    logger.info(f"✓ Installed binary to {dest}")
+    if frozen:
+        _install_pyinstaller_internal(source_binary)
+    _restorecon_binary(dest)
 
 
 def create_symlink():

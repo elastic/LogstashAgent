@@ -3,7 +3,11 @@
 #you may not use this file except in compliance with the Elastic License.
 
 import logging
+import os
+import sys
 from unittest.mock import MagicMock
+
+import pytest
 
 from logstashagent import installer
 from logstashagent.main import parse_arguments, AGENT_VERSION, _is_lightweight_cli
@@ -155,3 +159,136 @@ def test_installed_agent_version_probe_timeout_logs_and_returns_none(
     with caplog.at_level(logging.WARNING):
         assert installer.installed_agent_version() is None
     assert str(dest) in caplog.text
+
+
+def _prepare_install_binary(
+    tmp_path,
+    monkeypatch,
+    *,
+    dest_bytes=b"DEST-BIN",
+    src_bytes=b"SRC-BIN",
+    frozen=True,
+    create_dest=True,
+    create_internal=False,
+    same_file=False,
+):
+    """Point INSTALL_PATHS binary/binary_dir at tmp; set sys.executable/frozen."""
+    binary_dir = tmp_path / "bin"
+    binary_dir.mkdir()
+    dest = binary_dir / "logstash-agent"
+    if create_dest:
+        dest.write_bytes(dest_bytes)
+        dest.chmod(0o755)
+        os.utime(dest, (1_000_000, 1_000_000))
+    if same_file:
+        src = dest
+    else:
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+        src = src_dir / "logstash-agent"
+        src.write_bytes(src_bytes)
+        src.chmod(0o755)
+    monkeypatch.setitem(installer.INSTALL_PATHS, "binary_dir", str(binary_dir))
+    monkeypatch.setitem(installer.INSTALL_PATHS, "binary", str(dest))
+    monkeypatch.setattr(sys, "executable", str(src))
+    monkeypatch.setattr(sys, "frozen", frozen, raising=False)
+    internal = None
+    if create_internal:
+        internal = binary_dir / "_internal"
+        internal.mkdir()
+        (internal / "marker").write_text("keep")
+    return dest, src, binary_dir, internal
+
+
+def test_install_binary_same_file_skips_copy(tmp_path, monkeypatch):
+    dest, _src, _binary_dir, internal = _prepare_install_binary(
+        tmp_path, monkeypatch, same_file=True, create_internal=True
+    )
+    before = dest.read_bytes()
+    mtime_ns = dest.stat().st_mtime_ns
+
+    installer.install_binary()
+
+    assert dest.read_bytes() == before
+    assert dest.stat().st_mtime_ns == mtime_ns
+    assert (internal / "marker").read_text() == "keep"
+
+
+def test_install_binary_same_version_skips_copy_and_internal(tmp_path, monkeypatch):
+    dest, _src, _binary_dir, internal = _prepare_install_binary(
+        tmp_path, monkeypatch, create_internal=True
+    )
+    monkeypatch.setattr(installer, "installed_agent_version", lambda: "0.5.2")
+    monkeypatch.setattr(installer, "source_agent_version", lambda: "0.5.2")
+    before = dest.read_bytes()
+    mtime_ns = dest.stat().st_mtime_ns
+
+    installer.install_binary()
+
+    assert dest.read_bytes() == before
+    assert dest.stat().st_mtime_ns == mtime_ns
+    assert (internal / "marker").read_text() == "keep"
+
+
+def test_install_binary_unknown_version_raises_and_leaves_dest(tmp_path, monkeypatch):
+    dest, _src, _binary_dir, _internal = _prepare_install_binary(tmp_path, monkeypatch)
+    monkeypatch.setattr(installer, "installed_agent_version", lambda: None)
+    before = dest.read_bytes()
+    mtime_ns = dest.stat().st_mtime_ns
+
+    with pytest.raises(installer.InstallError, match="version"):
+        installer.install_binary()
+
+    assert dest.read_bytes() == before
+    assert dest.stat().st_mtime_ns == mtime_ns
+
+
+def test_install_binary_dest_newer_skips(tmp_path, monkeypatch, caplog):
+    dest, _src, _binary_dir, _internal = _prepare_install_binary(tmp_path, monkeypatch)
+    monkeypatch.setattr(installer, "installed_agent_version", lambda: "0.9.0")
+    monkeypatch.setattr(installer, "source_agent_version", lambda: "0.5.2")
+    before = dest.read_bytes()
+    mtime_ns = dest.stat().st_mtime_ns
+
+    with caplog.at_level(logging.WARNING):
+        installer.install_binary()
+
+    assert dest.read_bytes() == before
+    assert dest.stat().st_mtime_ns == mtime_ns
+    assert "0.9.0" in caplog.text
+
+
+def test_install_binary_dest_older_leaves_dest_unchanged(tmp_path, monkeypatch):
+    dest, _src, _binary_dir, _internal = _prepare_install_binary(tmp_path, monkeypatch)
+    monkeypatch.setattr(installer, "installed_agent_version", lambda: "0.4.0")
+    monkeypatch.setattr(installer, "source_agent_version", lambda: "0.5.2")
+    before = dest.read_bytes()
+    mtime_ns = dest.stat().st_mtime_ns
+
+    installer.install_binary()
+
+    assert dest.read_bytes() == before
+    assert dest.stat().st_mtime_ns == mtime_ns
+
+
+def test_install_binary_missing_dest_atomic_install(tmp_path, monkeypatch):
+    dest, src, _binary_dir, _internal = _prepare_install_binary(
+        tmp_path, monkeypatch, create_dest=False, frozen=False
+    )
+    copy_dests = []
+    real_copy2 = installer.shutil.copy2
+
+    def spy_copy2(src_path, dst_path, *args, **kwargs):
+        copy_dests.append(os.path.abspath(str(dst_path)))
+        return real_copy2(src_path, dst_path, *args, **kwargs)
+
+    monkeypatch.setattr(installer.shutil, "copy2", spy_copy2)
+
+    installer.install_binary()
+
+    assert dest.is_file()
+    assert dest.read_bytes() == src.read_bytes()
+    assert not os.path.exists(f"{dest}.new")
+    dest_abs = os.path.abspath(str(dest))
+    assert dest_abs not in copy_dests
+    assert os.access(dest, os.X_OK)
