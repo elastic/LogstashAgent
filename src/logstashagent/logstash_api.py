@@ -68,6 +68,28 @@ def resolve_logstash_api_port(*, yml_port=None, mode=None) -> int:
     return LOGSTASH_API_PORT
 
 
+def _state_port_equals(value, port: int) -> bool:
+    try:
+        return int(value) == port
+    except (TypeError, ValueError):
+        return False
+
+
+def persist_resolved_logstash_api_port(*, yml_port=None, mode=None) -> int:
+    """Write resolved Logstash API port into state. Never writes agent.env."""
+    port = resolve_logstash_api_port(yml_port=yml_port, mode=mode)
+    from logstashagent import agent_state
+
+    st = agent_state.get_state() or {}
+    if _state_port_equals(st.get("logstash_api_port"), port) and _state_port_equals(
+        st.get("api_port"), port
+    ):
+        return port
+    agent_state.update_state("logstash_api_port", port)
+    agent_state.update_state("api_port", port)
+    return port
+
+
 def default_logstash_api_base_url() -> str:
     return f"http://{LOGSTASH_API_HOST}:{resolve_logstash_api_port()}"
 

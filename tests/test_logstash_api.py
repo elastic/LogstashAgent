@@ -592,3 +592,51 @@ class TestResolveLogstashApiPort:
             assert resolve_logstash_api_port(yml_port=9650, mode="packaged") == 9650
         finally:
             agent_state.configure_state_dir(None)
+
+
+class TestPersistResolvedLogstashApiPort:
+    def test_writes_both_keys_when_they_differ(self, monkeypatch, tmp_path):
+        from logstashagent import agent_state
+        from logstashagent.logstash_api import persist_resolved_logstash_api_port
+
+        monkeypatch.setenv("LOGSTASH_API_PORT", "9561")
+        agent_state.configure_state_dir(tmp_path)
+        try:
+            agent_state.update_state("logstash_api_port", 9600)
+            agent_state.update_state("api_port", 9600)
+            assert persist_resolved_logstash_api_port() == 9561
+            st = agent_state.get_state()
+            assert st["logstash_api_port"] == 9561
+            assert st["api_port"] == 9561
+        finally:
+            agent_state.configure_state_dir(None)
+
+    def test_skips_write_when_both_keys_match(self, monkeypatch, tmp_path):
+        from logstashagent import agent_state
+        from logstashagent.logstash_api import persist_resolved_logstash_api_port
+
+        monkeypatch.setenv("LOGSTASH_API_PORT", "9561")
+        agent_state.configure_state_dir(tmp_path)
+        try:
+            agent_state.update_state("logstash_api_port", 9561)
+            agent_state.update_state("api_port", 9561)
+            with patch.object(agent_state, "update_state") as upd:
+                assert persist_resolved_logstash_api_port() == 9561
+            upd.assert_not_called()
+        finally:
+            agent_state.configure_state_dir(None)
+
+    def test_string_state_counts_as_match(self, monkeypatch, tmp_path):
+        from logstashagent import agent_state
+        from logstashagent.logstash_api import persist_resolved_logstash_api_port
+
+        monkeypatch.setenv("LOGSTASH_API_PORT", "9561")
+        agent_state.configure_state_dir(tmp_path)
+        try:
+            agent_state.update_state("logstash_api_port", "9561")
+            agent_state.update_state("api_port", "9561")
+            with patch.object(agent_state, "update_state") as upd:
+                assert persist_resolved_logstash_api_port() == 9561
+            upd.assert_not_called()
+        finally:
+            agent_state.configure_state_dir(None)
