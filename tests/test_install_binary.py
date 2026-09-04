@@ -2,6 +2,9 @@
 #or more contributor license agreements. Licensed under the Elastic License;
 #you may not use this file except in compliance with the Elastic License.
 
+import logging
+from unittest.mock import MagicMock
+
 from logstashagent import installer
 from logstashagent.main import parse_arguments, AGENT_VERSION, _is_lightweight_cli
 
@@ -81,3 +84,74 @@ def test_installed_agent_version_none_when_missing_or_probe_fails(tmp_path, monk
     dest.chmod(0o755)
     monkeypatch.setitem(installer.INSTALL_PATHS, "binary", str(dest))
     assert installer.installed_agent_version() is None
+
+
+def test_installed_agent_version_probe_uses_host_subprocess_env(tmp_path, monkeypatch):
+    dest = tmp_path / "logstash-agent"
+    dest.write_text("#!/bin/sh\necho 0.5.2\n")
+    dest.chmod(0o755)
+    _isolate_install_paths(tmp_path, monkeypatch, binary=dest)
+    monkeypatch.setattr(
+        "logstashagent.install_registry.load_registry",
+        lambda state_dir=None: {"package": None, "instances": {}},
+    )
+    expected_env = {"PATH": "/usr/bin", "SENTINEL": "1"}
+    monkeypatch.setattr(installer, "host_subprocess_env", lambda: expected_env)
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return MagicMock(returncode=0, stdout="0.5.2\n", stderr="")
+
+    monkeypatch.setattr(installer.subprocess, "run", fake_run)
+    assert installer.installed_agent_version() == "0.5.2"
+    assert captured["cmd"] == [str(dest), "--version"]
+    assert captured["kwargs"]["env"] == expected_env
+    assert captured["kwargs"]["timeout"] == 10
+    assert captured["kwargs"]["capture_output"] is True
+    assert captured["kwargs"]["text"] is True
+    assert captured["kwargs"].get("check") is False
+    assert captured["kwargs"].get("stdin") is installer.subprocess.DEVNULL
+
+
+def test_installed_agent_version_probe_oserror_logs_and_returns_none(
+    tmp_path, monkeypatch, caplog
+):
+    dest = tmp_path / "logstash-agent"
+    dest.write_text("#!/bin/sh\necho 0.5.2\n")
+    dest.chmod(0o755)
+    _isolate_install_paths(tmp_path, monkeypatch, binary=dest)
+    monkeypatch.setattr(
+        "logstashagent.install_registry.load_registry",
+        lambda state_dir=None: {"package": None, "instances": {}},
+    )
+
+    def boom(*args, **kwargs):
+        raise OSError("exec format error")
+
+    monkeypatch.setattr(installer.subprocess, "run", boom)
+    with caplog.at_level(logging.WARNING):
+        assert installer.installed_agent_version() is None
+    assert str(dest) in caplog.text
+
+
+def test_installed_agent_version_probe_timeout_logs_and_returns_none(
+    tmp_path, monkeypatch, caplog
+):
+    dest = tmp_path / "logstash-agent"
+    dest.write_text("#!/bin/sh\necho 0.5.2\n")
+    dest.chmod(0o755)
+    _isolate_install_paths(tmp_path, monkeypatch, binary=dest)
+    monkeypatch.setattr(
+        "logstashagent.install_registry.load_registry",
+        lambda state_dir=None: {"package": None, "instances": {}},
+    )
+
+    def boom(*args, **kwargs):
+        raise installer.subprocess.TimeoutExpired(cmd=[str(dest), "--version"], timeout=10)
+
+    monkeypatch.setattr(installer.subprocess, "run", boom)
+    with caplog.at_level(logging.WARNING):
+        assert installer.installed_agent_version() is None
+    assert str(dest) in caplog.text

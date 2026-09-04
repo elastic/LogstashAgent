@@ -652,6 +652,7 @@ def compare_agent_versions(a: str, b: str) -> int:
 
 def installed_agent_version() -> str | None:
     """Installed agent version from registry, else dest ``--version`` stdout."""
+    dest = INSTALL_PATHS.get('binary')
     try:
         from logstashagent import install_registry as _reg
 
@@ -660,10 +661,13 @@ def installed_agent_version() -> str | None:
             ver = str(pkg.get('agent_version') or '').strip()
             if ver:
                 return ver
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(
+            "Could not read install registry for agent version (dest=%s): %s",
+            dest,
+            e,
+        )
 
-    dest = INSTALL_PATHS.get('binary')
     if not dest or not os.path.exists(dest) or not os.path.isfile(dest):
         return None
     try:
@@ -672,12 +676,16 @@ def installed_agent_version() -> str | None:
             timeout=10,
             capture_output=True,
             text=True,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            env=host_subprocess_env(),
         )
         for token in (result.stdout or '').split():
             m = _VERSION_TOKEN_RE.match(token)
             if m:
                 return m.group(1)
-    except Exception:
+    except (subprocess.TimeoutExpired, OSError) as e:
+        logger.warning("Could not probe dest --version %s: %s", dest, e)
         return None
     return None
 
