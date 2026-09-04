@@ -28,6 +28,17 @@ def reset_shared_http_client():
     logstash_api._shared_client = None
 
 
+@pytest.fixture(autouse=True)
+def isolate_logstash_api_port(tmp_path, monkeypatch):
+    """Keep resolve_logstash_api_port off leftover process state/env."""
+    from logstashagent import agent_state
+
+    monkeypatch.delenv("LOGSTASH_API_PORT", raising=False)
+    agent_state.configure_state_dir(tmp_path / "isolate-state")
+    yield
+    agent_state.configure_state_dir(None)
+
+
 @pytest.fixture
 def mock_http():
     """Patch only ``httpx.Client`` so ``httpx.HTTPError`` in except clauses stays real."""
@@ -38,7 +49,11 @@ def mock_http():
 
 @pytest.fixture
 def api(mock_http):
-    return LogstashAPI(use_shared_client=False, timeout=5.0)
+    return LogstashAPI(
+        use_shared_client=False,
+        timeout=5.0,
+        base_url="http://localhost:9560",
+    )
 
 
 def _ok_json(data):
