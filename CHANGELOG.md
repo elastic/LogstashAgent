@@ -10,6 +10,7 @@ Package version is **0.5.2**. Works with **LogstashUI 0.5.1 & 0.5.2**.
 - Via-UI downloads resume: bytes land in `<download_dir>/.partial/<name>.part`, which survives an agent restart, so a death at 440/450 MB continues with `Range: bytes=<n>-` instead of re-pulling. `416` discards the partial and restarts from zero; orphans older than 24h are swept.
 - Agents report `logstash_via_ui` in the `GetConfigChanges` body, so toggling the proxy checkbox alone produces a `logstash_runtime` delta. The **persisted state** value is sent, not the env override, which would otherwise disagree with policy permanently. Check-in drift detection compares it too, since a checkbox flip does not move the revision number.
 - `logstash_via_ui` is now read from all three server channels: enrollment `policy_config` (previously dropped), check-in, and the config delta's `logstash_runtime.via_ui`.
+- `logstash-agent --version` prints agent version and exits (lightweight).
 
 ### Changed
 
@@ -19,6 +20,9 @@ Package version is **0.5.2**. Works with **LogstashUI 0.5.1 & 0.5.2**.
 - `resolve_path_settings_from_env(require_writable=True)`: missing directories are skipped; an explicit env path that exists but is not writable no longer falls back to `/etc/logstash`.
 - Missing VERSION tree: start a **background** download (per-version flock still in ensure) and **hold the whole policy revision** (no yml/jvm/log4j2/keystore/pipelines, no revision bump) until the tree exists. Next check-in after ready: snapshot → apply → flip `LOGSTASH_BINARY` immediately before the single restart.
 - Packaged/embedded: VERSION pin is a no-op (log once, no download). UI policy should not attach VERSION pins to those roles.
+- `install --enroll` skips overwriting `/opt/logstash-agent/bin/logstash-agent` when it is the same file or the same version; dest newer is not downgraded; unknown dest version refuses overwrite.
+- Dest older: prompt to upgrade in place (copy to `.new` + rename; `--yes` accepts). Either answer still enrolls.
+- After an accepted in-place replace, restart running agent units only.
 
 ### Fixed
 
