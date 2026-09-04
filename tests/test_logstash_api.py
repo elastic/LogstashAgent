@@ -503,3 +503,92 @@ class TestModuleHelpers:
         )
         with patch("logstashagent.logstash_api.time.time", return_value=0.0):
             assert wait_for_pipeline("p", max_wait=0.01, timeout=3.0) is True
+
+
+class TestResolveLogstashApiPort:
+    def test_env_wins_over_state(self, monkeypatch, tmp_path):
+        from logstashagent import agent_state
+        from logstashagent.logstash_api import resolve_logstash_api_port
+
+        agent_state.configure_state_dir(tmp_path)
+        try:
+            agent_state.update_state("logstash_api_port", 9600)
+            agent_state.update_state("api_port", 9600)
+            monkeypatch.setenv("LOGSTASH_API_PORT", "9561")
+            assert resolve_logstash_api_port() == 9561
+        finally:
+            agent_state.configure_state_dir(None)
+
+    def test_simulate_instance_without_env(self, monkeypatch, tmp_path):
+        from logstashagent import agent_state
+        from logstashagent.logstash_api import resolve_logstash_api_port
+
+        monkeypatch.delenv("LOGSTASH_API_PORT", raising=False)
+        agent_state.configure_state_dir(tmp_path)
+        try:
+            agent_state.update_state("mode", "simulate")
+            agent_state.update_state("instance_id", 1)
+            assert resolve_logstash_api_port() == 9561
+        finally:
+            agent_state.configure_state_dir(None)
+
+    def test_managed_instance_without_env(self, monkeypatch, tmp_path):
+        from logstashagent import agent_state
+        from logstashagent.logstash_api import resolve_logstash_api_port
+
+        monkeypatch.delenv("LOGSTASH_API_PORT", raising=False)
+        agent_state.configure_state_dir(tmp_path)
+        try:
+            agent_state.update_state("mode", "managed")
+            agent_state.update_state("instance_id", 1)
+            assert resolve_logstash_api_port() == 9701
+        finally:
+            agent_state.configure_state_dir(None)
+
+    def test_instance_id_without_mode_is_simulate_formula(self, monkeypatch, tmp_path):
+        from logstashagent import agent_state
+        from logstashagent.logstash_api import resolve_logstash_api_port
+
+        monkeypatch.delenv("LOGSTASH_API_PORT", raising=False)
+        agent_state.configure_state_dir(tmp_path)
+        try:
+            agent_state.update_state("instance_id", 4)
+            assert resolve_logstash_api_port() == 9564
+        finally:
+            agent_state.configure_state_dir(None)
+
+    def test_packaged_last_resort_is_9600(self, monkeypatch, tmp_path):
+        from logstashagent import agent_state
+        from logstashagent.logstash_api import resolve_logstash_api_port
+
+        monkeypatch.delenv("LOGSTASH_API_PORT", raising=False)
+        agent_state.configure_state_dir(tmp_path)
+        try:
+            (tmp_path / "state.json").write_text("{}", encoding="utf-8")
+            assert resolve_logstash_api_port(mode="packaged") == 9600
+        finally:
+            agent_state.configure_state_dir(None)
+
+    def test_non_digit_env_falls_through(self, monkeypatch, tmp_path):
+        from logstashagent import agent_state
+        from logstashagent.logstash_api import resolve_logstash_api_port
+
+        monkeypatch.setenv("LOGSTASH_API_PORT", "abc")
+        agent_state.configure_state_dir(tmp_path)
+        try:
+            agent_state.update_state("logstash_api_port", 9563)
+            assert resolve_logstash_api_port() == 9563
+        finally:
+            agent_state.configure_state_dir(None)
+
+    def test_yml_port_before_last_resort(self, monkeypatch, tmp_path):
+        from logstashagent import agent_state
+        from logstashagent.logstash_api import resolve_logstash_api_port
+
+        monkeypatch.delenv("LOGSTASH_API_PORT", raising=False)
+        agent_state.configure_state_dir(tmp_path)
+        try:
+            (tmp_path / "state.json").write_text("{}", encoding="utf-8")
+            assert resolve_logstash_api_port(yml_port=9650, mode="packaged") == 9650
+        finally:
+            agent_state.configure_state_dir(None)
