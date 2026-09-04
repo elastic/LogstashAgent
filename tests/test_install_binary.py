@@ -283,6 +283,7 @@ def test_install_binary_missing_dest_atomic_install(tmp_path, monkeypatch):
         return real_copy2(src_path, dst_path, *args, **kwargs)
 
     monkeypatch.setattr(installer.shutil, "copy2", spy_copy2)
+    monkeypatch.setattr(installer, "_restorecon_binary", lambda _dest: None)
 
     installer.install_binary()
 
@@ -292,3 +293,42 @@ def test_install_binary_missing_dest_atomic_install(tmp_path, monkeypatch):
     dest_abs = os.path.abspath(str(dest))
     assert dest_abs not in copy_dests
     assert os.access(dest, os.X_OK)
+
+
+def test_install_binary_atomic_cleans_dest_new_on_oserror(tmp_path, monkeypatch):
+    dest, src, _binary_dir, _internal = _prepare_install_binary(
+        tmp_path, monkeypatch, create_dest=False, frozen=False
+    )
+    real_copy2 = installer.shutil.copy2
+
+    def copy2_then_fail(src_path, dst_path, *args, **kwargs):
+        real_copy2(src_path, dst_path, *args, **kwargs)
+        raise OSError("simulated failure after dest.new")
+
+    monkeypatch.setattr(installer.shutil, "copy2", copy2_then_fail)
+
+    with pytest.raises(OSError, match="simulated failure after dest.new"):
+        installer._install_binary_atomic(str(src), str(dest))
+
+    assert not dest.exists()
+    assert not os.path.exists(f"{dest}.new")
+
+
+def test_source_agent_version_returns_dotted_version():
+    ver = installer.source_agent_version()
+    assert ver == AGENT_VERSION
+    assert installer._VERSION_TOKEN_RE.fullmatch(ver)
+    assert ver != "0.0.0+unknown"
+
+
+def test_source_agent_version_pyproject_when_metadata_missing(monkeypatch):
+    from importlib.metadata import PackageNotFoundError
+
+    def _missing(_name):
+        raise PackageNotFoundError(_name)
+
+    monkeypatch.setattr("importlib.metadata.version", _missing)
+    ver = installer.source_agent_version()
+    assert ver == AGENT_VERSION
+    assert installer._VERSION_TOKEN_RE.fullmatch(ver)
+    assert ver != "0.0.0+unknown"

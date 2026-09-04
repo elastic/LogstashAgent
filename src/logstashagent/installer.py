@@ -691,29 +691,42 @@ def installed_agent_version() -> str | None:
 
 
 def source_agent_version() -> str:
-    """Version of the running package being installed."""
+    """Version of the running package (metadata, else pyproject.toml)."""
     try:
         from importlib.metadata import PackageNotFoundError, version
 
         return version("LogstashAgent")
     except PackageNotFoundError:
+        try:
+            import tomllib
+
+            here = Path(__file__).resolve().parent
+            for agent_root in (here.parent.parent, here.parent.parent.parent):
+                pyproject_path = agent_root / "pyproject.toml"
+                if pyproject_path.exists():
+                    with open(pyproject_path, "rb") as f:
+                        pyproject_data = tomllib.load(f)
+                    return pyproject_data.get("project", {}).get(
+                        "version", "0.0.0+unknown"
+                    )
+        except Exception:
+            pass
         return "0.0.0+unknown"
 
 
 def _install_binary_atomic(src: str, dest: str) -> None:
-    """Copy src to dest via ``{dest}.new`` + rename (never copy2 onto dest)."""
+    """Copy src to dest via ``{dest}.new`` + replace (never copy2 onto dest)."""
     temp_binary = f"{dest}.new"
     try:
         shutil.copy2(src, temp_binary)
         os.chmod(temp_binary, 0o755)
-        os.rename(temp_binary, dest)
-    except OSError:
-        if os.path.exists(temp_binary):
+        os.replace(temp_binary, dest)
+    finally:
+        if os.path.lexists(temp_binary):
             try:
                 os.remove(temp_binary)
             except OSError:
                 pass
-        raise
 
 
 def _install_pyinstaller_internal(source_binary: str) -> None:
