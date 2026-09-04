@@ -207,7 +207,7 @@ def enroll_agent(encoded_token: str, logstash_ui_url: str, agent_id: str) -> dic
         from logstashagent.tls_trust import ensure_trust_from_token_payload, ssl_verify_argument
 
         ensure_trust_from_token_payload(ui_url, token_payload)
-        verify = ssl_verify_argument()
+        verify = ssl_verify_argument(ui_url)
     except Exception as e:
         logger.error(f"TLS trust setup from enrollment token failed: {e}")
         raise Exception(
@@ -238,13 +238,16 @@ def enroll_agent(encoded_token: str, logstash_ui_url: str, agent_id: str) -> dic
     }
     if callback_ip:
         enrollment_data["callback_ip"] = callback_ip
-    # Request product-CA-signed server cert for agent HTTPS (key stays local)
-    try:
-        from logstashagent import tls_server
+    # Request product-CA-signed server cert only when inbound TLS will be used
+    from logstashagent.tls_trust import agent_tls_enabled, ui_url_is_tls
 
-        enrollment_data["csr_pem"] = tls_server.build_csr_pem().decode("utf-8")
-    except Exception as e:
-        logger.warning("Could not build agent server CSR for enroll: %s", e)
+    if agent_tls_enabled() and ui_url_is_tls(ui_url):
+        try:
+            from logstashagent import tls_server
+
+            enrollment_data["csr_pem"] = tls_server.build_csr_pem().decode("utf-8")
+        except Exception as e:
+            logger.warning("Could not build agent server CSR for enroll: %s", e)
 
     try:
         # Send enrollment request (verify system CAs ± product CA)

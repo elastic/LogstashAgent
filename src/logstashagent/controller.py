@@ -2420,7 +2420,7 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
             json=request_data,
             headers=headers,
             timeout=30,
-            verify=ssl_verify_argument(),
+            verify=ssl_verify_argument(logstash_ui_url),
         )
         
         if response.status_code >= 400:
@@ -3311,7 +3311,7 @@ def check_in():
             json=check_in_data,
             headers=headers,
             timeout=30,
-            verify=ssl_verify_argument(),
+            verify=ssl_verify_argument(logstash_ui_url),
         )
         
         # Check for error status codes

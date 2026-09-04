@@ -196,6 +196,57 @@ class TestEnrollAgent:
             with pytest.raises(Exception, match="Failed to connect to logstashui"):
                 enrollment.enroll_agent(encoded, "http://down", "aid")
 
+    def test_http_ui_omits_csr_pem(self, monkeypatch):
+        encoded = _encoded_token({"enrollment_token": "x"})
+        response = MagicMock()
+        response.status_code = 200
+        response.raise_for_status = MagicMock()
+        response.headers = {}
+        response.text = "{}"
+        response.json.return_value = {
+            "success": True,
+            "api_key": "ak",
+            "policy_id": 1,
+            "connection_id": 1,
+            "policy_config": {},
+        }
+        with patch.object(enrollment, "get_callback_host", return_value="h"), patch.object(
+            enrollment, "get_callback_ip", return_value=None
+        ), patch(
+            "logstashagent.tls_trust.ensure_trust_from_token_payload", return_value=None
+        ), patch(
+            "logstashagent.tls_trust.ssl_verify_argument", return_value=False
+        ), patch.object(enrollment.requests, "post", return_value=response) as post:
+            enrollment.enroll_agent(encoded, "http://ui.example.com", "aid")
+        body = post.call_args.kwargs["json"]
+        assert "csr_pem" not in body
+        assert post.call_args.kwargs["verify"] is False
+
+    def test_tls_env_false_omits_csr_pem(self, monkeypatch):
+        monkeypatch.setenv("LOGSTASH_AGENT_TLS", "false")
+        encoded = _encoded_token({"enrollment_token": "x"})
+        response = MagicMock()
+        response.status_code = 200
+        response.raise_for_status = MagicMock()
+        response.headers = {}
+        response.text = "{}"
+        response.json.return_value = {
+            "success": True,
+            "api_key": "ak",
+            "policy_id": 1,
+            "connection_id": 1,
+            "policy_config": {},
+        }
+        with patch.object(enrollment, "get_callback_host", return_value="h"), patch.object(
+            enrollment, "get_callback_ip", return_value=None
+        ), patch(
+            "logstashagent.tls_trust.ensure_trust_from_token_payload", return_value=None
+        ), patch(
+            "logstashagent.tls_trust.ssl_verify_argument", return_value=True
+        ), patch.object(enrollment.requests, "post", return_value=response) as post:
+            enrollment.enroll_agent(encoded, "https://ui.example.com", "aid")
+        assert "csr_pem" not in post.call_args.kwargs["json"]
+
 
 class TestComputeHash:
     def test_sha256_hex(self):
