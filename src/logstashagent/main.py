@@ -68,7 +68,7 @@ _ADMIN_COMMANDS = (
 def _is_lightweight_cli(argv: list[str] | None = None) -> bool:
     """True when we must not load yml, create agent_id, or makedirs pipeline dirs."""
     argv = list(argv if argv is not None else sys.argv[1:])
-    if '-h' in argv or '--help' in argv:
+    if '-h' in argv or '--help' in argv or '--version' in argv or '-V' in argv:
         return True
     if '--run' in argv:
         return False
@@ -3344,6 +3344,11 @@ def parse_arguments():
     """
     Parse command-line arguments for enrollment and other modes
     """
+    # Top-level --version / -V only; do not steal `upgrade --version VERSION`.
+    if sys.argv[1:] in (['--version'], ['-V']):
+        print(AGENT_VERSION)
+        sys.exit(0)
+
     parser = argparse.ArgumentParser(
         description='logstashagent - Control plane agent for logstashui',
         formatter_class=argparse.RawDescriptionHelpFormatter,
