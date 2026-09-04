@@ -489,32 +489,170 @@ def apply_keystore_password_change(
 _log_watcher: Optional[log_analyzer.LogstashLogWatcher] = None
 
 
-def update_env_logstash_binary(env_file: Optional[str], binary: str) -> bool:
+def _set_env_file_var(env_file: Optional[str], key: str, value: Optional[str]) -> bool:
     """
-    Set or replace LOGSTASH_BINARY= in a multi-instance env file
+    Set, replace, or remove ``key=`` in a multi-instance env file
     (e.g. /opt/logstash-agent/simulate-N/env or managed-N/env) without sudo
-    when the agent owns the tree.
+    when the agent owns the tree. ``value=None`` deletes the line.
+
+    Every other line is preserved verbatim, so LOGSTASH_KEYSTORE_PASS and the
+    path flags survive.
     """
-    if not env_file or not binary:
+    if not env_file or not key:
         return False
     path = Path(env_file)
     try:
         lines = []
         if path.exists():
             lines = path.read_text(encoding='utf-8').splitlines()
-        filtered = [ln for ln in lines if not ln.startswith('LOGSTASH_BINARY=')]
-        filtered.append(f'LOGSTASH_BINARY={binary}')
+        prefix = f'{key}='
+        filtered = [ln for ln in lines if not ln.startswith(prefix)]
+        if value is not None:
+            filtered.append(f'{prefix}{value}')
+        elif len(filtered) == len(lines):
+            return True  # nothing to remove
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('\n'.join(filtered) + '\n', encoding='utf-8')
         try:
             os.chmod(path, 0o640)
         except OSError:
             pass
-        logger.info(f"Updated LOGSTASH_BINARY in {path} -> {binary}")
+        if value is None:
+            logger.info(f"Removed {key} from {path}")
+        else:
+            logger.info(f"Updated {key} in {path} -> {value}")
         return True
     except Exception as e:
-        logger.error(f"Failed to update LOGSTASH_BINARY in {env_file}: {e}")
+        logger.error(f"Failed to update {key} in {env_file}: {e}")
         return False
+
+
+def update_env_logstash_binary(env_file: Optional[str], binary: str) -> bool:
+    """Set or replace LOGSTASH_BINARY= in a multi-instance env file."""
+    if not binary:
+        return False
+    return _set_env_file_var(env_file, 'LOGSTASH_BINARY', binary)
+
+
+def ensure_env_jvm_opts(env_file: Optional[str], settings_path: Optional[str]) -> bool:
+    """
+    Keep LS_JVM_OPTS in a multi-instance env file pointed at the policy-pushed
+    jvm.options under path.settings.
+
+    Without this, Logstash finds jvm.options only via the argv scan in
+    logstash.lib.sh, which matches an argv entry *equal to* ``--path.settings``
+    and reads the next one. Anything else (notably ``--path.settings=<dir>``)
+    silently falls back to the stock jvm.options in LOGSTASH_HOME, so
+    policy-pushed heap settings never reach the JVM.
+
+    The line is removed when the file is absent: LS_JVM_OPTS naming a missing
+    file makes JvmOptionsParser fail and Logstash refuse to start.
+    """
+    if not env_file or not settings_path:
+        return False
+    jvm_options = Path(settings_path) / 'jvm.options'
+    if not jvm_options.is_file():
+        return _set_env_file_var(env_file, 'LS_JVM_OPTS', None)
+    return _set_env_file_var(env_file, 'LS_JVM_OPTS', str(jvm_options))
+
+
+def _installed_unit_is_stale(unit_path: Path) -> bool:
+    """
+    True when an installed Logstash unit still uses ``--path.settings=<dir>``.
+
+    Deliberately a marker check rather than a diff against the bundled template,
+    so a deliberate operator edit elsewhere in the unit is not clobbered.
+    """
+    try:
+        if not unit_path.is_file():
+            return False
+        return '--path.settings=' in unit_path.read_text(encoding='utf-8')
+    except OSError as exc:
+        logger.debug("Could not read %s: %s", unit_path, exc)
+        return False
+
+
+def heal_stale_logstash_launch(state: Optional[dict] = None) -> bool:
+    """
+    Repair managed/simulate instances installed before the jvm.options fix.
+
+    Two things go stale on such a host, with different privileges:
+
+    * the instance env file, which the agent owns and can rewrite directly —
+      adding LS_JVM_OPTS here is on its own enough to fix the bug;
+    * the unit file under /etc/systemd/system, which is root-owned. The agent
+      now runs as ``User=logstash``, so this goes through the existing
+      root → ``sudo -n … setup-simulate`` escalation in ensure_simulate_setup().
+
+    Returns True if anything was changed. Either way the Logstash unit must be
+    restarted for a new ExecStart or env value to take effect — daemon-reload
+    does not re-exec a running process.
+    """
+    from logstashagent import installer
+
+    state = state if state is not None else agent_state.get_state()
+    mode = str(state.get('mode') or '').lower()
+    if mode not in ('managed', 'simulate'):
+        return False
+
+    changed = False
+    settings_path = state.get('settings_path')
+    env_file = state.get('keystore_env_file')
+    if env_file and settings_path:
+        before = ''
+        try:
+            before = Path(env_file).read_text(encoding='utf-8')
+        except OSError:
+            pass
+        if ensure_env_jvm_opts(env_file, settings_path):
+            try:
+                changed = Path(env_file).read_text(encoding='utf-8') != before
+            except OSError:
+                changed = True
+
+    unit_key = 'logstash_managed_unit' if mode == 'managed' else 'ls_simulate_unit'
+    unit_path = Path(installer.INSTALL_PATHS.get(unit_key, ''))
+    if not _installed_unit_is_stale(unit_path):
+        return changed
+
+    logger.warning(
+        "%s still launches Logstash with --path.settings=<dir>; jvm.options is "
+        "ignored in that form. Reinstalling unit templates.",
+        unit_path,
+    )
+    try:
+        if hasattr(os, 'geteuid') and os.geteuid() == 0:
+            installer.install_multi_instance_unit_templates()
+            logger.info("✓ Reinstalled multi-instance unit templates")
+            changed = True
+        else:
+            result = installer.ensure_simulate_setup(
+                installer.policy_config_from_state(state)
+            )
+            if result.get('status') == 'complete':
+                logger.info("✓ Unit templates refreshed via %s", result.get('via'))
+                changed = True
+            else:
+                logger.warning(
+                    "Could not refresh unit templates (%s). LS_JVM_OPTS in the "
+                    "instance env file still applies jvm.options; run "
+                    "'sudo logstash-agent configure' to update ExecStart.",
+                    result.get('status'),
+                )
+    except Exception as exc:
+        logger.warning(
+            "Unit template refresh failed: %s. LS_JVM_OPTS in the instance env "
+            "file still applies jvm.options.",
+            exc,
+        )
+
+    if changed:
+        logger.warning(
+            "Restart the Logstash unit (%s) to pick up the corrected launch "
+            "configuration.",
+            state.get('logstash_unit') or unit_path.name,
+        )
+    return changed
 
 
 RUNTIME_SNAPSHOT_NAME = '.runtime-snapshot'
@@ -1268,10 +1406,18 @@ def update_jvm_options(settings_path, content):
     try:
         jvm_options_path = settings_path + 'jvm.options'
         logger.info(f"Updating jvm.options at {jvm_options_path}")
-        
+
         with open(jvm_options_path, 'w', encoding='utf-8') as f:
-            f.write(content)
-        
+            f.write(content if content.endswith('\n') else content + '\n')
+
+        # World-readable on purpose: logstash.lib.sh only honours the file when
+        # `[ -r "$dir/jvm.options" ]` passes for the logstash user, and a
+        # restrictive umask would otherwise revert Logstash to stock JVM settings.
+        try:
+            os.chmod(jvm_options_path, 0o644)
+        except OSError as exc:
+            logger.warning("Could not set mode 0644 on %s: %s", jvm_options_path, exc)
+
         logger.info("Successfully updated jvm.options")
         return True
     except Exception as e:
@@ -2230,6 +2376,14 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
             'logstash_source': state.get('logstash_source') or 'SYSTEM',
             'logstash_version': state.get('logstash_version') or '',
             'logstash_download_dir': state.get('logstash_download_dir') or '',
+            # Participates in the server's runtime_changed comparison. Without
+            # it the server assumes False, so ticking the proxy checkbox on an
+            # otherwise unchanged policy would yield no delta and no error — the
+            # agent would keep pulling from Elastic forever. Deliberately the
+            # persisted state value, not logstash_via_ui_enabled(): reporting the
+            # env override would disagree with policy permanently and re-trigger
+            # a runtime delta on every check-in.
+            'logstash_via_ui': bool(state.get('logstash_via_ui')),
             'keystore': keystore_state,
             'keystore_password_hash': state.get('keystore_password_hash', ''),
             'pipelines': pipelines_state,
@@ -2338,6 +2492,9 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
                     if update_jvm_options(settings_path, jvm_options_content):
                         files_updated = True
                         requires_restart = True
+                        # A first-time jvm.options needs LS_JVM_OPTS added to the
+                        # instance env file before the restart below picks it up.
+                        ensure_env_jvm_opts(state.get('keystore_env_file'), settings_path)
                     else:
                         logger.error("Failed to update jvm.options - aborting rollout")
                         failed_operations.append('jvm.options write failed')
@@ -3159,6 +3316,12 @@ def check_in():
         
         if result.get('success'):
             logger.info("Check-in successful")
+            # Snapshot before persisting: the via-UI drift check below compares
+            # what we had against what the server just sent.
+            agent_via_ui = bool(state.get('logstash_via_ui'))
+            server_via_ui = bool(
+                result.get('logstash_via_ui', result.get('via_ui', agent_via_ui))
+            )
             _maybe_persist_via_ui(result)
 
             try:
@@ -3194,12 +3357,16 @@ def check_in():
                     and server_download_dir
                     and server_download_dir != agent_download_dir
                 )
+                # A proxy-checkbox flip on an otherwise unchanged policy does not
+                # move the revision number, so without this the fetch below never
+                # happens and the agent keeps using its old source forever.
+                or (server_source == 'VERSION' and server_via_ui != agent_via_ui)
             )
             if runtime_dirty:
                 logger.info(
-                    "Logstash runtime drift detected (agent %s/%s vs server %s/%s)",
-                    agent_source, agent_version or '-',
-                    server_source, server_version or '-',
+                    "Logstash runtime drift detected (agent %s/%s via_ui=%s vs server %s/%s via_ui=%s)",
+                    agent_source, agent_version or '-', agent_via_ui,
+                    server_source, server_version or '-', server_via_ui,
                 )
 
             # Build ONE merged apply plan so the policy channel and the SNMP
@@ -3356,6 +3523,10 @@ def run_controller():
         logger.info(f"Logstash unit: {state.get('logstash_unit')}")
     logger.info("=" * 60)
     recover_incomplete_runtime_upgrade()
+    try:
+        heal_stale_logstash_launch(state)
+    except Exception as exc:
+        logger.warning("jvm.options launch self-heal failed: %s", exc)
     logger.info("Starting check-in loop (every 60 seconds)")
     logger.info("Press Ctrl+C to stop")
     logger.info("=" * 60)

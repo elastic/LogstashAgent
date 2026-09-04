@@ -170,25 +170,20 @@ def _build_systemd_service() -> str:
     """
     Build the systemd service unit content.
 
-    Runs as the logstash user/group when that account exists (i.e. Logstash is
-    installed).  Falls back to root when Logstash is not yet present so the
-    service can still be registered and start once Logstash is installed later.
+    Always runs as logstash:logstash. The installer guarantees the account via
+    :func:`ensure_logstash_user`, so there is no longer a "Logstash not yet
+    installed" case to fall back on — and a unit that silently ran as root was
+    the failure this replaced.
     """
-    try:
-        pwd.getpwnam('logstash')
-        grp.getgrnam('logstash')
-        user_lines = "User=logstash\nGroup=logstash\n"
-    except (KeyError, OSError):
-        logger.warning("logstash user not found — service will run as root until Logstash is installed")
-        user_lines = ""
-
-    return f"""[Unit]
+    return """[Unit]
 Description=LogstashAgent - Control plane agent for LogstashUI
 After=network.target
 
 [Service]
 Type=simple
-{user_lines}ExecStart=/opt/logstash-agent/bin/logstash-agent --run
+User=logstash
+Group=logstash
+ExecStart=/opt/logstash-agent/bin/logstash-agent --run
 Restart=always
 RestartSec=10
 WorkingDirectory=/opt/logstash-agent/state
@@ -226,19 +221,17 @@ def verify_logstash_installed() -> bool:
     """
     Check whether Logstash appears to be installed on this host.
 
-    Looks for the logstash system user, /etc/logstash, and /usr/share/logstash.
-    Returns True if all checks pass, False if any are missing.  The caller decides
-    whether to abort or continue with a warning.
+    Looks for /etc/logstash and /usr/share/logstash. Returns True if all checks
+    pass, False if any are missing.  The caller decides whether to abort or
+    continue with a warning.
+
+    The logstash *account* is deliberately not part of this check: the installer
+    now creates it itself (:func:`ensure_logstash_user`), so its presence is no
+    longer evidence that the Logstash package was installed.
     """
     logger.info("Checking Logstash installation...")
 
     missing = []
-
-    try:
-        pwd.getpwnam('logstash')
-        logger.info("✓ User 'logstash' exists")
-    except KeyError:
-        missing.append("user: logstash")
 
     if not os.path.isdir('/etc/logstash'):
         missing.append("directory: /etc/logstash")
@@ -273,18 +266,276 @@ def get_logstash_uid_gid():
     """
     Get the UID and GID for the logstash user.
 
-    Returns (uid, gid) if the logstash user exists, or (0, 0) (root) with a
-    warning if it does not.  Callers that perform chown operations will therefore
-    fall back to root ownership when Logstash is not yet installed, which is safe
-    and can be corrected later once Logstash is present.
+    Returns (uid, gid) if the logstash user exists, or (0, 0) (root) if it does
+    not.  Privileged entrypoints call :func:`ensure_logstash_user` first, so the
+    fallback should be unreachable there; it remains for callers that may run
+    before/without account setup.
     """
     try:
         pw = pwd.getpwnam('logstash')
         gr = grp.getgrnam('logstash')
         return pw.pw_uid, gr.gr_gid
     except (KeyError, OSError):
-        logger.warning("logstash user/group not found — using root ownership as fallback")
+        logger.warning(
+            "logstash user/group not found — falling back to ROOT ownership "
+            "(run 'sudo logstash-agent configure' to create the account and "
+            "repair ownership)"
+        )
         return 0, 0
+
+
+# Account layout mirrors the Logstash DEB/RPM scriptlets so that installing the
+# package later agrees with what we created here.
+LOGSTASH_USER = 'logstash'
+LOGSTASH_GROUP = 'logstash'
+LOGSTASH_HOME = '/usr/share/logstash'
+# useradd/groupadd exit 9 == "name already in use". Treated as success: covers a
+# race with a concurrent package install, and an account served from LDAP/SSSD
+# that getpwnam can see but useradd refuses to shadow.
+_USERADD_EEXIST = 9
+
+
+def _sbin_tool(name: str) -> str:
+    """
+    Absolute path to a shadow-utils binary.
+
+    /usr/sbin is not on root's PATH on every distro, and the frozen binary's
+    environment is not the operator's shell. Same approach as _systemctl_bin().
+    """
+    for candidate in (f'/usr/sbin/{name}', f'/sbin/{name}'):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return name
+
+
+def _nologin_shell() -> str:
+    """Path to nologin: /usr/sbin on Debian, /sbin on RHEL."""
+    for candidate in ('/usr/sbin/nologin', '/sbin/nologin'):
+        if os.path.isfile(candidate):
+            return candidate
+    return '/bin/false'
+
+
+def _manual_account_commands() -> str:
+    """The commands an operator would run by hand, for error messages."""
+    return (
+        f"  sudo {_sbin_tool('groupadd')} --system {LOGSTASH_GROUP}\n"
+        f"  sudo {_sbin_tool('useradd')} --system --gid {LOGSTASH_GROUP} "
+        f"--home-dir {LOGSTASH_HOME} --no-create-home "
+        f"--shell {_nologin_shell()} {LOGSTASH_USER}"
+    )
+
+
+def _run_account_tool(argv: list[str]) -> subprocess.CompletedProcess:
+    """
+    Run groupadd/useradd with a clean host environment.
+
+    host_subprocess_env() is required: PyInstaller ships its own OpenSSL and sets
+    LD_LIBRARY_PATH, which breaks distro tools linked against a newer system
+    libcrypto. Without it these calls fail with a confusing loader error.
+    """
+    return subprocess.run(
+        argv,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+        env=host_subprocess_env(),
+    )
+
+
+def _group_exists() -> bool:
+    try:
+        grp.getgrnam(LOGSTASH_GROUP)
+        return True
+    except (KeyError, OSError):
+        return False
+
+
+def _user_exists() -> bool:
+    try:
+        pwd.getpwnam(LOGSTASH_USER)
+        return True
+    except (KeyError, OSError):
+        return False
+
+
+def ensure_logstash_user() -> tuple[int, int]:
+    """
+    Ensure the ``logstash`` system group and user exist; return (uid, gid).
+
+    Logstash must not run as root, and every ownership decision the installer
+    makes depends on this account. Historically it was only ever *looked up* —
+    created as a side effect of installing the Logstash DEB/RPM — so installing
+    the agent on a host without the package produced root-owned directories,
+    systemd units with no ``User=``, and a sudoers file granting rights to a
+    nonexistent user. This creates the account the way the package scriptlets do.
+
+    Idempotent: a host that already has the Logstash package runs no commands and
+    the existing account is left untouched. The group and user are handled
+    independently, since group-present-but-user-missing is a normal state.
+
+    Raises:
+        InstallError: the account is missing and could not be created. Ownership
+            and privilege separation cannot be established, so callers must abort
+            rather than silently continue as root.
+    """
+    if pwd is None or grp is None:
+        raise InstallError(
+            "Cannot manage the logstash account on this platform "
+            "(pwd/grp unavailable). Install is Linux-only."
+        )
+
+    have_group = _group_exists()
+    have_user = _user_exists()
+    if have_group and have_user:
+        uid, gid = get_logstash_uid_gid()
+        logger.info(
+            "✓ User '%s' and group '%s' already exist (uid=%s gid=%s)",
+            LOGSTASH_USER, LOGSTASH_GROUP, uid, gid,
+        )
+        return uid, gid
+
+    if not have_group:
+        logger.info("Creating system group '%s'...", LOGSTASH_GROUP)
+        argv = [_sbin_tool('groupadd'), '--system', LOGSTASH_GROUP]
+        try:
+            result = _run_account_tool(argv)
+        except (OSError, subprocess.SubprocessError) as e:
+            raise InstallError(
+                f"Could not create the '{LOGSTASH_GROUP}' group: {e}\n\n"
+                f"Create the account manually, then re-run:\n"
+                f"{_manual_account_commands()}"
+            ) from e
+        if result.returncode not in (0, _USERADD_EEXIST):
+            detail = (result.stderr or result.stdout or '').strip()
+            raise InstallError(
+                f"groupadd failed (exit {result.returncode}): {detail}\n\n"
+                f"Create the account manually, then re-run:\n"
+                f"{_manual_account_commands()}"
+            )
+        logger.info("✓ Created system group '%s'", LOGSTASH_GROUP)
+
+    if not have_user:
+        logger.info("Creating system user '%s'...", LOGSTASH_USER)
+        # --no-create-home: the home dir belongs to the Logstash package (or does
+        # not exist at all for VERSION installs, where Logstash lives under
+        # /opt/logstash-agent/logstash-versions). A nologin service account does
+        # not need it, and creating it would leave a stray dir behind.
+        argv = [
+            _sbin_tool('useradd'),
+            '--system',
+            '--gid', LOGSTASH_GROUP,
+            '--home-dir', LOGSTASH_HOME,
+            '--no-create-home',
+            '--shell', _nologin_shell(),
+            '--comment', 'logstash service account',
+            LOGSTASH_USER,
+        ]
+        try:
+            result = _run_account_tool(argv)
+        except (OSError, subprocess.SubprocessError) as e:
+            raise InstallError(
+                f"Could not create the '{LOGSTASH_USER}' user: {e}\n\n"
+                f"Create the account manually, then re-run:\n"
+                f"{_manual_account_commands()}"
+            ) from e
+        if result.returncode not in (0, _USERADD_EEXIST):
+            detail = (result.stderr or result.stdout or '').strip()
+            raise InstallError(
+                f"useradd failed (exit {result.returncode}): {detail}\n\n"
+                f"Create the account manually, then re-run:\n"
+                f"{_manual_account_commands()}"
+            )
+        logger.info("✓ Created system user '%s'", LOGSTASH_USER)
+
+    # Re-resolve: the ids only exist now that the tools have run.
+    if not (_group_exists() and _user_exists()):
+        raise InstallError(
+            f"The '{LOGSTASH_USER}' account still does not resolve after "
+            f"creation. If it is served by LDAP/SSSD, ensure it is reachable.\n\n"
+            f"Expected:\n{_manual_account_commands()}"
+        )
+    uid, gid = get_logstash_uid_gid()
+    logger.info("✓ logstash account ready (uid=%s gid=%s)", uid, gid)
+    return uid, gid
+
+
+def _chown_recursive(path: str, uid: int, gid: int) -> bool:
+    """
+    Recursively chown ``path``. Returns False if absent or on error (logged).
+
+    Missing paths are normal — /etc/logstash only exists with the DEB/RPM, and
+    VERSION installs keep Logstash under /opt/logstash-agent/logstash-versions.
+    """
+    if not os.path.exists(path):
+        logger.debug("Not present, skipping chown: %s", path)
+        return False
+    owner = 'logstash' if uid else 'root'
+    try:
+        for root, dirs, files in os.walk(path):
+            os.chown(root, uid, gid)
+            for name in dirs + files:
+                os.chown(os.path.join(root, name), uid, gid)
+        logger.info("✓ Set ownership on %s (%s, recursive)", path, owner)
+        return True
+    except OSError as e:
+        logger.warning("Could not set ownership on %s: %s", path, e)
+        return False
+
+
+def repair_agent_ownership() -> None:
+    """
+    Re-apply logstash ownership to the agent trees and rewrite the unit files.
+
+    The recovery path for a host installed before :func:`ensure_logstash_user`
+    existed, where everything ended up root-owned and the units carried no
+    ``User=``. Call *after* ensure_logstash_user().
+
+    ``bin/`` is deliberately excluded and stays root-owned: sudoers grants
+    logstash NOPASSWD on ``bin/logstash-agent``, so letting logstash own that
+    binary would be a privilege-escalation path. For the same reason this
+    enumerates directories instead of recursing from ``opt_root``.
+    """
+    uid, gid = get_logstash_uid_gid()
+    if not uid:
+        logger.warning("Skipping ownership repair — logstash account unavailable")
+        return
+
+    opt_root = INSTALL_PATHS['opt_root']
+    targets = [
+        INSTALL_PATHS['config_dir'],
+        INSTALL_PATHS['state_dir'],
+        INSTALL_PATHS['log_dir'],
+        INSTALL_PATHS['cache_dir'],
+        os.path.join(opt_root, 'logstash-versions'),
+    ]
+    # Multi-instance trees (managed-N / simulate-N)
+    try:
+        for name in sorted(os.listdir(opt_root)):
+            if name.startswith(('managed-', 'simulate-')):
+                targets.append(os.path.join(opt_root, name))
+    except OSError as e:
+        logger.debug("Could not enumerate instance trees under %s: %s", opt_root, e)
+
+    for target in targets:
+        _chown_recursive(target, uid, gid)
+
+    # state/.secret_key needs 0600 as well as the right owner
+    try:
+        from logstashagent.encryption import ensure_secret_key_ownership
+
+        ensure_secret_key_ownership(None)
+    except Exception as e:
+        logger.warning("Could not fix secret key ownership: %s", e)
+
+    # Rewrite the multi-instance templates so they carry User=logstash. Note
+    # configure_logstash() rewrites only the packaged unit, so without this a
+    # broken host's managed-/simulate- units would keep running Logstash as root.
+    try:
+        install_multi_instance_unit_templates()
+    except Exception as e:
+        logger.warning("Could not reinstall multi-instance unit templates: %s", e)
 
 
 def migrate_legacy_fhs_paths() -> None:
@@ -327,27 +578,32 @@ def create_directories():
     logger.info("Creating installation directories under %s ...", INSTALL_PATHS['opt_root'])
 
     uid, gid = get_logstash_uid_gid()
+    # Name the owner actually applied. This used to always claim "owned by
+    # logstash" even when get_logstash_uid_gid() had fallen back to root, which
+    # is what hid the missing-account bug.
+    owner = 'logstash' if uid else 'root'
 
     migrate_legacy_fhs_paths()
 
-    # Create binary directory (owned by root)
+    # Binary directory stays root-owned: sudoers grants logstash NOPASSWD on
+    # bin/logstash-agent, so logstash must not be able to modify it.
     os.makedirs(INSTALL_PATHS['binary_dir'], mode=0o755, exist_ok=True)
-    logger.info(f"✓ Created {INSTALL_PATHS['binary_dir']}")
+    logger.info(f"✓ Created {INSTALL_PATHS['binary_dir']} (owned by root)")
 
-    # Create config directory (owned by logstash)
+    # Create config directory
     os.makedirs(INSTALL_PATHS['config_dir'], mode=0o755, exist_ok=True)
     os.chown(INSTALL_PATHS['config_dir'], uid, gid)
-    logger.info(f"✓ Created {INSTALL_PATHS['config_dir']} (owned by logstash)")
+    logger.info(f"✓ Created {INSTALL_PATHS['config_dir']} (owned by {owner})")
 
-    # Create state directory (owned by logstash)
+    # Create state directory
     os.makedirs(INSTALL_PATHS['state_dir'], mode=0o750, exist_ok=True)
     os.chown(INSTALL_PATHS['state_dir'], uid, gid)
-    logger.info(f"✓ Created {INSTALL_PATHS['state_dir']} (owned by logstash)")
+    logger.info(f"✓ Created {INSTALL_PATHS['state_dir']} (owned by {owner})")
 
-    # Create log directory (owned by logstash)
+    # Create log directory
     os.makedirs(INSTALL_PATHS['log_dir'], mode=0o755, exist_ok=True)
     os.chown(INSTALL_PATHS['log_dir'], uid, gid)
-    logger.info(f"✓ Created {INSTALL_PATHS['log_dir']} (owned by logstash)")
+    logger.info(f"✓ Created {INSTALL_PATHS['log_dir']} (owned by {owner})")
 
     # VERSION download cache — owned by logstash so Logstash can read its tree
     versions_dir = os.path.join(INSTALL_PATHS['opt_root'], 'logstash-versions')
@@ -361,12 +617,12 @@ def create_directories():
             os.chown(versions_dir, uid, gid)
         except OSError:
             pass
-    logger.info(f"✓ Ensured {versions_dir} (owned by logstash)")
+    logger.info(f"✓ Ensured {versions_dir} (owned by {owner})")
 
-    # Create cache directory (owned by logstash)
+    # Create cache directory
     os.makedirs(INSTALL_PATHS['cache_dir'], mode=0o755, exist_ok=True)
     os.chown(INSTALL_PATHS['cache_dir'], uid, gid)
-    logger.info(f"✓ Created {INSTALL_PATHS['cache_dir']} (owned by logstash)")
+    logger.info(f"✓ Created {INSTALL_PATHS['cache_dir']} (owned by {owner})")
 
 
 def install_binary():
@@ -655,17 +911,12 @@ def install_multi_instance_unit_templates() -> None:
     """
     logger.info("Installing multi-instance systemd unit templates...")
     for template_name, dest_key in _MULTI_INSTANCE_UNIT_TEMPLATES:
+        # Templates ship with User=/Group=logstash already set; the account is
+        # guaranteed by ensure_logstash_user() before we get here, so there is
+        # nothing to rewrite. Previously these were shipped commented out and
+        # uncommented only if the account happened to resolve, which meant
+        # Logstash silently ran as root on hosts without the DEB/RPM.
         content = _read_unit_template(template_name)
-        # Inject User=logstash when available
-        try:
-            pwd.getpwnam('logstash')
-            grp.getgrnam('logstash')
-            if '# User=logstash' in content:
-                content = content.replace('# User=logstash', 'User=logstash')
-            if '# Group=logstash' in content:
-                content = content.replace('# Group=logstash', 'Group=logstash')
-        except (KeyError, OSError, TypeError):
-            pass
         dest = INSTALL_PATHS[dest_key]
         with open(dest, 'w') as f:
             f.write(content)
@@ -836,6 +1087,15 @@ def materialize_simulate_instance(policy_config: dict) -> dict:
                 )
             target = settings / name
             target.write_text(content if content.endswith('\n') else content + '\n', encoding='utf-8')
+            # World-readable on purpose. logstash.lib.sh only honours jvm.options
+            # when `[ -r "$dir/jvm.options" ]` passes for the *logstash* user, and
+            # a restrictive umask here would land 0600 root-owned — silently
+            # reverting to the stock JVM settings (or, with LS_JVM_OPTS set,
+            # failing the JvmOptionsParser outright).
+            try:
+                os.chmod(target, 0o644)
+            except OSError as exc:
+                logger.warning("Could not set mode 0644 on %s: %s", target, exc)
             logger.info(f"✓ Wrote {target}")
 
     # Simulate-only: seed simulation harness (simulate-start/end) + bare pipelines.yml
@@ -917,6 +1177,16 @@ def materialize_simulate_instance(policy_config: dict) -> dict:
         f"LOGSTASH_PATH_DATA={data}",
         # LOGSTASH_KEYSTORE_PASS added later when keystore password is set
     ]
+    # Point Logstash at the policy-pushed jvm.options explicitly. logstash.lib.sh
+    # would otherwise have to find it by scanning argv for a bare "--path.settings"
+    # entry, which is easy to break and fails silently.
+    #
+    # Only when the file exists: LS_JVM_OPTS naming a missing file makes
+    # JvmOptionsParser fail and Logstash refuse to start, and a policy carrying no
+    # jvm_options writes nothing above. controller.ensure_env_jvm_opts() adds the
+    # line later if a policy starts supplying jvm.options.
+    if (settings / 'jvm.options').is_file():
+        env_lines.append(f"LS_JVM_OPTS={settings}/jvm.options")
     if stream_base:
         env_lines.append(f"LOGSTASH_URL={stream_base}")
         env_lines.append(f"LOGSTASH_UI_URL={stream_base}")
@@ -1294,6 +1564,13 @@ def setup_simulate_from_policy(
     state can be relocated and ``.secret_key`` ownership fixed *before* the
     agent unit is started as the logstash user.
     """
+    # The units installed just below declare User=logstash, and
+    # materialize_simulate_instance() chowns the instance tree — both need the
+    # account to exist. Idempotent, so the install path's earlier call is cheap.
+    # Guarded because ensure_simulate_setup() has a non-root materialize-only
+    # fallback path that must keep working.
+    if os.geteuid() == 0:
+        ensure_logstash_user()
     install_multi_instance_unit_templates()
     result = materialize_simulate_instance(policy_config)
     pt = (policy_config.get('policy_type') or result.get('policy_type') or 'SIMULATE').upper()
@@ -1667,74 +1944,21 @@ def configure_logstash() -> None:
     logger.info("Configuring Logstash for agent management...")
     uid, gid = get_logstash_uid_gid()
 
-    # Fix ownership on the agent's own directories.  These may have been created
-    # with root:root during installation if the logstash user didn't exist yet.
+    # The agent's own directories may still be root:root from an install that
+    # ran before the logstash account existed.
     for agent_dir in [
         INSTALL_PATHS['log_dir'],    # /opt/logstash-agent/logs
         INSTALL_PATHS['state_dir'],  # /opt/logstash-agent/state
         INSTALL_PATHS['config_dir'], # /opt/logstash-agent/config
         INSTALL_PATHS['cache_dir'],  # /opt/logstash-agent/cache
     ]:
-        if os.path.exists(agent_dir):
-            try:
-                for root, dirs, files in os.walk(agent_dir):
-                    os.chown(root, uid, gid)
-                    for d in dirs:
-                        os.chown(os.path.join(root, d), uid, gid)
-                    for f in files:
-                        os.chown(os.path.join(root, f), uid, gid)
-                logger.info(f"✓ Fixed ownership on {agent_dir} (logstash:logstash)")
-            except Exception as e:
-                logger.warning(f"Could not fix ownership on {agent_dir}: {e}")
+        _chown_recursive(agent_dir, uid, gid)
 
-    # chown /etc/logstash
-    logstash_config_dir = '/etc/logstash'
-    if os.path.exists(logstash_config_dir):
-        try:
-            for root, dirs, files in os.walk(logstash_config_dir):
-                os.chown(root, uid, gid)
-                for d in dirs:
-                    os.chown(os.path.join(root, d), uid, gid)
-                for f in files:
-                    os.chown(os.path.join(root, f), uid, gid)
-            logger.info(f"✓ Set ownership on {logstash_config_dir} (logstash:logstash, recursive)")
-        except Exception as e:
-            logger.warning(f"Could not set ownership on {logstash_config_dir}: {e}")
-            logger.warning("Agent may not be able to manage Logstash configuration")
-    else:
-        logger.warning(f"Logstash config directory not found at {logstash_config_dir}")
-
-    # chown /var/log/logstash
-    logstash_log_dir = '/var/log/logstash'
-    if os.path.exists(logstash_log_dir):
-        try:
-            for root, dirs, files in os.walk(logstash_log_dir):
-                os.chown(root, uid, gid)
-                for d in dirs:
-                    os.chown(os.path.join(root, d), uid, gid)
-                for f in files:
-                    os.chown(os.path.join(root, f), uid, gid)
-            logger.info(f"✓ Set ownership on {logstash_log_dir} (logstash:logstash, recursive)")
-        except Exception as e:
-            logger.warning(f"Could not set ownership on {logstash_log_dir}: {e}")
-    else:
-        logger.warning(f"Logstash log directory not found at {logstash_log_dir}")
-
-    # chown /usr/share/logstash/data
-    logstash_data_dir = '/usr/share/logstash/data'
-    if os.path.exists(logstash_data_dir):
-        try:
-            for root, dirs, files in os.walk(logstash_data_dir):
-                os.chown(root, uid, gid)
-                for d in dirs:
-                    os.chown(os.path.join(root, d), uid, gid)
-                for f in files:
-                    os.chown(os.path.join(root, f), uid, gid)
-            logger.info(f"✓ Set ownership on {logstash_data_dir} (logstash:logstash, recursive)")
-        except Exception as e:
-            logger.warning(f"Could not set ownership on {logstash_data_dir}: {e}")
-    else:
-        logger.warning(f"Logstash data directory not found at {logstash_data_dir}")
+    # Logstash's own package directories
+    if not _chown_recursive('/etc/logstash', uid, gid):
+        logger.warning("Agent may not be able to manage Logstash configuration")
+    _chown_recursive('/var/log/logstash', uid, gid)
+    _chown_recursive('/usr/share/logstash/data', uid, gid)
 
     # Validated systemctl helper + sudoers (sudo-rs forbids wildcards in args)
     try:
@@ -1821,9 +2045,14 @@ def perform_configure() -> None:
     """
     Entry point for `logstash-agent configure`.
 
-    Applies the Logstash-specific setup that requires Logstash to already be
-    installed on the host.  Run this after installing Logstash when the agent
-    was originally installed on a host without Logstash.
+    Two jobs:
+
+    1. Repair: ensure the logstash account exists, re-apply ownership to the
+       agent trees, and rewrite the systemd units with ``User=logstash``. This
+       runs unconditionally and is the recovery path for a host installed before
+       the installer created the account.
+    2. Logstash-specific setup (sudoers, /etc/logstash ownership), which needs
+       Logstash already installed from a package.
     """
     logger.info("="*60)
     logger.info("LOGSTASH AGENT - CONFIGURE")
@@ -1839,13 +2068,30 @@ def perform_configure() -> None:
                 "  sudo logstash-agent install --enroll <TOKEN> --logstash-ui-url <URL>"
             )
 
+        # Create the account and repair ownership/units *before* the Logstash
+        # gate below, so `configure` fixes a host that was installed without the
+        # logstash account even when Logstash itself is not package-installed
+        # (MANAGED/SIMULATE keep Logstash under logstash-versions).
+        ensure_logstash_user()
+        repair_agent_ownership()
+
         logstash_present = verify_logstash_installed()
         if not logstash_present:
-            raise InstallError(
-                "Logstash must be installed before running configure.\n\n"
-                "Install Logstash, then rerun:\n"
-                "  sudo logstash-agent configure"
+            logger.info("\n" + "=" * 60)
+            logger.info("ACCOUNT AND OWNERSHIP REPAIR COMPLETED")
+            logger.info("=" * 60)
+            logger.info(
+                "\nLogstash itself is not installed from a package here, so the "
+                "Logstash-specific setup (sudoers, /etc/logstash ownership) was "
+                "skipped."
             )
+            logger.info(
+                "Restart the agent and any managed/simulate units so they pick "
+                "up User=logstash:"
+            )
+            logger.info("    sudo systemctl restart logstash-agent")
+            logger.info("=" * 60)
+            return
 
         configure_logstash()
         # Enable distro logstash only — never start/restart on configure (live-system safe)
@@ -1855,7 +2101,12 @@ def perform_configure() -> None:
         logger.info("CONFIGURE COMPLETED SUCCESSFULLY!")
         logger.info("="*60)
         logger.info("\nDistro logstash enabled only (not started).")
-        logger.info("Restart the agent so it can manage Logstash when policy requires:")
+        # daemon-reload does not move an already-running process off root; the
+        # unit has to be restarted for User=logstash to take effect.
+        logger.info(
+            "Restart the agent so it can manage Logstash when policy requires "
+            "(also required for User=logstash to take effect):"
+        )
         logger.info("    sudo systemctl restart logstash-agent")
         logger.info("="*60)
 
@@ -1916,6 +2167,9 @@ def perform_installation(
         logger.info("\nStep 1: Verifying prerequisites...")
         verify_root()
         verify_platform()
+        # Must precede create_directories(): it is the first consumer of
+        # get_logstash_uid_gid(), and every later chown depends on the account.
+        ensure_logstash_user()
         logstash_present = verify_logstash_installed()
         if not logstash_present:
             logger.warning(

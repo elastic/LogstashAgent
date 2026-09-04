@@ -225,6 +225,7 @@ __marimo__/
 # Local analysis / packaging artifacts (do not ship)
 docs/archive/
 docs/superpowers/
+.superpowers/
 graphify-out/
 scratch/
 IDEA.md

@@ -257,6 +257,61 @@ class TestSaveEnrollmentConfig:
         assert ("simulate_setup_pending", True) in calls
         assert ("instance_id", 2) in calls
 
+    def test_persists_logstash_via_ui(self):
+        """
+        Enrollment is one of the three channels carrying the flag. Dropping it
+        means the agent pulls from Elastic until the first check-in lands.
+        """
+        policy = {
+            "policy_type": "SIMULATE",
+            "logstash_source": "VERSION",
+            "logstash_version": "9.4.3",
+            "logstash_via_ui": True,
+        }
+
+        with patch.object(enrollment.agent_state, "update_state") as upd:
+            enrollment.save_enrollment_config(
+                api_key="key",
+                logstash_ui_url="http://ui",
+                policy_id=3,
+                connection_id=7,
+                policy_config=policy,
+            )
+
+        calls = [c[0] for c in upd.call_args_list]
+        assert ("logstash_via_ui", True) in calls
+
+    def test_via_ui_false_is_persisted(self):
+        """False must be written too — a PACKAGED policy has to clear a stale True."""
+        policy = {"policy_type": "PACKAGED", "logstash_via_ui": False}
+
+        with patch.object(enrollment.agent_state, "update_state") as upd:
+            enrollment.save_enrollment_config(
+                api_key="key",
+                logstash_ui_url="http://ui",
+                policy_id=3,
+                connection_id=7,
+                policy_config=policy,
+            )
+
+        calls = [c[0] for c in upd.call_args_list]
+        assert ("logstash_via_ui", False) in calls
+
+    def test_via_ui_absent_is_not_written(self):
+        policy = {"settings_path": "/etc/logstash"}
+
+        with patch.object(enrollment.agent_state, "update_state") as upd:
+            enrollment.save_enrollment_config(
+                api_key="key",
+                logstash_ui_url="http://ui",
+                policy_id=3,
+                connection_id=7,
+                policy_config=policy,
+            )
+
+        keys = [c[0][0] for c in upd.call_args_list]
+        assert "logstash_via_ui" not in keys
+
     def test_propagates_update_state_failure(self):
         with patch.object(
             enrollment.agent_state,

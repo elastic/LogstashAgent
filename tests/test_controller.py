@@ -6,6 +6,7 @@
 
 import hashlib
 import json
+import os
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -51,6 +52,188 @@ class TestUpdateJvmOptions:
         base = temp_dir.replace("\\", "/") + "/"
         with patch("builtins.open", side_effect=OSError("denied")):
             assert controller.update_jvm_options(base, "x") is False
+
+    def test_appends_trailing_newline(self, temp_dir):
+        base = temp_dir.replace("\\", "/") + "/"
+        assert controller.update_jvm_options(base, "-Xmx1g") is True
+        assert (Path(base) / "jvm.options").read_text(encoding="utf-8") == "-Xmx1g\n"
+
+    def test_file_is_readable_under_restrictive_umask(self, temp_dir):
+        """
+        logstash.lib.sh only honours jvm.options when `[ -r ... ]` passes for the
+        logstash user. A 0600 root-owned file silently reverts Logstash to the
+        stock JVM settings.
+        """
+        base = temp_dir.replace("\\", "/") + "/"
+        old_umask = os.umask(0o077)
+        try:
+            assert controller.update_jvm_options(base, "-Xmx1g\n") is True
+        finally:
+            os.umask(old_umask)
+        mode = (Path(base) / "jvm.options").stat().st_mode & 0o777
+        assert mode == 0o644, oct(mode)
+
+
+class TestEnsureEnvJvmOpts:
+    def test_adds_line_pointing_at_jvm_options(self, tmp_path):
+        settings = tmp_path / "settings"
+        settings.mkdir()
+        (settings / "jvm.options").write_text("-Xmx1g\n")
+        env_file = tmp_path / "env"
+        env_file.write_text("LOGSTASH_BINARY=/usr/share/logstash/bin/logstash\n")
+
+        assert controller.ensure_env_jvm_opts(str(env_file), str(settings)) is True
+
+        text = env_file.read_text()
+        assert f"LS_JVM_OPTS={settings / 'jvm.options'}" in text
+        assert "LOGSTASH_BINARY=/usr/share/logstash/bin/logstash" in text
+
+    def test_is_idempotent(self, tmp_path):
+        settings = tmp_path / "settings"
+        settings.mkdir()
+        (settings / "jvm.options").write_text("-Xmx1g\n")
+        env_file = tmp_path / "env"
+        env_file.write_text("LOGSTASH_BINARY=/bin/logstash\n")
+
+        controller.ensure_env_jvm_opts(str(env_file), str(settings))
+        first = env_file.read_text()
+        controller.ensure_env_jvm_opts(str(env_file), str(settings))
+
+        assert env_file.read_text() == first
+        assert first.count("LS_JVM_OPTS=") == 1
+
+    def test_replaces_stale_value(self, tmp_path):
+        settings = tmp_path / "settings"
+        settings.mkdir()
+        (settings / "jvm.options").write_text("-Xmx1g\n")
+        env_file = tmp_path / "env"
+        env_file.write_text("LS_JVM_OPTS=/old/path/jvm.options\n")
+
+        controller.ensure_env_jvm_opts(str(env_file), str(settings))
+
+        text = env_file.read_text()
+        assert "/old/path/jvm.options" not in text
+        assert text.count("LS_JVM_OPTS=") == 1
+
+    def test_preserves_keystore_password(self, tmp_path):
+        settings = tmp_path / "settings"
+        settings.mkdir()
+        (settings / "jvm.options").write_text("-Xmx1g\n")
+        env_file = tmp_path / "env"
+        env_file.write_text("LOGSTASH_KEYSTORE_PASS=s3cret\nLOGSTASH_PATH_DATA=/d\n")
+
+        controller.ensure_env_jvm_opts(str(env_file), str(settings))
+
+        text = env_file.read_text()
+        assert "LOGSTASH_KEYSTORE_PASS=s3cret" in text
+        assert "LOGSTASH_PATH_DATA=/d" in text
+
+    def test_removes_line_when_jvm_options_absent(self, tmp_path):
+        """A missing file would make JvmOptionsParser fail Logstash startup."""
+        settings = tmp_path / "settings"
+        settings.mkdir()
+        env_file = tmp_path / "env"
+        env_file.write_text("LOGSTASH_BINARY=/bin/logstash\nLS_JVM_OPTS=/gone/jvm.options\n")
+
+        assert controller.ensure_env_jvm_opts(str(env_file), str(settings)) is True
+
+        text = env_file.read_text()
+        assert "LS_JVM_OPTS" not in text
+        assert "LOGSTASH_BINARY=/bin/logstash" in text
+
+    def test_no_env_file_is_a_noop(self, tmp_path):
+        # Packaged mode has no per-instance env file in state.
+        assert controller.ensure_env_jvm_opts(None, str(tmp_path)) is False
+
+
+class TestHealStaleLogstashLaunch:
+    def _state(self, tmp_path, mode="managed", **extra):
+        settings = tmp_path / "settings"
+        settings.mkdir(exist_ok=True)
+        (settings / "jvm.options").write_text("-Xmx1g\n")
+        state = {
+            "mode": mode,
+            "settings_path": str(settings),
+            "keystore_env_file": str(tmp_path / "env"),
+            "logstash_unit": "logstash-managed@1",
+        }
+        state.update(extra)
+        return state
+
+    def test_packaged_mode_is_skipped(self, tmp_path):
+        state = self._state(tmp_path, mode="packaged")
+        assert controller.heal_stale_logstash_launch(state) is False
+        assert not (tmp_path / "env").exists()
+
+    def test_adds_ls_jvm_opts_without_touching_units(self, tmp_path):
+        state = self._state(tmp_path)
+        unit = tmp_path / "logstash-managed@.service"
+        unit.write_text('ExecStart=/bin/bash -c \'exec "${LOGSTASH_BINARY}" --path.settings "${LOGSTASH_PATH_SETTINGS}"\'\n')
+
+        with patch.dict(
+            controller_installer().INSTALL_PATHS,
+            {"logstash_managed_unit": str(unit)},
+        ), patch.object(
+            controller_installer(), "install_multi_instance_unit_templates"
+        ) as reinstall:
+            assert controller.heal_stale_logstash_launch(state) is True
+
+        reinstall.assert_not_called()
+        assert "LS_JVM_OPTS=" in (tmp_path / "env").read_text()
+
+    def test_stale_unit_triggers_template_reinstall_as_root(self, tmp_path):
+        state = self._state(tmp_path)
+        unit = tmp_path / "logstash-managed@.service"
+        unit.write_text('ExecStart=/bin/bash -c \'exec "${LOGSTASH_BINARY}" --path.settings="${LOGSTASH_PATH_SETTINGS}"\'\n')
+
+        with patch.dict(
+            controller_installer().INSTALL_PATHS,
+            {"logstash_managed_unit": str(unit)},
+        ), patch.object(
+            controller_installer(), "install_multi_instance_unit_templates"
+        ) as reinstall, patch.object(controller.os, "geteuid", return_value=0, create=True):
+            assert controller.heal_stale_logstash_launch(state) is True
+
+        reinstall.assert_called_once()
+
+    def test_stale_unit_escalates_via_sudo_when_not_root(self, tmp_path):
+        state = self._state(tmp_path)
+        unit = tmp_path / "logstash-managed@.service"
+        unit.write_text('ExecStart=/bin/bash -c \'exec "${LOGSTASH_BINARY}" --path.settings="${LOGSTASH_PATH_SETTINGS}"\'\n')
+
+        inst = controller_installer()
+        with patch.dict(
+            inst.INSTALL_PATHS, {"logstash_managed_unit": str(unit)}
+        ), patch.object(inst, "policy_config_from_state", return_value={"policy_type": "MANAGED"}), patch.object(
+            inst, "ensure_simulate_setup", return_value={"status": "complete", "via": "sudo"}
+        ) as escalate, patch.object(
+            controller.os, "geteuid", return_value=1000, create=True
+        ):
+            assert controller.heal_stale_logstash_launch(state) is True
+
+        escalate.assert_called_once()
+
+    def test_failed_escalation_still_leaves_env_fix(self, tmp_path):
+        state = self._state(tmp_path)
+        unit = tmp_path / "logstash-managed@.service"
+        unit.write_text('ExecStart=/bin/bash -c \'exec "${LOGSTASH_BINARY}" --path.settings="${LOGSTASH_PATH_SETTINGS}"\'\n')
+
+        inst = controller_installer()
+        with patch.dict(
+            inst.INSTALL_PATHS, {"logstash_managed_unit": str(unit)}
+        ), patch.object(inst, "policy_config_from_state", return_value={}), patch.object(
+            inst, "ensure_simulate_setup", side_effect=RuntimeError("no sudo")
+        ), patch.object(controller.os, "geteuid", return_value=1000, create=True):
+            controller.heal_stale_logstash_launch(state)
+
+        # The env-file half alone is enough to fix the bug.
+        assert "LS_JVM_OPTS=" in (tmp_path / "env").read_text()
+
+
+def controller_installer():
+    from logstashagent import installer
+
+    return installer
 
 
 class TestUpdateLog4j2Properties:
@@ -515,6 +698,140 @@ class TestCheckIn:
                 out = controller.check_in()
 
         assert out["success"] is False
+
+    def test_via_ui_flip_alone_triggers_get_config_changes(self):
+        """
+        Ticking the proxy checkbox does not move the revision number, so the
+        via_ui comparison is the only thing that can trigger the fetch.
+        """
+        from unittest.mock import ANY
+
+        state = {
+            "enrolled": True,
+            "logstash_ui_url": "http://localhost:8000",
+            "api_key": "k",
+            "connection_id": "c",
+            "revision_number": 5,
+            "logstash_source": "VERSION",
+            "logstash_version": "9.4.3",
+            "logstash_via_ui": False,
+        }
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "success": True,
+            "current_revision_number": 5,  # unchanged
+            "logstash_source": "VERSION",
+            "logstash_version": "9.4.3",
+            "logstash_via_ui": True,  # the only change
+            "settings_path": "/a/",
+            "logs_path": "/l/",
+            "binary_path": "/b/",
+        }
+        gcc_result = {
+            "ran": False, "files_updated": False, "requires_restart": False,
+            "failed_operations": [], "aborted": False, "current_revision": 5,
+            "snmp_changes": None,
+        }
+
+        with patch.object(controller.agent_state, "get_state", return_value=state):
+            with patch.object(controller.agent_state, "update_state"):
+                with patch.object(
+                    controller, "get_config_changes", return_value=gcc_result
+                ) as gcc:
+                    with patch.object(controller, "_apply_merged_plan"):
+                        with patch.object(
+                            controller.requests, "post", return_value=resp
+                        ):
+                            controller.check_in()
+
+        gcc.assert_called_once_with("/a/", "/l/", "/b/", plan=ANY)
+
+    def test_via_ui_unchanged_does_not_trigger_fetch(self):
+        state = {
+            "enrolled": True,
+            "logstash_ui_url": "http://localhost:8000",
+            "api_key": "k",
+            "connection_id": "c",
+            "revision_number": 5,
+            "logstash_source": "VERSION",
+            "logstash_version": "9.4.3",
+            "logstash_via_ui": True,
+        }
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "success": True,
+            "current_revision_number": 5,
+            "logstash_source": "VERSION",
+            "logstash_version": "9.4.3",
+            "logstash_via_ui": True,
+        }
+
+        with patch.object(controller.agent_state, "get_state", return_value=state):
+            with patch.object(controller.agent_state, "update_state"):
+                with patch.object(controller, "get_config_changes") as gcc:
+                    with patch.object(controller, "_apply_merged_plan"):
+                        with patch.object(
+                            controller.requests, "post", return_value=resp
+                        ):
+                            controller.check_in()
+
+        gcc.assert_not_called()
+
+
+class TestGetConfigChangesViaUiReporting:
+    """
+    The server compares the agent's reported logstash_via_ui against the policy
+    to compute runtime_changed. Omitting the key defaults it to False, which
+    silently prevents a checkbox-only change from ever being applied.
+    """
+
+    def _run(self, tmp_path, state, env=None, monkeypatch=None):
+        settings = tmp_path / "settings"
+        settings.mkdir()
+        (settings / "logstash.yml").write_text("a: 1\n", encoding="utf-8")
+        (settings / "jvm.options").write_text("-Xmx1g\n", encoding="utf-8")
+        (settings / "log4j2.properties").write_text("x=y\n", encoding="utf-8")
+
+        full_state = {
+            "logstash_ui_url": "http://localhost:8000",
+            "api_key": "k",
+            "connection_id": 7,
+            "settings_path": str(settings),
+        }
+        full_state.update(state)
+
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"success": True, "changes": {}}
+
+        with patch.object(
+            controller.agent_state, "get_state", return_value=full_state
+        ):
+            with patch.object(controller, "build_pipelines_state", return_value={}):
+                with patch.object(
+                    controller.requests, "post", return_value=resp
+                ) as post:
+                    controller.get_config_changes()
+        return post.call_args.kwargs["json"]
+
+    def test_sends_via_ui_true(self, tmp_path):
+        body = self._run(tmp_path, {"logstash_via_ui": True})
+        assert body["logstash_via_ui"] is True
+
+    def test_sends_via_ui_false_when_absent(self, tmp_path):
+        body = self._run(tmp_path, {})
+        assert body["logstash_via_ui"] is False
+
+    def test_reports_state_not_env_override(self, tmp_path, monkeypatch):
+        """
+        The env escape hatch must not be reported: it would disagree with policy
+        permanently and re-trigger a runtime delta on every single check-in.
+        """
+        monkeypatch.setenv("LOGSTASH_AGENT_LOGSTASH_VIA_UI", "1")
+        body = self._run(tmp_path, {"logstash_via_ui": False})
+        assert body["logstash_via_ui"] is False
 
 
 class TestRunController:

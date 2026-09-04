@@ -11,12 +11,16 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import http.client
+import json
 import logging
 import os
 import platform
 import shutil
 import tarfile
 import tempfile
+import time
+import urllib.error
 import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
@@ -29,6 +33,24 @@ _LEGACY_DOWNLOAD_ROOT = "/opt/LogstashAgent/logstash-versions"
 ARTIFACTS_BASE = "https://artifacts.elastic.co/downloads/logstash"
 VIA_UI_ENV = "LOGSTASH_AGENT_LOGSTASH_VIA_UI"
 _TRUTHY_FLAGS = {"1", "true", "yes", "on"}
+
+# --- via-UI artifact proxy tuning -------------------------------------------
+# Wall-clock cap on a single ensure. On expiry the download fails and the
+# caller (controller._version_download_worker) records status=failed; the next
+# check-in re-triggers a fresh attempt, and the .part file is kept for resume.
+ARTIFACT_DEADLINE_ENV = "LOGSTASH_AGENT_ARTIFACT_DEADLINE_SEC"
+DEFAULT_ARTIFACT_DEADLINE_SEC = 3600.0
+# Matches the server's 256 KiB streaming chunk.
+_DOWNLOAD_CHUNK = 256 * 1024
+# Cold cache (503), serve-cap back-pressure (429), upstream failure (502).
+_RETRYABLE_STATUSES = frozenset({429, 502, 503})
+# Bad key / wrong connection_id, unknown filename, wrong method. Never retry.
+_FATAL_STATUSES = frozenset({401, 404, 405})
+# Own backoff when the server sends no Retry-After (spec §6).
+_BACKOFF_START_SEC = 15.0
+_BACKOFF_CEILING_SEC = 300.0
+# Discard .part files nobody resumed within this window.
+_PARTIAL_MAX_AGE_SEC = 86400.0
 
 
 class LogstashDownloadError(Exception):
@@ -100,8 +122,19 @@ def artifact_url(
     *,
     via_ui: Optional[bool] = None,
     logstash_ui_url: Optional[str] = None,
+    connection_id: Optional[int | str] = None,
     state: Optional[dict] = None,
 ) -> str:
+    """
+    Artifact URL for ``version``.
+
+    Elastic: ``{ARTIFACTS_BASE}/{filename}``.
+    Via-UI:  ``{logstash_ui_url}/ConnectionManager/LogstashArtifact/{connection_id}/{filename}``
+
+    ``connection_id`` is in the path because a GET carries no body and the agent
+    API key is a bare PBKDF2 hash with no lookup column — the server needs it to
+    narrow to one row before check_password runs.
+    """
     name = artifact_filename(version, platform_arch)
     if via_ui is None:
         via_ui = logstash_via_ui_enabled(state)
@@ -115,7 +148,15 @@ def artifact_url(
         raise LogstashDownloadError(
             "logstash_via_ui is enabled but logstash_ui_url is missing"
         )
-    return f"{base.rstrip('/')}/ConnectionManager/LogstashArtifact/{name}"
+    cid = connection_id
+    if cid in (None, ""):
+        st = state if state is not None else _agent_state()
+        cid = (st or {}).get("connection_id")
+    if cid in (None, ""):
+        raise LogstashDownloadError(
+            "logstash_via_ui is enabled but connection_id is missing"
+        )
+    return f"{base.rstrip('/')}/ConnectionManager/LogstashArtifact/{cid}/{name}"
 
 
 def _via_ui_auth_headers(
@@ -129,6 +170,13 @@ def _via_ui_auth_headers(
         raise LogstashDownloadError(
             "logstash_via_ui is enabled but api_key is missing"
         )
+    if key.startswith("lsui_"):
+        # ApiTokenCsrfMiddleware classifies lsui_-prefixed values as admin tokens
+        # and 401s before the artifact view ever runs.
+        raise LogstashDownloadError(
+            "api_key has an lsui_ prefix (admin token); the artifact proxy needs "
+            "the raw enrollment key"
+        )
     return {"Authorization": f"ApiKey {key}"}
 
 
@@ -136,6 +184,130 @@ def _ssl_context():
     from logstashagent.tls_trust import build_ssl_context
 
     return build_ssl_context()
+
+
+def _artifact_deadline_sec() -> float:
+    """Wall-clock cap for one ensure, overridable via env."""
+    raw = os.environ.get(ARTIFACT_DEADLINE_ENV)
+    if not raw:
+        return DEFAULT_ARTIFACT_DEADLINE_SEC
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid %s=%r; using %.0f s", ARTIFACT_DEADLINE_ENV, raw,
+            DEFAULT_ARTIFACT_DEADLINE_SEC,
+        )
+        return DEFAULT_ARTIFACT_DEADLINE_SEC
+    return val if val > 0 else DEFAULT_ARTIFACT_DEADLINE_SEC
+
+
+def _retry_after_seconds(headers) -> Optional[float]:
+    """
+    Parse ``Retry-After`` (delta-seconds form) from a response.
+
+    The server's values are tunable constants, so they are honoured verbatim
+    rather than hardcoded here. Returns None when absent or unparseable, in
+    which case the caller falls back to its own backoff.
+    """
+    if headers is None:
+        return None
+    try:
+        raw = headers.get("Retry-After")
+    except AttributeError:
+        return None
+    if raw is None:
+        return None
+    try:
+        val = float(str(raw).strip())
+    except (TypeError, ValueError):
+        # HTTP-date form: not emitted by this server, and guessing is worse
+        # than falling back to our own schedule.
+        return None
+    if val < 0:
+        return None
+    return min(val, _BACKOFF_CEILING_SEC * 2)
+
+
+def _own_backoff(attempt: int) -> float:
+    """Exponential from 15 s, hard ceiling 300 s (spec §6)."""
+    return min(_BACKOFF_START_SEC * (2**max(0, attempt)), _BACKOFF_CEILING_SEC)
+
+
+def _partial_dir(download_root: str) -> Path:
+    return Path(download_root) / ".partial"
+
+
+def _sweep_stale_partials(
+    download_root: str, max_age_sec: float = _PARTIAL_MAX_AGE_SEC
+) -> None:
+    """Drop .part files nobody resumed — orphans from a killed agent."""
+    pdir = _partial_dir(download_root)
+    if not pdir.is_dir():
+        return
+    now = time.time()
+    try:
+        entries = list(pdir.iterdir())
+    except OSError:
+        return
+    for path in entries:
+        if not path.name.endswith(".part"):
+            continue
+        try:
+            age = now - path.stat().st_mtime
+        except OSError:
+            continue
+        if age > max_age_sec:
+            try:
+                path.unlink()
+                logger.info(
+                    "Swept stale partial download %s (%.0f h old)", path.name, age / 3600
+                )
+            except OSError as e:
+                logger.debug("Could not sweep %s: %s", path, e)
+
+
+def _http_error_body(exc: urllib.error.HTTPError, limit: int = 200) -> str:
+    """Best-effort short body read for logging. Consumes the error stream."""
+    try:
+        return exc.read().decode("utf-8", errors="replace").strip()[:limit]
+    except Exception:
+        return ""
+
+
+def _log_retryable(code: int, name: str, delay: float, exc: urllib.error.HTTPError) -> None:
+    """
+    Log a retryable artifact response.
+
+    503 is the *normal* cold-cache answer, so it stays at debug and carries the
+    server's real fetch progress. 502 means the upstream fetch failed and is
+    logged loudly — retrying also re-triggers the fetch server-side.
+    """
+    if code == 502:
+        logger.error(
+            "Artifact proxy upstream fetch failed (502) for %s; retrying in %.0fs: %s",
+            name, delay, _http_error_body(exc),
+        )
+        return
+    if code == 503:
+        percent = None
+        try:
+            percent = json.loads(exc.read() or b"{}").get("percent")
+        except Exception:
+            pass
+        if percent is not None:
+            logger.debug(
+                "Artifact %s not cached yet (server %s%% fetched); retrying in %.0fs",
+                name, percent, delay,
+            )
+        else:
+            logger.debug(
+                "Artifact %s not cached yet; retrying in %.0fs", name, delay
+            )
+        return
+    logger.debug(
+        "Artifact proxy at serve cap (429) for %s; retrying in %.0fs", name, delay
+    )
 
 
 def version_dir_name(version: str) -> str:
@@ -249,20 +421,170 @@ def chown_tree_to_logstash(path: Path | str) -> None:
 
 
 def _download_file(
-    url: str, dest: Path, timeout: int = 600, headers: Optional[dict] = None
+    url: str,
+    dest: Path,
+    timeout: int = 600,
+    headers: Optional[dict] = None,
+    *,
+    via_ui: bool = False,
+    download_root: Optional[str] = None,
 ) -> None:
-    logger.info("Downloading %s -> %s", url, dest)
+    """
+    Download ``url`` to ``dest``.
+
+    Elastic (``via_ui=False``): single-shot stream, as before.
+
+    Via-UI: resumable and retrying. Bytes land in ``<download_root>/.partial/
+    <name>.part`` — a stable path that survives an agent restart, so a death at
+    440/450 MB resumes with ``Range`` instead of re-pulling everything. 503/429/
+    502 are retried honouring ``Retry-After``; 401/404/405 fail immediately; 416
+    means the partial is wrong, so it is discarded and restarted from zero.
+
+    There is deliberately no fallback to ``artifacts.elastic.co``: a visible
+    retry loop is correct, and reaching the internet would defeat both the
+    bandwidth saving and air-gapped operation.
+    """
+    if not via_ui or not download_root:
+        logger.info("Downloading %s -> %s", url, dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        target: str | urllib.request.Request = (
+            urllib.request.Request(url, headers=headers) if headers else url
+        )
+        try:
+            with urllib.request.urlopen(
+                target, timeout=timeout, context=_ssl_context()
+            ) as resp, open(dest, "wb") as out:
+                shutil.copyfileobj(resp, out)
+        except Exception as exc:
+            raise LogstashDownloadError(f"Download failed for {url}: {exc}") from exc
+        return
+
+    pdir = _partial_dir(download_root)
+    pdir.mkdir(parents=True, exist_ok=True)
+    part = pdir / f"{dest.name}.part"
     dest.parent.mkdir(parents=True, exist_ok=True)
-    target: str | urllib.request.Request = (
-        urllib.request.Request(url, headers=headers) if headers else url
-    )
-    try:
-        with urllib.request.urlopen(
-            target, timeout=timeout, context=_ssl_context()
-        ) as resp, open(dest, "wb") as out:
-            shutil.copyfileobj(resp, out)
-    except Exception as exc:
-        raise LogstashDownloadError(f"Download failed for {url}: {exc}") from exc
+
+    deadline = time.monotonic() + _artifact_deadline_sec()
+    attempt = 0
+    discard_partial = False
+    logger.info("Downloading %s -> %s (via UI artifact proxy)", url, dest)
+
+    while True:
+        if time.monotonic() >= deadline:
+            raise LogstashDownloadError(
+                f"Artifact download deadline exceeded for {dest.name}; "
+                f"partial retained at {part} for resume"
+            )
+
+        if discard_partial:
+            try:
+                part.unlink()
+            except OSError:
+                pass
+            discard_partial = False
+            attempt = 0
+
+        try:
+            offset = part.stat().st_size
+        except OSError:
+            offset = 0
+
+        req_headers = dict(headers or {})
+        if offset > 0:
+            # Single range only — multi-range is answered with a full 200.
+            req_headers["Range"] = f"bytes={offset}-"
+
+        try:
+            req = urllib.request.Request(url, headers=req_headers)
+            with urllib.request.urlopen(
+                req, timeout=timeout, context=_ssl_context()
+            ) as resp:
+                status = getattr(resp, "status", 200)
+                if status == 206:
+                    logger.info(
+                        "Resuming %s from byte %d", dest.name, offset
+                    )
+                    mode = "ab"
+                else:
+                    # 200: whole file, whether or not we asked for a range.
+                    if offset > 0:
+                        logger.debug(
+                            "Server sent 200 for a ranged request; restarting %s from 0",
+                            dest.name,
+                        )
+                    mode = "wb"
+                with open(part, mode) as out:
+                    while True:
+                        chunk = resp.read(_DOWNLOAD_CHUNK)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+        except urllib.error.HTTPError as exc:
+            code = exc.code
+
+            if code == 416:
+                logger.warning(
+                    "Range past EOF for %s (partial was %d B) — discarding and restarting",
+                    dest.name,
+                    offset,
+                )
+                discard_partial = True
+                continue
+
+            if code in _FATAL_STATUSES:
+                raise LogstashDownloadError(
+                    f"HTTP {code} from artifact proxy for {url}: "
+                    f"{_http_error_body(exc)}"
+                ) from exc
+
+            if code in _RETRYABLE_STATUSES:
+                delay = _retry_after_seconds(exc.headers)
+                if delay is None:
+                    delay = _own_backoff(attempt)
+                _log_retryable(code, dest.name, delay, exc)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    continue
+                time.sleep(min(delay, remaining))
+                attempt += 1
+                continue
+
+            raise LogstashDownloadError(
+                f"HTTP {code} from artifact proxy for {url}: "
+                f"{_http_error_body(exc)}"
+            ) from exc
+        except (OSError, http.client.IncompleteRead) as exc:
+            # Connection reset / timeout / truncated read mid-transfer. The bytes
+            # already in .part are kept, so this resumes rather than re-pulling.
+            # Narrowly typed on purpose: a TypeError here must not loop for an
+            # hour. (URLError, ConnectionError and TimeoutError are all OSError.)
+            delay = _own_backoff(attempt)
+            logger.warning(
+                "Transfer of %s interrupted (%s); resuming in %.0fs",
+                dest.name, exc, delay,
+            )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                continue
+            time.sleep(min(delay, remaining))
+            attempt += 1
+            continue
+        except Exception as exc:
+            raise LogstashDownloadError(f"Download failed for {url}: {exc}") from exc
+
+        # The .part lives under download_root; dest is usually a tmpfs temp dir,
+        # so copy rather than os.replace (which cannot cross filesystems).
+        try:
+            shutil.copy2(part, dest)
+        except OSError as exc:
+            raise LogstashDownloadError(
+                f"Could not stage downloaded {dest.name}: {exc}"
+            ) from exc
+        try:
+            part.unlink()
+        except OSError:
+            pass
+        return
 
 
 def _sha512_file(path: Path) -> str:
@@ -284,23 +606,60 @@ def _verify_sha512(
     Verify tarball against the .sha512 sidecar at ``sha_url`` (same origin as the artifact).
 
     When ``required`` is False (Elastic), sidecar fetch failure is non-fatal.
-    When True (via-UI), fetch failure raises LogstashDownloadError.
+    When True (via-UI), fetch failure raises LogstashDownloadError, and a cold
+    cache (503/502) is retried honouring ``Retry-After``. Sidecars are exempt
+    from the server's serve semaphore, so 429 is unlikely but handled anyway.
+
+    The server always has a .sha512 to serve once the row is READY — stored
+    verbatim when upstream published one, otherwise written from the digest the
+    server computed — so verification is never skipped on the via-UI path.
     """
-    target: str | urllib.request.Request = (
-        urllib.request.Request(sha_url, headers=headers) if headers else sha_url
-    )
-    try:
+    def _fetch() -> str:
+        target: str | urllib.request.Request = (
+            urllib.request.Request(sha_url, headers=headers) if headers else sha_url
+        )
         with urllib.request.urlopen(
             target, timeout=timeout, context=_ssl_context()
         ) as resp:
-            text = resp.read().decode("utf-8", errors="replace").strip()
-    except Exception as exc:
-        if required:
-            raise LogstashDownloadError(
-                f"Could not fetch checksum {sha_url}: {exc}"
-            ) from exc
-        logger.warning("Could not fetch checksum %s: %s (skipping verify)", sha_url, exc)
-        return
+            return resp.read().decode("utf-8", errors="replace").strip()
+
+    if not required:
+        try:
+            text = _fetch()
+        except Exception as exc:
+            logger.warning(
+                "Could not fetch checksum %s: %s (skipping verify)", sha_url, exc
+            )
+            return
+    else:
+        deadline = time.monotonic() + _artifact_deadline_sec()
+        attempt = 0
+        while True:
+            if time.monotonic() >= deadline:
+                raise LogstashDownloadError(
+                    f"Deadline exceeded fetching checksum {sha_url}"
+                )
+            try:
+                text = _fetch()
+                break
+            except urllib.error.HTTPError as exc:
+                if exc.code not in _RETRYABLE_STATUSES:
+                    raise LogstashDownloadError(
+                        f"Could not fetch checksum {sha_url}: {exc}"
+                    ) from exc
+                delay = _retry_after_seconds(exc.headers)
+                if delay is None:
+                    delay = _own_backoff(attempt)
+                _log_retryable(exc.code, f"{tarball.name}.sha512", delay, exc)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    continue
+                time.sleep(min(delay, remaining))
+                attempt += 1
+            except Exception as exc:
+                raise LogstashDownloadError(
+                    f"Could not fetch checksum {sha_url}: {exc}"
+                ) from exc
 
     # Format is typically: "<hex>  filename" or just hex
     expected = text.split()[0].lower()
@@ -343,6 +702,7 @@ def ensure_logstash_version(
     force: bool = False,
     logstash_ui_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    connection_id: Optional[int | str] = None,
 ) -> Path:
     """
     Ensure Logstash ``version`` is present under download_root.
@@ -363,6 +723,7 @@ def ensure_logstash_version(
             force=force,
             logstash_ui_url=logstash_ui_url,
             api_key=api_key,
+            connection_id=connection_id,
         )
 
 
@@ -374,6 +735,7 @@ def _ensure_logstash_version_locked(
     force: bool = False,
     logstash_ui_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    connection_id: Optional[int | str] = None,
 ) -> Path:
     root = Path(download_root)
     install_dir = version_install_dir(version, download_root)
@@ -391,11 +753,14 @@ def _ensure_logstash_version_locked(
     platform_arch = platform_arch or detect_platform_arch()
     via_ui = logstash_via_ui_enabled()
     state = _agent_state() if via_ui else None
+    if via_ui:
+        _sweep_stale_partials(download_root)
     url = artifact_url(
         version,
         platform_arch,
         via_ui=via_ui,
         logstash_ui_url=logstash_ui_url,
+        connection_id=connection_id,
         state=state,
     )
     sha_url = url + ".sha512"
@@ -410,7 +775,13 @@ def _ensure_logstash_version_locked(
     with tempfile.TemporaryDirectory(prefix="ls-download-") as tmp:
         tmp_path = Path(tmp)
         tarball = tmp_path / artifact_filename(version, platform_arch)
-        _download_file(url, tarball, headers=headers)
+        _download_file(
+            url,
+            tarball,
+            headers=headers,
+            via_ui=via_ui,
+            download_root=download_root,
+        )
         _verify_sha512(
             tarball,
             sha_url,

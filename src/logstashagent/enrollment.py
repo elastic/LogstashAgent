@@ -375,6 +375,13 @@ def save_enrollment_config(api_key: str, logstash_ui_url: str, policy_id: int, c
             agent_state.update_state(
                 'logstash_download_dir', policy_config.get('logstash_download_dir')
             )
+        # Server normalises this to False unless MANAGED/SIMULATE + VERSION, so
+        # trust it rather than re-deriving. Without persisting it here the agent
+        # pulls from Elastic until the first check-in or config delta arrives.
+        if policy_config.get('logstash_via_ui') is not None:
+            agent_state.update_state(
+                'logstash_via_ui', bool(policy_config.get('logstash_via_ui'))
+            )
         # Full policy_config for deferred root setup (non-root --enroll)
         if policy_config:
             agent_state.update_state('policy_config', policy_config)
