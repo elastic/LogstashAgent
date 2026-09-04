@@ -430,26 +430,9 @@ is_systemctl_managed_logstash = is_systemctl_managed_simulate
 
 def sim_logstash_api_port() -> int:
     """HTTP API port for the Logstash instance this agent manages."""
-    state = agent_state.get_state() or {}
-    for key in ('logstash_api_port', 'api_port'):
-        if state.get(key) is not None:
-            try:
-                return int(state[key])
-            except (TypeError, ValueError):
-                pass
-    instance_id = state.get('instance_id')
-    if instance_id is None:
-        instance_id = (AGENT_CONFIG or {}).get('instance_id')
-    mode = (state.get('mode') or (AGENT_CONFIG or {}).get('mode') or '').lower()
-    if instance_id is not None:
-        try:
-            n = int(instance_id)
-            if mode == 'managed':
-                return 9700 + n
-            return 9560 + n
-        except (TypeError, ValueError):
-            pass
-    return int((AGENT_CONFIG or {}).get('logstash_api_port') or 9560)
+    from logstashagent.logstash_api import resolve_logstash_api_port
+
+    return resolve_logstash_api_port()
 
 
 # Restart counter for systemctl-managed simulate (supervisor has its own)
@@ -4049,20 +4032,13 @@ if __name__ == "__main__":
 
     # Check if we're in run mode (controller for enrolled packaged/managed/simulate agents)
     if args.run:
-        # Persist the Logstash API port from config/state so check_in uses the right port.
-        # packaged: 9600; simulate: 9560+N; managed: 9700+N; embedded: 9560
+        from logstashagent.logstash_api import persist_resolved_logstash_api_port
+
         state = agent_state.get_state()
-        if state.get('logstash_api_port'):
-            logstash_api_port = state.get('logstash_api_port')
-        elif agent_mode == 'simulate' and state.get('instance_id') is not None:
-            logstash_api_port = 9560 + int(state['instance_id'])
-        elif agent_mode == 'managed' and state.get('instance_id') is not None:
-            logstash_api_port = 9700 + int(state['instance_id'])
-        elif agent_mode == 'embedded':
-            logstash_api_port = AGENT_CONFIG.get('logstash_api_port', 9560)
-        else:
-            logstash_api_port = AGENT_CONFIG.get('logstash_api_port', 9600)
-        agent_state.update_state('api_port', logstash_api_port)
+        logstash_api_port = persist_resolved_logstash_api_port(
+            yml_port=AGENT_CONFIG.get("logstash_api_port"),
+            mode=agent_mode,
+        )
         # Persist normalized mode so later restarts and status_blob use the new vocabulary
         if not state.get('mode') or mode_legacy:
             agent_state.update_state('mode', agent_mode)

@@ -82,6 +82,17 @@ class TestSimLogstashApiPort:
         ):
             assert main.sim_logstash_api_port() == 9564
 
+    def test_env_wins(self, monkeypatch, tmp_path):
+        from logstashagent import agent_state
+
+        monkeypatch.setenv("LOGSTASH_API_PORT", "9561")
+        agent_state.configure_state_dir(tmp_path)
+        try:
+            agent_state.update_state("logstash_api_port", 9600)
+            assert main.sim_logstash_api_port() == 9561
+        finally:
+            agent_state.configure_state_dir(None)
+
 
 class TestCheckSimLogstashHealth:
     def test_systemctl_path_probes_api(self):
