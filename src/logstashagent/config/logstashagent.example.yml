@@ -20,6 +20,11 @@
 #   Logstash API:  LOGSTASH_API_PORT                 → state / yml
 #   LS paths:      env LOGSTASH_BINARY, LOGSTASH_PATH_* → yml paths
 #   UI URL:        state / LOGSTASH_UI_URL           → yml logstash_ui_url
+#   Agent API TLS: LOGSTASH_AGENT_TLS (default true; false serves HTTP)
+#   UI cert verify: LOGSTASH_UI_TLS_INSECURE (default false; https UI only)
+#   UI encryption:  URL prefix http:// vs https:// (not a yml key)
+#
+# Disabling TLS or UI cert verify is not recommended / not best practice.
 #
 # Keep this file as a human-readable fallback. Do not duplicate secrets here;
 # keystore password lives in instance env as LOGSTASH_KEYSTORE_PASS.

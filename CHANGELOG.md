@@ -11,6 +11,8 @@ Package version is **0.5.2**. Works with **LogstashUI 0.5.1 & 0.5.2**.
 - Agents report `logstash_via_ui` in the `GetConfigChanges` body, so toggling the proxy checkbox alone produces a `logstash_runtime` delta. The **persisted state** value is sent, not the env override, which would otherwise disagree with policy permanently. Check-in drift detection compares it too, since a checkbox flip does not move the revision number.
 - `logstash_via_ui` is now read from all three server channels: enrollment `policy_config` (previously dropped), check-in, and the config delta's `logstash_runtime.via_ui`.
 - `logstash-agent --version` prints agent version and exits (lightweight).
+- `LOGSTASH_AGENT_TLS` (default true) disables FastAPI SSL termination when false. Inbound HTTPS also requires an `https://` UI URL and a pinned product CA; leftover `agent-server.crt` is not enough. Not recommended.
+- `LOGSTASH_UI_TLS_INSECURE` (default false) skips verifying the LogstashUI certificate when the UI URL is `https://`. The agent still attempts the well-known CA pin and does not fail if it misses. `http://` UI URLs skip pin/verify entirely. Not recommended. Elastic artifact downloads still verify.
 
 ### Changed
 

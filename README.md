@@ -42,6 +42,23 @@ Legacy aliases (rewritten on load / CLI): `default` and `agent` → **packaged**
 | Logstash binary & paths | Logstash env (`LOGSTASH_BINARY`, `LOGSTASH_PATH_*`) | yml / state |
 | UI URL | state / `LOGSTASH_UI_URL` | yml `logstash_ui_url` |
 
+### TLS (not recommended to disable)
+
+By default the agent serves FastAPI over HTTPS (product-CA cert) and verifies LogstashUI certificates.
+
+These knobs are **not recommended** and **not best practice**. They exist for lab or broken-PKI setups. Leave them unset in production.
+
+| Env | Default | Effect |
+|-----|---------|--------|
+| `LOGSTASH_AGENT_TLS` | `true` | Set `false` / `0` / `no` / `off` to serve the agent API over HTTP (no SSL termination). |
+| `LOGSTASH_UI_TLS_INSECURE` | `false` | Set `true` / `1` / `yes` / `on` to skip verifying the UI certificate when the UI URL is `https://`. |
+
+The UI URL scheme is the only signal for agent→UI encryption: `https://` uses TLS; `http://` is plaintext (CA pin skipped; the insecure env does not apply). Missing or unknown scheme is treated as not TLS and logged as an error; the URL is not rewritten.
+
+Inbound FastAPI HTTPS requires **all** of: `LOGSTASH_AGENT_TLS` not disabled, UI URL `https://`, and a pinned product CA (after the usual wait). No CA ⇒ HTTP, even if a leftover `agent-server.crt` is on disk. Restart the agent after the CA becomes available.
+
+Env only (systemd `agent.env` / compose). Not yml keys. LogstashUI has a separate flag for dialing agents over HTTP; the agent does not advertise `http` vs `https` in enroll/check-in.
+
 **Upgrade:** Existing production agents keep working **without re-enroll** after package upgrade. Use a **Simulate** or **Managed** policy token when adding multi-instance roles.
 
 ## Features
