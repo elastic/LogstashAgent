@@ -339,6 +339,7 @@ def test_install_binary_dest_older_assume_yes_replaces_atomic(tmp_path, monkeypa
 
     assert dest.read_bytes() == src.read_bytes()
     assert not os.path.exists(f"{dest}.new")
+    assert not os.path.exists(f"{dest}.backup")
     dest_abs = os.path.abspath(str(dest))
     assert dest_abs not in copy_dests
     assert os.access(dest, os.X_OK)
@@ -391,6 +392,7 @@ def test_install_binary_dest_older_input_y_replaces(tmp_path, monkeypatch):
 
     assert dest.read_bytes() == src.read_bytes()
     assert not os.path.exists(f"{dest}.new")
+    assert not os.path.exists(f"{dest}.backup")
     assert prompts, "expected upgrade prompt"
     assert "0.4.0" in prompts[0]
     assert "0.5.2" in prompts[0]
@@ -438,6 +440,7 @@ def test_perform_installation_dest_older_assume_yes_still_enrolls(
 
     assert dest.read_bytes() == src.read_bytes()
     assert not os.path.exists(f"{dest}.new")
+    assert not os.path.exists(f"{dest}.backup")
     dest_abs = os.path.abspath(str(dest))
     assert dest_abs not in copy_dests
     assert order == ["install_binary", "enrollment"]
@@ -465,6 +468,94 @@ def test_perform_installation_dest_older_input_n_still_enrolls(tmp_path, monkeyp
     assert dest.read_bytes() == before
     assert dest.stat().st_mtime_ns == mtime_ns
     enrollment_func.assert_called_once()
+
+
+def test_install_binary_dest_older_input_eof_leaves_dest(tmp_path, monkeypatch):
+    dest, _src, _binary_dir, _internal = _prepare_install_binary(tmp_path, monkeypatch)
+    monkeypatch.setattr(installer, "installed_agent_version", lambda: "0.4.0")
+    monkeypatch.setattr(installer, "source_agent_version", lambda: "0.5.2")
+    before = dest.read_bytes()
+    mtime_ns = dest.stat().st_mtime_ns
+
+    def eof(_prompt=""):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", eof)
+    restart = MagicMock()
+    monkeypatch.setattr(installer, "_restart_running_agent_units", restart)
+
+    installer.install_binary()
+
+    assert dest.read_bytes() == before
+    assert dest.stat().st_mtime_ns == mtime_ns
+    restart.assert_not_called()
+
+
+def test_install_binary_dest_older_input_empty_leaves_dest(tmp_path, monkeypatch):
+    dest, _src, _binary_dir, _internal = _prepare_install_binary(tmp_path, monkeypatch)
+    monkeypatch.setattr(installer, "installed_agent_version", lambda: "0.4.0")
+    monkeypatch.setattr(installer, "source_agent_version", lambda: "0.5.2")
+    before = dest.read_bytes()
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "")
+    restart = MagicMock()
+    monkeypatch.setattr(installer, "_restart_running_agent_units", restart)
+
+    installer.install_binary()
+
+    assert dest.read_bytes() == before
+    restart.assert_not_called()
+
+
+def test_perform_installation_dest_older_input_eof_still_enrolls(
+    tmp_path, monkeypatch
+):
+    dest, _src, _binary_dir, _internal = _prepare_install_binary(
+        tmp_path, monkeypatch, frozen=False
+    )
+    monkeypatch.setattr(installer, "installed_agent_version", lambda: "0.4.0")
+    monkeypatch.setattr(installer, "source_agent_version", lambda: "0.5.2")
+    _stub_perform_installation_around_binary(monkeypatch, tmp_path)
+    before = dest.read_bytes()
+    mtime_ns = dest.stat().st_mtime_ns
+
+    def eof(_prompt=""):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", eof)
+    enrollment_func = MagicMock(return_value={})
+
+    installer.perform_installation(
+        enroll_token="tok",
+        logstash_ui_url="http://example.test",
+        agent_id="agent-1",
+        enrollment_func=enrollment_func,
+    )
+
+    assert dest.read_bytes() == before
+    assert dest.stat().st_mtime_ns == mtime_ns
+    enrollment_func.assert_called_once()
+
+
+def test_install_binary_dest_older_assume_yes_replaces_internal(
+    tmp_path, monkeypatch
+):
+    dest, src, binary_dir, dest_internal = _prepare_install_binary(
+        tmp_path, monkeypatch, frozen=True, create_internal=True
+    )
+    src_internal = src.parent / "_internal"
+    src_internal.mkdir()
+    (src_internal / "marker").write_text("new")
+    monkeypatch.setattr(installer, "installed_agent_version", lambda: "0.4.0")
+    monkeypatch.setattr(installer, "source_agent_version", lambda: "0.5.2")
+    restart = _stub_binary_side_effects(monkeypatch)
+
+    installer.install_binary(assume_yes=True)
+
+    assert dest.read_bytes() == src.read_bytes()
+    assert (dest_internal / "marker").read_text() == "new"
+    assert not os.path.exists(f"{dest}.backup")
+    assert not os.path.exists(binary_dir / "_internal.backup")
+    restart.assert_called_once()
 
 
 def test_install_binary_missing_dest_atomic_install(tmp_path, monkeypatch):

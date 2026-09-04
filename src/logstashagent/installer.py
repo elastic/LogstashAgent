@@ -791,7 +791,10 @@ def _confirm_upgrade_older_binary(
             src_ver,
         )
         return True
-    answer = input(prompt).strip().lower()
+    try:
+        answer = input(prompt).strip().lower()
+    except EOFError:
+        answer = ''
     return answer == 'y'
 
 
@@ -811,6 +814,25 @@ def _backup_installed_binary() -> None:
             shutil.rmtree(internal_backup_path)
         shutil.copytree(internal_current, internal_backup_path)
         logger.info("✓ Backed up dependencies to %s", internal_backup_path)
+
+
+def _remove_installed_binary_backups() -> None:
+    """Drop dest.backup and _internal.backup after a successful in-place replace."""
+    dest = INSTALL_PATHS['binary']
+    backup_path = f"{dest}.backup"
+    if os.path.exists(backup_path):
+        try:
+            os.remove(backup_path)
+            logger.info("✓ Removed backup binary: %s", backup_path)
+        except OSError as e:
+            logger.warning("Could not remove backup binary: %s", e)
+    internal_backup_path = f"{INSTALL_PATHS['binary_dir']}/_internal.backup"
+    if os.path.exists(internal_backup_path):
+        try:
+            shutil.rmtree(internal_backup_path)
+            logger.info("✓ Removed backup dependencies: %s", internal_backup_path)
+        except OSError as e:
+            logger.warning("Could not remove backup dependencies: %s", e)
 
 
 def _packaged_agent_unit_name() -> str:
@@ -935,6 +957,7 @@ def install_binary(*, assume_yes: bool = False):
             _install_pyinstaller_internal(source_binary)
         _restorecon_binary(dest)
         _restart_running_agent_units()
+        _remove_installed_binary_backups()
         return
 
     _install_binary_atomic(source_binary, dest)
