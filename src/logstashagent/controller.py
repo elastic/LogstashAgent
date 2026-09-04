@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from cryptography.fernet import Fernet
 from . import agent_state
 from . import log_analyzer
+from .logstash_api import persist_resolved_logstash_api_port
 from .ls_keystore_utils import LogstashKeystore
 from .ls_keystore_utils.exceptions import (
     LogstashKeystoreException,
@@ -3219,7 +3220,7 @@ def check_in():
             'runtime_download': state.get('runtime_download'),
         }
 
-        api_port = state.get('api_port', 9600)
+        api_port = persist_resolved_logstash_api_port()
         status_blob['logstash_api'] = get_logstash_api_status(api_port)
         status_blob['health_report'] = get_logstash_health_report(api_port)
         status_blob['node_stats'] = get_logstash_node_stats(api_port)

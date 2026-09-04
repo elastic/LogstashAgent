@@ -11,6 +11,7 @@ import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
 import requests
 
 from logstashagent import controller
@@ -598,6 +599,15 @@ class TestGetConfigChanges:
 
 
 class TestCheckIn:
+    @pytest.fixture(autouse=True)
+    def _stub_persist_port(self):
+        with patch(
+            "logstashagent.controller.persist_resolved_logstash_api_port",
+            return_value=9600,
+            create=True,
+        ):
+            yield
+
     def test_not_enrolled_returns_none(self):
         with patch.object(controller.agent_state, "get_state", return_value={}):
             assert controller.check_in() is None
@@ -666,6 +676,37 @@ class TestCheckIn:
                             controller.check_in()
 
         gcc.assert_called_once_with("/a/", "/l/", "/b/", plan=ANY)
+
+    def test_check_in_probes_resolved_port(self):
+        state = {
+            "enrolled": True,
+            "logstash_ui_url": "http://localhost:8000",
+            "api_key": "k",
+            "connection_id": "c",
+            "revision_number": 5,
+            "api_port": 9600,
+            "logstash_api_port": 9600,
+        }
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"success": True, "current_revision_number": 5}
+        with patch(
+            "logstashagent.controller.persist_resolved_logstash_api_port",
+            return_value=9561,
+            create=True,
+        ):
+            with patch.object(controller.agent_state, "get_state", return_value=state):
+                with patch.object(controller, "get_logstash_api_status") as st:
+                    with patch.object(controller, "get_logstash_health_report") as hr:
+                        with patch.object(controller, "get_logstash_node_stats") as ns:
+                            st.return_value = {"accessible": False}
+                            hr.return_value = {"accessible": False}
+                            ns.return_value = {"accessible": False}
+                            with patch.object(controller.requests, "post", return_value=resp):
+                                controller.check_in()
+        st.assert_called_with(9561)
+        hr.assert_called_with(9561)
+        ns.assert_called_with(9561)
 
     def test_request_failure_returns_none(self):
         state = {
@@ -778,6 +819,45 @@ class TestCheckIn:
                             controller.check_in()
 
         gcc.assert_not_called()
+
+
+class TestCheckInPersistPort:
+    def test_check_in_restamps_state_when_env_disagrees(self, monkeypatch, tmp_path):
+        from logstashagent import agent_state
+
+        monkeypatch.setenv("LOGSTASH_API_PORT", "9561")
+        agent_state.configure_state_dir(tmp_path)
+        try:
+            agent_state.update_state("enrolled", True)
+            agent_state.update_state("logstash_ui_url", "http://localhost:8000")
+            agent_state.update_state("api_key", "k")
+            agent_state.update_state("connection_id", "c")
+            agent_state.update_state("revision_number", 5)
+            agent_state.update_state("api_port", 9600)
+            agent_state.update_state("logstash_api_port", 9600)
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {"success": True, "current_revision_number": 5}
+            with patch.object(
+                controller, "get_logstash_api_status", return_value={"accessible": False}
+            ):
+                with patch.object(
+                    controller,
+                    "get_logstash_health_report",
+                    return_value={"accessible": False},
+                ):
+                    with patch.object(
+                        controller,
+                        "get_logstash_node_stats",
+                        return_value={"accessible": False},
+                    ):
+                        with patch.object(controller.requests, "post", return_value=resp):
+                            controller.check_in()
+            st = agent_state.get_state()
+            assert st["api_port"] == 9561
+            assert st["logstash_api_port"] == 9561
+        finally:
+            agent_state.configure_state_dir(None)
 
 
 class TestGetConfigChangesViaUiReporting:
