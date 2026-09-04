@@ -3656,7 +3656,8 @@ if __name__ == "__main__":
                 enroll_token=args.enroll,
                 logstash_ui_url=args.logstash_ui_url,
                 agent_id=AGENT_ID,
-                enrollment_func=enrollment.perform_enrollment
+                enrollment_func=enrollment.perform_enrollment,
+                assume_yes=args.yes,
             )
             sys.exit(0)
         except installer.InstallError as e:

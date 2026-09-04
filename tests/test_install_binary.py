@@ -258,17 +258,213 @@ def test_install_binary_dest_newer_skips(tmp_path, monkeypatch, caplog):
     assert "0.9.0" in caplog.text
 
 
-def test_install_binary_dest_older_leaves_dest_unchanged(tmp_path, monkeypatch):
+def _spy_copy2(monkeypatch):
+    copy_dests = []
+    real_copy2 = installer.shutil.copy2
+
+    def spy_copy2(src_path, dst_path, *args, **kwargs):
+        copy_dests.append(os.path.abspath(str(dst_path)))
+        return real_copy2(src_path, dst_path, *args, **kwargs)
+
+    monkeypatch.setattr(installer.shutil, "copy2", spy_copy2)
+    return copy_dests
+
+
+def _stub_binary_side_effects(monkeypatch):
+    monkeypatch.setattr(installer, "_restorecon_binary", lambda _dest: None)
+    restart = MagicMock()
+    monkeypatch.setattr(installer, "_restart_running_agent_units", restart)
+    return restart
+
+
+def _stub_perform_installation_around_binary(monkeypatch, tmp_path):
+    """Patch prereqs and post-binary steps so perform_installation reaches enroll."""
+
+    def _noop(*_a, **_k):
+        return None
+
+    for name in (
+        "verify_root",
+        "verify_platform",
+        "ensure_logstash_user",
+        "create_directories",
+        "create_symlink",
+        "write_config_file",
+        "install_multi_instance_unit_templates",
+        "install_systemd_service",
+        "enable_and_start_default_agent",
+        "enable_package_logstash_only",
+        "configure_logstash",
+        "_restorecon_binary",
+        "_restart_running_agent_units",
+    ):
+        monkeypatch.setattr(installer, name, _noop)
+    monkeypatch.setattr(installer, "verify_logstash_installed", lambda: False)
+    monkeypatch.setattr(
+        installer, "get_logstash_uid_gid", lambda: (os.getuid(), os.getgid())
+    )
+    state = tmp_path / "state"
+    logs = tmp_path / "logs"
+    config = tmp_path / "config"
+    opt = tmp_path / "opt"
+    for d in (state, logs, config, opt):
+        d.mkdir(exist_ok=True)
+    monkeypatch.setitem(installer.INSTALL_PATHS, "state_dir", str(state))
+    monkeypatch.setitem(installer.INSTALL_PATHS, "log_dir", str(logs))
+    monkeypatch.setitem(installer.INSTALL_PATHS, "config_dir", str(config))
+    monkeypatch.setitem(installer.INSTALL_PATHS, "opt_root", str(opt))
+    monkeypatch.setitem(installer.INSTALL_PATHS, "simulate_root", str(opt))
+    monkeypatch.setitem(
+        installer.INSTALL_PATHS,
+        "systemd_service",
+        str(tmp_path / "logstash-agent.service"),
+    )
+
+
+def test_install_binary_dest_older_assume_yes_replaces_atomic(tmp_path, monkeypatch):
+    dest, src, _binary_dir, _internal = _prepare_install_binary(
+        tmp_path, monkeypatch, frozen=False
+    )
+    monkeypatch.setattr(installer, "installed_agent_version", lambda: "0.4.0")
+    monkeypatch.setattr(installer, "source_agent_version", lambda: "0.5.2")
+    restart = _stub_binary_side_effects(monkeypatch)
+    copy_dests = _spy_copy2(monkeypatch)
+
+    def boom(_prompt=""):
+        raise AssertionError("input must not be called when assume_yes=True")
+
+    monkeypatch.setattr("builtins.input", boom)
+
+    installer.install_binary(assume_yes=True)
+
+    assert dest.read_bytes() == src.read_bytes()
+    assert not os.path.exists(f"{dest}.new")
+    dest_abs = os.path.abspath(str(dest))
+    assert dest_abs not in copy_dests
+    assert os.access(dest, os.X_OK)
+    restart.assert_called_once()
+
+
+def test_install_binary_dest_older_input_n_leaves_dest(tmp_path, monkeypatch):
     dest, _src, _binary_dir, _internal = _prepare_install_binary(tmp_path, monkeypatch)
     monkeypatch.setattr(installer, "installed_agent_version", lambda: "0.4.0")
     monkeypatch.setattr(installer, "source_agent_version", lambda: "0.5.2")
     before = dest.read_bytes()
     mtime_ns = dest.stat().st_mtime_ns
+    prompts = []
+
+    def fake_input(prompt=""):
+        prompts.append(prompt)
+        return "n"
+
+    monkeypatch.setattr("builtins.input", fake_input)
+    restart = MagicMock()
+    monkeypatch.setattr(installer, "_restart_running_agent_units", restart)
 
     installer.install_binary()
 
     assert dest.read_bytes() == before
     assert dest.stat().st_mtime_ns == mtime_ns
+    assert prompts, "expected upgrade prompt"
+    assert "0.4.0" in prompts[0]
+    assert "0.5.2" in prompts[0]
+    assert "[y/N]" in prompts[0]
+    restart.assert_not_called()
+
+
+def test_install_binary_dest_older_input_y_replaces(tmp_path, monkeypatch):
+    dest, src, _binary_dir, _internal = _prepare_install_binary(
+        tmp_path, monkeypatch, frozen=False
+    )
+    monkeypatch.setattr(installer, "installed_agent_version", lambda: "0.4.0")
+    monkeypatch.setattr(installer, "source_agent_version", lambda: "0.5.2")
+    restart = _stub_binary_side_effects(monkeypatch)
+    prompts = []
+
+    def fake_input(prompt=""):
+        prompts.append(prompt)
+        return "y"
+
+    monkeypatch.setattr("builtins.input", fake_input)
+
+    installer.install_binary()
+
+    assert dest.read_bytes() == src.read_bytes()
+    assert not os.path.exists(f"{dest}.new")
+    assert prompts, "expected upgrade prompt"
+    assert "0.4.0" in prompts[0]
+    assert "0.5.2" in prompts[0]
+    assert "[y/N]" in prompts[0]
+    restart.assert_called_once()
+
+
+def test_perform_installation_dest_older_assume_yes_still_enrolls(
+    tmp_path, monkeypatch
+):
+    dest, src, _binary_dir, _internal = _prepare_install_binary(
+        tmp_path, monkeypatch, frozen=False
+    )
+    monkeypatch.setattr(installer, "installed_agent_version", lambda: "0.4.0")
+    monkeypatch.setattr(installer, "source_agent_version", lambda: "0.5.2")
+    _stub_perform_installation_around_binary(monkeypatch, tmp_path)
+    copy_dests = _spy_copy2(monkeypatch)
+    order = []
+    real_install = installer.install_binary
+
+    def tracking_install(*, assume_yes=False):
+        order.append("install_binary")
+        return real_install(assume_yes=assume_yes)
+
+    monkeypatch.setattr(installer, "install_binary", tracking_install)
+
+    def enrollment_func(*_a, **_k):
+        order.append("enrollment")
+        return {}
+
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda _prompt="": (_ for _ in ()).throw(
+            AssertionError("input must not be called when assume_yes=True")
+        ),
+    )
+
+    installer.perform_installation(
+        enroll_token="tok",
+        logstash_ui_url="http://example.test",
+        agent_id="agent-1",
+        enrollment_func=enrollment_func,
+        assume_yes=True,
+    )
+
+    assert dest.read_bytes() == src.read_bytes()
+    assert not os.path.exists(f"{dest}.new")
+    dest_abs = os.path.abspath(str(dest))
+    assert dest_abs not in copy_dests
+    assert order == ["install_binary", "enrollment"]
+
+
+def test_perform_installation_dest_older_input_n_still_enrolls(tmp_path, monkeypatch):
+    dest, _src, _binary_dir, _internal = _prepare_install_binary(
+        tmp_path, monkeypatch, frozen=False
+    )
+    monkeypatch.setattr(installer, "installed_agent_version", lambda: "0.4.0")
+    monkeypatch.setattr(installer, "source_agent_version", lambda: "0.5.2")
+    _stub_perform_installation_around_binary(monkeypatch, tmp_path)
+    before = dest.read_bytes()
+    mtime_ns = dest.stat().st_mtime_ns
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "n")
+    enrollment_func = MagicMock(return_value={})
+
+    installer.perform_installation(
+        enroll_token="tok",
+        logstash_ui_url="http://example.test",
+        agent_id="agent-1",
+        enrollment_func=enrollment_func,
+    )
+
+    assert dest.read_bytes() == before
+    assert dest.stat().st_mtime_ns == mtime_ns
+    enrollment_func.assert_called_once()
 
 
 def test_install_binary_missing_dest_atomic_install(tmp_path, monkeypatch):

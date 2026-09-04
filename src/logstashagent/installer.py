@@ -777,7 +777,93 @@ def _restorecon_binary(dest: str) -> None:
         logger.debug(f"SELinux context setting skipped: {e}")
 
 
-def install_binary():
+def _confirm_upgrade_older_binary(
+    installed: str, src_ver: str, *, assume_yes: bool
+) -> bool:
+    prompt = (
+        f"existing {installed}, installing {src_ver}, "
+        f"upgrade the package binary now? [y/N] "
+    )
+    if assume_yes:
+        logger.info(
+            "Assuming yes: upgrade package binary %s -> %s",
+            installed,
+            src_ver,
+        )
+        return True
+    answer = input(prompt).strip().lower()
+    return answer == 'y'
+
+
+def _backup_installed_binary() -> None:
+    """Backup dest binary and ``_internal`` (same layout as perform_upgrade)."""
+    dest = INSTALL_PATHS['binary']
+    backup_path = f"{dest}.backup"
+    if os.path.exists(backup_path):
+        os.remove(backup_path)
+    shutil.copy2(dest, backup_path)
+    logger.info("✓ Backed up binary to %s", backup_path)
+
+    internal_current = os.path.join(INSTALL_PATHS['binary_dir'], '_internal')
+    internal_backup_path = f"{INSTALL_PATHS['binary_dir']}/_internal.backup"
+    if os.path.exists(internal_current):
+        if os.path.exists(internal_backup_path):
+            shutil.rmtree(internal_backup_path)
+        shutil.copytree(internal_current, internal_backup_path)
+        logger.info("✓ Backed up dependencies to %s", internal_backup_path)
+
+
+def _packaged_agent_unit_name() -> str:
+    name = os.path.basename(
+        INSTALL_PATHS.get('systemd_service') or 'logstash-agent.service'
+    )
+    if name.endswith('.service'):
+        name = name[: -len('.service')]
+    return name or 'logstash-agent'
+
+
+def _is_logstash_unit(unit: str) -> bool:
+    name = (unit or '').strip()
+    if name.endswith('.service'):
+        name = name[: -len('.service')]
+    if name == 'logstash':
+        return True
+    return name.startswith('ls-simulate@') or name.startswith('logstash-managed@')
+
+
+def _restart_running_agent_units() -> None:
+    """Restart running agent units after in-place binary replace (not Logstash)."""
+    units: list[str] = []
+    packaged = _packaged_agent_unit_name()
+    if packaged:
+        units.append(packaged)
+    try:
+        from logstashagent import install_registry as _reg
+
+        for inst in _reg.list_instances() or []:
+            agent_unit = str((inst or {}).get('agent_unit') or '').strip()
+            if not agent_unit or agent_unit in units:
+                continue
+            if _is_logstash_unit(agent_unit):
+                continue
+            units.append(agent_unit)
+    except Exception as e:
+        logger.warning("Could not list instance agent units to restart: %s", e)
+
+    for unit in units:
+        if _is_logstash_unit(unit):
+            continue
+        try:
+            active = _systemctl_cmd('is-active', unit)
+            if active.returncode != 0:
+                continue
+            _systemctl_cmd('restart', unit)
+            logger.info("✓ Restarted %s", unit)
+        except Exception as e:
+            logger.warning("Failed to restart %s: %s", unit, e)
+
+
+def install_binary(*, assume_yes: bool = False):
     """
     Copy the current executable to /opt/logstash-agent/bin/logstash-agent
     For PyInstaller bundles, also copies the _internal directory with dependencies
@@ -826,12 +912,29 @@ def install_binary():
                 src_ver,
             )
             return
+        if not _confirm_upgrade_older_binary(
+            installed, src_ver, assume_yes=assume_yes
+        ):
+            logger.info(
+                "Installed agent version %s is older than source %s; "
+                "leaving existing binary in place",
+                installed,
+                src_ver,
+            )
+            return
+
         logger.info(
-            "Installed agent version %s is older than source %s; "
-            "leaving existing binary in place",
+            "Upgrading installed agent binary %s -> %s",
             installed,
             src_ver,
         )
+        _backup_installed_binary()
+        _install_binary_atomic(source_binary, dest)
+        logger.info(f"✓ Installed binary to {dest}")
+        if frozen:
+            _install_pyinstaller_internal(source_binary)
+        _restorecon_binary(dest)
+        _restart_running_agent_units()
         return
 
     _install_binary_atomic(source_binary, dest)
@@ -2285,6 +2388,8 @@ def perform_installation(
     logstash_ui_url: str,
     agent_id: str,
     enrollment_func,
+    *,
+    assume_yes: bool = False,
 ) -> None:
     """
     Perform the complete installation process.
@@ -2294,6 +2399,7 @@ def perform_installation(
         logstash_ui_url: URL of the LogstashUI instance
         agent_id: Agent ID for this installation
         enrollment_func: Function to call for enrollment (from enrollment module)
+        assume_yes: Auto-accept dest-older binary upgrade prompt (``--yes``)
     """
     logger.info("="*60)
     logger.info("LOGSTASH AGENT INSTALLATION")
@@ -2323,7 +2429,7 @@ def perform_installation(
 
         # Step 3: Install binary
         logger.info("\nStep 3: Installing binary...")
-        install_binary()
+        install_binary(assume_yes=assume_yes)
 
         # Step 4: Create symlink
         logger.info("\nStep 4: Creating symlink...")
