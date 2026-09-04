@@ -180,9 +180,11 @@ def _via_ui_auth_headers(
     return {"Authorization": f"ApiKey {key}"}
 
 
-def _ssl_context():
-    from logstashagent.tls_trust import build_ssl_context
+def _ssl_context(*, via_ui: bool = False):
+    from logstashagent.tls_trust import build_ssl_context, ui_ssl_context
 
+    if via_ui:
+        return ui_ssl_context()
     return build_ssl_context()
 
 
@@ -452,7 +454,7 @@ def _download_file(
         )
         try:
             with urllib.request.urlopen(
-                target, timeout=timeout, context=_ssl_context()
+                target, timeout=timeout, context=_ssl_context(via_ui=via_ui)
             ) as resp, open(dest, "wb") as out:
                 shutil.copyfileobj(resp, out)
         except Exception as exc:
@@ -497,7 +499,7 @@ def _download_file(
         try:
             req = urllib.request.Request(url, headers=req_headers)
             with urllib.request.urlopen(
-                req, timeout=timeout, context=_ssl_context()
+                req, timeout=timeout, context=_ssl_context(via_ui=via_ui)
             ) as resp:
                 status = getattr(resp, "status", 200)
                 if status == 206:
@@ -601,6 +603,7 @@ def _verify_sha512(
     timeout: int = 60,
     headers: Optional[dict] = None,
     required: bool = False,
+    via_ui: bool = False,
 ) -> None:
     """
     Verify tarball against the .sha512 sidecar at ``sha_url`` (same origin as the artifact).
@@ -619,7 +622,7 @@ def _verify_sha512(
             urllib.request.Request(sha_url, headers=headers) if headers else sha_url
         )
         with urllib.request.urlopen(
-            target, timeout=timeout, context=_ssl_context()
+            target, timeout=timeout, context=_ssl_context(via_ui=via_ui)
         ) as resp:
             return resp.read().decode("utf-8", errors="replace").strip()
 
@@ -788,6 +791,7 @@ def _ensure_logstash_version_locked(
             timeout=sha_timeout,
             headers=headers,
             required=via_ui,
+            via_ui=via_ui,
         )
 
         # Remove partial/legacy trees for this version before extract

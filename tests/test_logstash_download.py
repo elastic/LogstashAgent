@@ -93,6 +93,20 @@ def no_sleep(monkeypatch):
     return slept
 
 
+def test_ssl_context_elastic_verified_when_ui_insecure(monkeypatch):
+    monkeypatch.setenv("LOGSTASH_UI_TLS_INSECURE", "true")
+    ctx = ld._ssl_context(via_ui=False)
+    assert ctx.verify_mode != __import__("ssl").CERT_NONE
+
+
+def test_ssl_context_via_ui_insecure_unverified(monkeypatch):
+    monkeypatch.setenv("LOGSTASH_UI_TLS_INSECURE", "true")
+    monkeypatch.setenv("LOGSTASH_UI_URL", "https://ui.example.com")
+    ctx = ld._ssl_context(via_ui=True)
+    assert ctx.verify_mode == __import__("ssl").CERT_NONE
+    assert ctx.check_hostname is False
+
+
 def test_version_is_present(tmp_path):
     version = "9.4.3"
     assert ld.version_is_present("", str(tmp_path)) is False
