@@ -2685,14 +2685,16 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
         return None
 
 
-def get_logstash_api_status(api_port=9600):
+def get_logstash_api_status(api_port=None):
     """
     Query the Logstash node info API at http://localhost:{api_port}/.
 
     Returns:
         dict with keys: accessible, status, version, host, error
     """
-    from .logstash_api import LogstashAPI
+    from .logstash_api import LogstashAPI, resolve_logstash_api_port
+    if api_port is None:
+        api_port = resolve_logstash_api_port()
     base_url = f"http://localhost:{api_port}"
     try:
         api = LogstashAPI(base_url=base_url)
@@ -2715,7 +2717,7 @@ def get_logstash_api_status(api_port=9600):
         }
 
 
-def get_logstash_health_report(api_port=9600):
+def get_logstash_health_report(api_port=None):
     """
     Query the Logstash /_health_report endpoint.
 
@@ -2730,7 +2732,9 @@ def get_logstash_health_report(api_port=9600):
     Returns:
         dict with keys: accessible, status, symptom, indicators, error
     """
-    from .logstash_api import LogstashAPI
+    from .logstash_api import LogstashAPI, resolve_logstash_api_port
+    if api_port is None:
+        api_port = resolve_logstash_api_port()
     base_url = f"http://localhost:{api_port}"
 
     def strip_indicators(indicators_dict):
@@ -2775,7 +2779,7 @@ def get_logstash_health_report(api_port=9600):
         }
 
 
-def get_logstash_node_stats(api_port=9600):
+def get_logstash_node_stats(api_port=None):
     """
     Query the Logstash /_node/stats endpoint and return condensed node-level
     statistics. Pipeline-level detail is intentionally excluded.
@@ -2783,7 +2787,9 @@ def get_logstash_node_stats(api_port=9600):
     Returns:
         dict with keys: accessible, jvm, process, events, pipeline, reloads, error
     """
-    from .logstash_api import LogstashAPI
+    from .logstash_api import LogstashAPI, resolve_logstash_api_port
+    if api_port is None:
+        api_port = resolve_logstash_api_port()
     base_url = f"http://localhost:{api_port}"
     try:
         api = LogstashAPI(base_url=base_url)

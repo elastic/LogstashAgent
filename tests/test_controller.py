@@ -1313,3 +1313,19 @@ class TestUpdateLogstashEnvFileClear:
         written = mock_run.call_args_list[1].kwargs.get("input") or ""
         assert "LOGSTASH_KEYSTORE_PASS" not in written
         assert "FOO=1" in written
+
+
+class TestLogstashProbePortDefault:
+    def test_node_stats_omitted_port_uses_resolve(self, monkeypatch):
+        monkeypatch.setenv("LOGSTASH_API_PORT", "9561")
+        with patch("logstashagent.logstash_api.LogstashAPI") as api_cls:
+            inst = MagicMock()
+            inst.get_node_stats.side_effect = ConnectionError("refused")
+            api_cls.return_value = inst
+            out = controller.get_logstash_node_stats()
+        assert out["accessible"] is False
+        kwargs = api_cls.call_args.kwargs
+        args = api_cls.call_args.args
+        base = kwargs.get("base_url") or (args[0] if args else "")
+        assert str(base).endswith(":9561") or str(base) == "http://localhost:9561"
+        assert "9600" not in str(base)
