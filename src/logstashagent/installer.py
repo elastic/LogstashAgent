@@ -625,6 +625,63 @@ def create_directories():
     logger.info(f"✓ Created {INSTALL_PATHS['cache_dir']} (owned by {owner})")
 
 
+_VERSION_TOKEN_RE = re.compile(r'(\d+\.\d+(?:\.\d+)*)')
+
+
+def compare_agent_versions(a: str, b: str) -> int:
+    """Compare dotted numeric versions. Missing parts count as 0."""
+    def parts(v: str) -> list[int]:
+        nums: list[int] = []
+        for p in (v or '').split('.'):
+            try:
+                nums.append(int(p))
+            except ValueError:
+                nums.append(0)
+        return nums or [0]
+
+    pa, pb = parts(a), parts(b)
+    n = max(len(pa), len(pb))
+    pa += [0] * (n - len(pa))
+    pb += [0] * (n - len(pb))
+    if pa < pb:
+        return -1
+    if pa > pb:
+        return 1
+    return 0
+
+
+def installed_agent_version() -> str | None:
+    """Installed agent version from registry, else dest ``--version`` stdout."""
+    try:
+        from logstashagent import install_registry as _reg
+
+        pkg = (_reg.load_registry() or {}).get('package') or {}
+        if isinstance(pkg, dict):
+            ver = str(pkg.get('agent_version') or '').strip()
+            if ver:
+                return ver
+    except Exception:
+        pass
+
+    dest = INSTALL_PATHS.get('binary')
+    if not dest or not os.path.exists(dest) or not os.path.isfile(dest):
+        return None
+    try:
+        result = subprocess.run(
+            [dest, '--version'],
+            timeout=10,
+            capture_output=True,
+            text=True,
+        )
+        for token in (result.stdout or '').split():
+            m = _VERSION_TOKEN_RE.match(token)
+            if m:
+                return m.group(1)
+    except Exception:
+        return None
+    return None
+
+
 def install_binary():
     """
     Copy the current executable to /opt/logstash-agent/bin/logstash-agent
