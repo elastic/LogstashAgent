@@ -387,6 +387,15 @@ def test_finalize_commits_when_api_up(tmp_path):
     rb.assert_not_called()
 
 
+def test_finalize_waits_on_resolved_port_not_snapshot(monkeypatch, tmp_path):
+    monkeypatch.setenv("LOGSTASH_API_PORT", "9561")
+    prep = {"changed": True, "previous": {"api_port": 9600}}
+    with patch.object(controller, "wait_for_logstash_api", return_value=True) as wait:
+        with patch.object(controller, "commit_runtime_upgrade"):
+            controller.finalize_runtime_upgrade(prep, restart_ok=True)
+    wait.assert_called_once_with(9561)
+
+
 def test_finalize_rolls_back_when_unhealthy(tmp_path):
     tree = _managed_tree(tmp_path)
     prep = {

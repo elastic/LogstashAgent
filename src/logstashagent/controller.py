@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from cryptography.fernet import Fernet
 from . import agent_state
 from . import log_analyzer
-from .logstash_api import persist_resolved_logstash_api_port
+from .logstash_api import persist_resolved_logstash_api_port, resolve_logstash_api_port
 from .ls_keystore_utils import LogstashKeystore
 from .ls_keystore_utils.exceptions import (
     LogstashKeystoreException,
@@ -1198,9 +1198,7 @@ def finalize_runtime_upgrade(prep: dict, restart_ok: bool) -> bool:
     if not prep or not prep.get('changed'):
         return True
     if restart_ok:
-        previous = prep.get('previous') or {}
-        state = agent_state.get_state() or {}
-        api_port = int(previous.get('api_port') or state.get('logstash_api_port') or 9600)
+        api_port = resolve_logstash_api_port()
         if wait_for_logstash_api(api_port):
             commit_runtime_upgrade(prep)
             return True
