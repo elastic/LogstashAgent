@@ -854,6 +854,17 @@ def _canonical_run_mode(mode: str | None) -> str:
     return raw
 
 
+def _optional_settings_path(raw) -> Path | None:
+    """Return a settings dir Path, or None when missing/empty/whitespace.
+
+    Never Path(''): pathlib turns that into '.', which is cwd.
+    """
+    s = str(raw or '').strip()
+    if not s:
+        return None
+    return Path(s)
+
+
 def _runtime_path_root(state: dict) -> Path | None:
     raw = (state.get('path_root') or '').strip()
     if raw:
@@ -861,9 +872,9 @@ def _runtime_path_root(state: dict) -> Path | None:
     env_file = (state.get('keystore_env_file') or '').strip()
     if env_file.replace('\\', '/').endswith('/env'):
         return Path(env_file).parent
-    settings = (state.get('settings_path') or '').strip()
-    if settings:
-        return Path(settings)
+    settings = _optional_settings_path(state.get('settings_path'))
+    if settings is not None:
+        return settings
     return None
 
 
@@ -885,10 +896,10 @@ def _write_runtime_snapshot(state: dict, previous: dict, desired: dict) -> Path:
     if snap.exists():
         raise RuntimeError(f'refusing to overwrite existing runtime snapshot at {snap}')
     snap.mkdir(parents=True, exist_ok=True)
-    settings = Path(state.get('settings_path') or '')
-    settings_dest = snap / 'settings'
-    settings_dest.mkdir(parents=True, exist_ok=True)
-    if settings.is_dir() or str(settings):
+    settings = _optional_settings_path(state.get('settings_path'))
+    if settings is not None:
+        settings_dest = snap / 'settings'
+        settings_dest.mkdir(parents=True, exist_ok=True)
         for name in _SNAPSHOT_SETTING_FILES:
             _copy_if_exists(settings / name, settings_dest / name)
         for dirname in _SNAPSHOT_SETTING_DIRS:
@@ -915,9 +926,9 @@ def _restore_runtime_snapshot(prep: dict) -> bool:
         return False
     previous = meta.get('previous') or prep.get('previous') or {}
     try:
-        settings = Path(previous.get('settings_path') or '')
+        settings = _optional_settings_path(previous.get('settings_path'))
         src_settings = snap / 'settings'
-        if src_settings.is_dir() and settings:
+        if src_settings.is_dir() and settings is not None:
             settings.mkdir(parents=True, exist_ok=True)
             for name in _SNAPSHOT_SETTING_FILES:
                 _copy_if_exists(src_settings / name, settings / name)

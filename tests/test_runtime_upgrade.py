@@ -2,6 +2,7 @@
 #or more contributor license agreements. Licensed under the Elastic License;
 #you may not use this file except in compliance with the Elastic License.
 
+import json
 import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -135,6 +136,74 @@ def test_prepare_snapshots_then_rollback_restores(tmp_path):
     assert not (tree["settings"] / "conf.d" / "extra.conf").exists()
     assert "LOGSTASH_BINARY=/old/bin/logstash" in tree["env"].read_text(encoding="utf-8")
     assert not snap.exists()
+
+
+_ABSENT_SETTINGS = ("missing", "", "  \t")
+
+
+def _apply_settings_path(d: dict, value: str) -> None:
+    if value == "missing":
+        d.pop("settings_path", None)
+    else:
+        d["settings_path"] = value
+
+
+@pytest.mark.parametrize("settings_value", _ABSENT_SETTINGS)
+def test_write_runtime_snapshot_absent_settings_path_skips_cwd(
+    tmp_path, monkeypatch, settings_value
+):
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    decoy = cwd / "logstash.yml"
+    decoy.write_text("from-cwd\n", encoding="utf-8")
+    monkeypatch.chdir(cwd)
+
+    root = tmp_path / "instance"
+    root.mkdir()
+    env = root / "env"
+    env.write_text("LOGSTASH_BINARY=/old\n", encoding="utf-8")
+    state = {"path_root": str(root), "keystore_env_file": str(env)}
+    _apply_settings_path(state, settings_value)
+    previous = {"env_file": str(env)}
+    _apply_settings_path(previous, settings_value)
+
+    snap = controller._write_runtime_snapshot(state, previous, {"binary": "/new"})
+    assert (snap / "meta.json").is_file()
+    assert (snap / "env").read_text(encoding="utf-8") == "LOGSTASH_BINARY=/old\n"
+    assert not (snap / "settings").exists()
+    assert decoy.read_text(encoding="utf-8") == "from-cwd\n"
+
+
+@pytest.mark.parametrize("settings_value", _ABSENT_SETTINGS)
+def test_restore_runtime_snapshot_absent_settings_path_skips_cwd(
+    tmp_path, monkeypatch, settings_value
+):
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    decoy = cwd / "logstash.yml"
+    decoy.write_text("from-cwd\n", encoding="utf-8")
+    monkeypatch.chdir(cwd)
+
+    root = tmp_path / "instance"
+    root.mkdir()
+    snap = root / controller.RUNTIME_SNAPSHOT_NAME
+    settings_src = snap / "settings"
+    settings_src.mkdir(parents=True)
+    (settings_src / "logstash.yml").write_text("from-snap\n", encoding="utf-8")
+    (snap / "env").write_text("LOGSTASH_BINARY=/old\n", encoding="utf-8")
+    env_dest = root / "env"
+    env_dest.write_text("LOGSTASH_BINARY=/new\n", encoding="utf-8")
+    previous = {"env_file": str(env_dest)}
+    _apply_settings_path(previous, settings_value)
+    (snap / "meta.json").write_text(
+        json.dumps({"previous": previous, "desired": {}}) + "\n", encoding="utf-8"
+    )
+
+    ok = controller._restore_runtime_snapshot({"snapshot_dir": str(snap)})
+    assert ok is True
+    assert decoy.read_text(encoding="utf-8") == "from-cwd\n"
+    assert not (cwd / "jvm.options").exists()
+    assert env_dest.read_text(encoding="utf-8") == "LOGSTASH_BINARY=/old\n"
 
 
 def test_commit_deletes_snapshot_and_stamps_state(tmp_path):
