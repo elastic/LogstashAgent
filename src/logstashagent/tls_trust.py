@@ -40,6 +40,15 @@ WELL_KNOWN_CA_SUFFIX = "/.well-known/logstashui/ca.crt"
 CA_FILENAME = "product-ca.crt"
 FINGERPRINT_FILENAME = "product-ca.fingerprint"
 
+TLS_ENV = "LOGSTASH_AGENT_TLS"
+UI_INSECURE_ENV = "LOGSTASH_UI_TLS_INSECURE"
+_TRUTHY_FLAGS = {"1", "true", "yes", "on"}
+_FALSY_FLAGS = {"0", "false", "no", "off"}
+
+_logged_bad_scheme = False
+_logged_http_insecure = False
+_logged_https_insecure = False
+
 # Bootstrap loop status (for /_logstash/tls-status and UI indicators)
 _bootstrap_lock = threading.Lock()
 _bootstrap_state: dict[str, Any] = {
@@ -202,7 +211,13 @@ def ensure_trust_from_token_payload(
 ) -> Optional[str]:
     """
     If token has fingerprint, pin CA (fetch if needed). Return fingerprint or None.
+
+    Non-https UI URLs skip pin. ``LOGSTASH_UI_TLS_INSECURE`` still attempts pin
+    but does not raise on miss.
     """
+    if not ui_url_is_tls(ui_url):
+        logger.info("UI URL is not https; skipping product CA pin")
+        return None
     fp = (token_payload or {}).get("fingerprint") or (token_payload or {}).get(
         "ca_fingerprint_sha256"
     )
@@ -214,7 +229,17 @@ def ensure_trust_from_token_payload(
     if existing == fp and ca_cert_file().is_file():
         logger.info("Product CA already pinned (fingerprint match)")
         return fp
-    fetch_and_pin_product_ca(ui_url, fp)
+    try:
+        fetch_and_pin_product_ca(ui_url, fp)
+    except Exception as e:
+        if ui_tls_insecure():
+            logger.warning(
+                "Product CA pin failed under %s (continuing unverified): %s",
+                UI_INSECURE_ENV,
+                e,
+            )
+            return None
+        raise
     return fp
 
 
@@ -235,6 +260,53 @@ def resolve_ui_url_for_bootstrap(agent_config: Optional[dict] = None) -> Optiona
 
 def product_ca_already_pinned() -> bool:
     return bool(load_persisted_fingerprint() and ca_cert_file().is_file())
+
+
+def ui_url_is_tls(url: Optional[str] = None) -> bool:
+    """True only when the UI URL has an https:// prefix (case-insensitive)."""
+    global _logged_bad_scheme, _logged_http_insecure
+    if url is not None:
+        s = str(url).strip()
+    else:
+        s = (resolve_ui_url_for_bootstrap() or "").strip()
+    lower = s.lower()
+    if lower.startswith("https://"):
+        return True
+    if lower.startswith("http://"):
+        if ui_tls_insecure() and not _logged_http_insecure:
+            logger.info(
+                "%s is set but UI URL is http://; insecure verify does not apply",
+                UI_INSECURE_ENV,
+            )
+            _logged_http_insecure = True
+        return False
+    if not _logged_bad_scheme:
+        logger.error(
+            "UI URL must start with http:// or https:// (got %r); treating as not TLS",
+            s,
+        )
+        _logged_bad_scheme = True
+    return False
+
+
+def agent_tls_enabled() -> bool:
+    """FastAPI SSL termination wanted. Default true; only known falsy tokens disable."""
+    if TLS_ENV not in os.environ:
+        return True
+    return str(os.environ.get(TLS_ENV) or "").strip().lower() not in _FALSY_FLAGS
+
+
+def ui_tls_insecure() -> bool:
+    return str(os.environ.get(UI_INSECURE_ENV) or "").strip().lower() in _TRUTHY_FLAGS
+
+
+def inbound_tls_ok(ui_url: Optional[str] = None) -> bool:
+    """True when FastAPI may terminate TLS: env on, UI is https, product CA pinned."""
+    return (
+        agent_tls_enabled()
+        and ui_url_is_tls(ui_url)
+        and product_ca_already_pinned()
+    )
 
 
 def _bootstrap_loop(
@@ -306,17 +378,22 @@ def start_ui_ca_bootstrap_loop(
     """
     global _bootstrap_thread
 
+    url = (ui_url or resolve_ui_url_for_bootstrap(agent_config) or "").strip().rstrip("/")
+    if url and not ui_url_is_tls(url):
+        logger.info("UI URL is not https; skip CA bootstrap")
+        _set_bootstrap_state(status="idle", last_error="ui url is not https")
+        return False
+
     if product_ca_already_pinned():
         _set_bootstrap_state(
             status="ok",
-            ui_url=ui_url or resolve_ui_url_for_bootstrap(agent_config),
+            ui_url=url or None,
             pinned_at=datetime.now(timezone.utc).isoformat(),
             last_error=None,
         )
         logger.info("Product CA already pinned; bootstrap loop not needed")
         return True
 
-    url = (ui_url or resolve_ui_url_for_bootstrap(agent_config) or "").strip().rstrip("/")
     if not url:
         logger.info("No logstash_ui_url for CA bootstrap; skip")
         _set_bootstrap_state(status="idle", last_error="no logstash_ui_url")
@@ -368,12 +445,26 @@ def build_ssl_context() -> ssl.SSLContext:
     return ctx
 
 
-def ssl_verify_argument() -> Union[bool, str]:
+def ssl_verify_argument(ui_url: Optional[str] = None) -> Union[bool, str]:
     """
     For requests: when product CA is present, pass CA file path.
     Note: requests replaces the default store when a path is given; for public
     UI certs we still need system CAs. Use certifi bundle + product CA temp file.
+
+    ``http://`` UI URLs and ``LOGSTASH_UI_TLS_INSECURE`` return False (no verify).
+    Elastic downloads must not use this helper — they use ``build_ssl_context``.
     """
+    global _logged_https_insecure
+    insecure = ui_tls_insecure()
+    if ui_url_is_tls(ui_url) and insecure and not _logged_https_insecure:
+        logger.warning(
+            "%s is set; agent will not verify the LogstashUI certificate. "
+            "Not recommended, not best practice.",
+            UI_INSECURE_ENV,
+        )
+        _logged_https_insecure = True
+    if not ui_url_is_tls(ui_url) or insecure:
+        return False
     path = ca_cert_file()
     if not path.is_file():
         return True
@@ -393,6 +484,16 @@ def ssl_verify_argument() -> Union[bool, str]:
     return str(bundle)
 
 
+def ui_ssl_context(ui_url: Optional[str] = None) -> ssl.SSLContext:
+    """SSLContext for agent→UI urllib. Elastic must use ``build_ssl_context``."""
+    if not ui_url_is_tls(ui_url) or ui_tls_insecure():
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+    return build_ssl_context()
+
+
 def ui_request(
     method: str,
     url: str,
@@ -400,5 +501,5 @@ def ui_request(
 ) -> requests.Response:
     """requests wrapper that applies product CA + system trust when available."""
     if "verify" not in kwargs:
-        kwargs["verify"] = ssl_verify_argument()
+        kwargs["verify"] = ssl_verify_argument(url)
     return requests.request(method, url, **kwargs)
