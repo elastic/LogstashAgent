@@ -28,15 +28,17 @@ LOGSTASH_API_PORT = 9560
 LOGSTASH_API_BASE_URL = f"http://{LOGSTASH_API_HOST}:{LOGSTASH_API_PORT}"
 
 
-def resolve_logstash_api_port() -> int:
+def resolve_logstash_api_port(*, yml_port=None, mode=None) -> int:
     """
     Port for the Logstash HTTP API this agent should talk to.
 
-    Priority: LOGSTASH_API_PORT env (agent.env) → agent state → 9560.
+    Priority: LOGSTASH_API_PORT env (agent.env) → agent state → mode+instance
+    formula → yml_port → packaged 9600 / else 9560.
     """
     env = (os.environ.get("LOGSTASH_API_PORT") or "").strip()
     if env.isdigit():
         return int(env)
+    resolved_mode = (mode or "").lower()
     try:
         from logstashagent import agent_state
 
@@ -48,16 +50,44 @@ def resolve_logstash_api_port() -> int:
                 except (TypeError, ValueError):
                     pass
         instance_id = st.get("instance_id")
-        mode = (st.get("mode") or "").lower()
+        resolved_mode = (mode or st.get("mode") or "").lower()
         if instance_id is not None:
             n = int(instance_id)
-            if mode == "managed":
+            if resolved_mode == "managed":
                 return 9700 + n
-            if mode in ("simulate", "simulation"):
-                return 9560 + n
+            return 9560 + n
     except Exception:
         pass
+    if yml_port is not None:
+        try:
+            return int(yml_port)
+        except (TypeError, ValueError):
+            pass
+    if resolved_mode == "packaged":
+        return 9600
     return LOGSTASH_API_PORT
+
+
+def _state_port_equals(value, port: int) -> bool:
+    try:
+        return int(value) == port
+    except (TypeError, ValueError):
+        return False
+
+
+def persist_resolved_logstash_api_port(*, yml_port=None, mode=None) -> int:
+    """Write resolved Logstash API port into state. Never writes agent.env."""
+    port = resolve_logstash_api_port(yml_port=yml_port, mode=mode)
+    from logstashagent import agent_state
+
+    st = agent_state.get_state() or {}
+    if _state_port_equals(st.get("logstash_api_port"), port) and _state_port_equals(
+        st.get("api_port"), port
+    ):
+        return port
+    agent_state.update_state("logstash_api_port", port)
+    agent_state.update_state("api_port", port)
+    return port
 
 
 def default_logstash_api_base_url() -> str:

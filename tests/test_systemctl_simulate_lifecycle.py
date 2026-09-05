@@ -82,6 +82,17 @@ class TestSimLogstashApiPort:
         ):
             assert main.sim_logstash_api_port() == 9564
 
+    def test_env_wins(self, monkeypatch, tmp_path):
+        from logstashagent import agent_state
+
+        monkeypatch.setenv("LOGSTASH_API_PORT", "9561")
+        agent_state.configure_state_dir(tmp_path)
+        try:
+            agent_state.update_state("logstash_api_port", 9600)
+            assert main.sim_logstash_api_port() == 9561
+        finally:
+            agent_state.configure_state_dir(None)
+
 
 class TestCheckSimLogstashHealth:
     def test_systemctl_path_probes_api(self):
@@ -147,6 +158,23 @@ class TestTriggerSimLogstashRestart:
             trig.assert_called_once()
 
 
+async def _noop_simulation_queue():
+    return None
+
+
+async def _cleanup_queue_processor():
+    task = getattr(main, "_queue_processor_task", None)
+    if task is None:
+        return
+    if not task.done():
+        task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    main._queue_processor_task = None
+
+
 class TestStartupSkipsSupervisor:
     def test_startup_skips_supervisor_for_enrolled_simulate(self):
         async def _run():
@@ -157,10 +185,13 @@ class TestStartupSkipsSupervisor:
             ), patch.object(
                 main.logstash_supervisor, "start_supervised_logstash"
             ) as start, patch.object(
-                main.asyncio, "create_task", return_value=MagicMock()
+                main, "_process_simulation_queue", _noop_simulation_queue
             ):
-                await main.startup_event()
-                return start
+                try:
+                    await main.startup_event()
+                    return start
+                finally:
+                    await _cleanup_queue_processor()
 
         start = asyncio.run(_run())
         start.assert_not_called()
@@ -177,10 +208,13 @@ class TestStartupSkipsSupervisor:
             ) as start, patch.object(
                 main.asyncio, "sleep", side_effect=_sleep
             ), patch.object(
-                main.asyncio, "create_task", return_value=MagicMock()
+                main, "_process_simulation_queue", _noop_simulation_queue
             ):
-                await main.startup_event()
-                return start
+                try:
+                    await main.startup_event()
+                    return start
+                finally:
+                    await _cleanup_queue_processor()
 
         start = asyncio.run(_run())
         start.assert_called_once()

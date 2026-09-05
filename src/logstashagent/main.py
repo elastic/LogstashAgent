@@ -9,6 +9,24 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 import sys
 
+FIRST_CLASS_MODES = ('packaged', 'managed', 'simulate', 'embedded')
+MODE_ALIASES = {
+    'default': 'packaged',
+    'agent': 'packaged',
+    'host': 'managed',
+}
+
+
+def canonical_agent_mode(value: str | None) -> str | None:
+    """Map CLI/config aliases to a first-class mode. Unknown values returned lowercased."""
+    if value is None:
+        return None
+    raw = str(value).strip().lower()
+    if not raw:
+        return None
+    return MODE_ALIASES.get(raw, raw)
+
+
 # slots starts a cleanup thread on import when mode looks like simulation.
 # Skip for enroll/install/admin and for packaged --run (controller only).
 # Do NOT skip for --run --mode simulate|managed|embedded — those serve FastAPI
@@ -17,9 +35,9 @@ def _argv_mode_hint() -> str | None:
     argv = sys.argv[1:]
     for i, a in enumerate(argv):
         if a == '--mode' and i + 1 < len(argv):
-            return str(argv[i + 1]).lower()
+            return canonical_agent_mode(argv[i + 1])
         if a.startswith('--mode='):
-            return a.split('=', 1)[1].lower()
+            return canonical_agent_mode(a.split('=', 1)[1])
     return None
 
 
@@ -40,8 +58,32 @@ _ADMIN_CLI = (
     or 'ensure-version' in sys.argv
     or 'prune-versions' in sys.argv
 )
+_ADMIN_COMMANDS = (
+    'install', 'uninstall', 'list-instances', 'list-versions',
+    'ensure-version', 'prune-versions', 'configure', 'setup-simulate',
+    'recover-simulate', 'upgrade',
+)
+
+
+def _is_lightweight_cli(argv: list[str] | None = None) -> bool:
+    """True when we must not load yml, create agent_id, or makedirs pipeline dirs."""
+    argv = list(argv if argv is not None else sys.argv[1:])
+    if '-h' in argv or '--help' in argv or '--version' in argv or '-V' in argv:
+        return True
+    if '--run' in argv:
+        return False
+    for a in argv:
+        if a in _ADMIN_COMMANDS:
+            return True
+        if a == '--enroll' or a.startswith('--enroll='):
+            return True
+    return False
+
+
+_LIGHTWEIGHT_CLI = _is_lightweight_cli()
 _SKIP_SIMULATION_IMPORTS = bool(
     _ADMIN_CLI
+    or _LIGHTWEIGHT_CLI
     or (
         '--run' in sys.argv
         and (_CLI_MODE_HINT is None or _CLI_MODE_HINT not in _SIM_FASTAPI_MODES)
@@ -74,6 +116,19 @@ if not _SKIP_SIMULATION_IMPORTS:
     from logstashagent import slots
 import argparse
 import asyncio
+
+
+def cli_mode_type(value: str) -> str:
+    """argparse type=: accept first-class modes plus aliases; store canonical name."""
+    mapped = canonical_agent_mode(value)
+    if mapped not in FIRST_CLASS_MODES:
+        raise argparse.ArgumentTypeError(
+            f"invalid mode {value!r} (choose from {', '.join(FIRST_CLASS_MODES)}; "
+            "aliases: default|agent→packaged, host→managed)"
+        )
+    return mapped
+
+
 import atexit
 import base64
 import threading
@@ -154,17 +209,14 @@ def _get_version():
 
 AGENT_VERSION = _get_version()
 
-# Resolve per-instance state early (LOGSTASH_AGENT_STATE_DIR / --mode --instance)
-# so Packaged and managed-N/simulate-N do not share agent_id on one host.
-agent_state.refresh_state_paths()
-
-# Initialize agent state (generates agent_id on first run)
-AGENT_ID = agent_state.get_or_create_agent_id()
-
-# Save version to agent state
-agent_state.update_state('agent_version', AGENT_VERSION)
-logger.info(f"LogstashAgent version: {AGENT_VERSION}")
-logger.info(f"Agent state dir: {agent_state.STATE_DIR}")
+# Placeholders so FastAPI routes can close over names; filled by ensure_runtime_init.
+AGENT_ID: str | None = None
+AGENT_CONFIG: dict = {}
+LOGSTASH_PATHS: dict = {}
+PIPELINES_YML_PATH = ''
+PIPELINES_DIR = ''
+METADATA_DIR = ''
+_RUNTIME_READY = False
 
 # Load agent configuration
 # Check for config in current directory first (native mode)
@@ -284,31 +336,31 @@ def normalize_agent_mode(config: dict) -> dict:
     """
     Normalize legacy mode/simulation_mode into mode:
       packaged | managed | simulate | embedded
-    (legacy aliases: default → packaged; agent|host → packaged)
+
+    Aliases:
+      default | agent -> packaged
+      host            -> managed
 
     Mapping:
-      packaged|managed|simulate|embedded|default  -> first-class (default kept as alias)
-      agent|host                                  -> packaged
+      packaged|managed|simulate|embedded          -> first-class
+      default|agent                               -> packaged
+      host                                        -> managed
       simulation + embedded (or missing)          -> embedded
       simulation + host                           -> simulate
-
-    When a legacy value is rewritten, sets config['_mode_legacy'] to a short
-    description of the original value (for startup logging).
     """
     if not config:
         return {'mode': 'embedded', '_mode_legacy': '(empty config)'}
-    # Drop prior annotation if re-normalizing
     config.pop('_mode_legacy', None)
 
     mode = str(config.get('mode', '') or '').lower()
     sim_mode = str(config.get('simulation_mode', '') or '').lower()
 
-    if mode in ('packaged', 'managed', 'simulate', 'embedded', 'default'):
+    if mode in FIRST_CLASS_MODES:
         config['mode'] = mode
         return config
-    if mode in ('agent', 'host'):
+    if mode in MODE_ALIASES:
         config['_mode_legacy'] = mode
-        config['mode'] = 'packaged'
+        config['mode'] = MODE_ALIASES[mode]
         return config
     if mode == 'simulation' or mode == '':
         if sim_mode == 'host':
@@ -323,7 +375,6 @@ def normalize_agent_mode(config: dict) -> dict:
             config['_mode_legacy'] = legacy
             config['mode'] = 'embedded'
         return config
-    # Unknown -> embedded (safest for docker-ish defaults)
     config['_mode_legacy'] = mode or '(unknown)'
     config['mode'] = 'embedded'
     return config
@@ -379,26 +430,9 @@ is_systemctl_managed_logstash = is_systemctl_managed_simulate
 
 def sim_logstash_api_port() -> int:
     """HTTP API port for the Logstash instance this agent manages."""
-    state = agent_state.get_state() or {}
-    for key in ('logstash_api_port', 'api_port'):
-        if state.get(key) is not None:
-            try:
-                return int(state[key])
-            except (TypeError, ValueError):
-                pass
-    instance_id = state.get('instance_id')
-    if instance_id is None:
-        instance_id = (AGENT_CONFIG or {}).get('instance_id')
-    mode = (state.get('mode') or (AGENT_CONFIG or {}).get('mode') or '').lower()
-    if instance_id is not None:
-        try:
-            n = int(instance_id)
-            if mode == 'managed':
-                return 9700 + n
-            return 9560 + n
-        except (TypeError, ValueError):
-            pass
-    return int((AGENT_CONFIG or {}).get('logstash_api_port') or 9560)
+    from logstashagent.logstash_api import resolve_logstash_api_port
+
+    return resolve_logstash_api_port()
 
 
 # Restart counter for systemctl-managed simulate (supervisor has its own)
@@ -1103,17 +1137,6 @@ def _atexit_shutdown_supervisor():
     logstash_supervisor.shutdown_supervisor()
 
 
-# Global config
-AGENT_CONFIG = normalize_agent_mode(load_agent_config())
-if AGENT_CONFIG.get('_mode_legacy'):
-    log_resolved_agent_mode(
-        AGENT_CONFIG.get('mode', 'embedded'),
-        legacy=AGENT_CONFIG.get('_mode_legacy'),
-        source='config',
-    )
-else:
-    log_resolved_agent_mode(AGENT_CONFIG.get('mode', 'embedded'), source='config')
-
 app = FastAPI(title="logstashagent API", version="0.0.1")
 
 # Request queue for simulation requests during Logstash restarts
@@ -1276,14 +1299,39 @@ def get_logstash_log_dir() -> str:
     )
     return log_dir
 
-LOGSTASH_PATHS = get_logstash_paths()
-PIPELINES_YML_PATH = LOGSTASH_PATHS['pipelines_yml']
-PIPELINES_DIR = LOGSTASH_PATHS['conf_d']
-METADATA_DIR = LOGSTASH_PATHS['metadata']
 
-# Ensure directories exist
-os.makedirs(PIPELINES_DIR, exist_ok=True)
-os.makedirs(METADATA_DIR, exist_ok=True)
+def ensure_runtime_init(*, create_pipeline_dirs: bool = True) -> None:
+    """Load config, agent_id, and pipeline dirs. No-op if already initialized."""
+    global AGENT_ID, AGENT_CONFIG, LOGSTASH_PATHS
+    global PIPELINES_YML_PATH, PIPELINES_DIR, METADATA_DIR, _RUNTIME_READY
+    if _RUNTIME_READY:
+        return
+    agent_state.refresh_state_paths()
+    AGENT_ID = agent_state.get_or_create_agent_id()
+    agent_state.update_state('agent_version', AGENT_VERSION)
+    logger.info(f"LogstashAgent version: {AGENT_VERSION}")
+    logger.info(f"Agent state dir: {agent_state.STATE_DIR}")
+    AGENT_CONFIG = normalize_agent_mode(load_agent_config())
+    if AGENT_CONFIG.get('_mode_legacy'):
+        log_resolved_agent_mode(
+            AGENT_CONFIG.get('mode', 'embedded'),
+            legacy=AGENT_CONFIG.get('_mode_legacy'),
+            source='config',
+        )
+    else:
+        log_resolved_agent_mode(AGENT_CONFIG.get('mode', 'embedded'), source='config')
+    LOGSTASH_PATHS = get_logstash_paths()
+    PIPELINES_YML_PATH = LOGSTASH_PATHS['pipelines_yml']
+    PIPELINES_DIR = LOGSTASH_PATHS['conf_d']
+    METADATA_DIR = LOGSTASH_PATHS['metadata']
+    if create_pipeline_dirs:
+        os.makedirs(PIPELINES_DIR, exist_ok=True)
+        os.makedirs(METADATA_DIR, exist_ok=True)
+    _RUNTIME_READY = True
+
+
+if not _LIGHTWEIGHT_CLI:
+    ensure_runtime_init(create_pipeline_dirs=True)
 
 
 def _validate_pipeline_id(pipeline_id: str) -> None:
@@ -2898,8 +2946,9 @@ def _restart_logstash_for_sim() -> bool:
     from logstashagent import controller as _controller
 
     state = agent_state.get_state()
-    mode = (state.get("mode") or AGENT_CONFIG.get("mode") or "").lower()
-    if mode in ("simulate", "default", "agent", "host") or state.get("logstash_unit"):
+    mode = canonical_agent_mode(state.get("mode") or AGENT_CONFIG.get("mode") or "") or ""
+    # packaged: system logstash unit; simulate/managed: instance unit
+    if mode in ("simulate", "packaged", "managed") or state.get("logstash_unit"):
         return bool(_controller.restart_logstash())
     try:
         sup = logstash_supervisor.get_supervisor()
@@ -3278,6 +3327,11 @@ def parse_arguments():
     """
     Parse command-line arguments for enrollment and other modes
     """
+    # Top-level --version / -V only; do not steal `upgrade --version VERSION`.
+    if sys.argv[1:] in (['--version'], ['-V']):
+        print(AGENT_VERSION)
+        sys.exit(0)
+
     parser = argparse.ArgumentParser(
         description='logstashagent - Control plane agent for logstashui',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -3522,10 +3576,14 @@ Examples:
 
     parser.add_argument(
         '--mode',
-        type=str,
-        choices=['default', 'simulate', 'embedded'],
+        type=cli_mode_type,
+        choices=list(FIRST_CLASS_MODES),
         default=None,
-        help='Agent role: default (production), simulate (enrolled sim), embedded (docker sim)'
+        help=(
+            'Agent role: packaged (production), managed (enrolled instance N), '
+            'simulate (enrolled sim N), embedded (docker sim). '
+            'Aliases: default|agent→packaged, host→managed'
+        ),
     )
 
     parser.add_argument(
@@ -3533,7 +3591,7 @@ Examples:
         type=int,
         metavar='N',
         default=None,
-        help='Simulate instance number N (for --mode simulate / lsagent-simulate@N)'
+        help='Instance number N for --mode managed|simulate (logstash-agent@N / lsagent-simulate@N)',
     )
 
     parser.add_argument(
@@ -3576,11 +3634,13 @@ if __name__ == "__main__":
                 sys.exit(0)
 
         try:
+            ensure_runtime_init(create_pipeline_dirs=False)
             installer.perform_installation(
                 enroll_token=args.enroll,
                 logstash_ui_url=args.logstash_ui_url,
                 agent_id=AGENT_ID,
-                enrollment_func=enrollment.perform_enrollment
+                enrollment_func=enrollment.perform_enrollment,
+                assume_yes=args.yes,
             )
             sys.exit(0)
         except installer.InstallError as e:
@@ -3909,6 +3969,7 @@ if __name__ == "__main__":
                 sys.exit(0)
 
         try:
+            ensure_runtime_init(create_pipeline_dirs=False)
             enrollment.perform_enrollment(
                 encoded_token=args.enroll,
                 logstash_ui_url=args.logstash_ui_url,
@@ -3922,6 +3983,8 @@ if __name__ == "__main__":
     # Setup file logging for normal operation (not install/uninstall/upgrade)
     # This creates the log file with the correct user permissions
     setup_file_logging()
+
+    ensure_runtime_init(create_pipeline_dirs=True)
 
     # CLI overrides for mode / instance
     if getattr(args, 'mode', None):
@@ -3969,20 +4032,13 @@ if __name__ == "__main__":
 
     # Check if we're in run mode (controller for enrolled packaged/managed/simulate agents)
     if args.run:
-        # Persist the Logstash API port from config/state so check_in uses the right port.
-        # packaged: 9600; simulate: 9560+N; managed: 9700+N; embedded: 9560
+        from logstashagent.logstash_api import persist_resolved_logstash_api_port
+
         state = agent_state.get_state()
-        if state.get('logstash_api_port'):
-            logstash_api_port = state.get('logstash_api_port')
-        elif agent_mode == 'simulate' and state.get('instance_id') is not None:
-            logstash_api_port = 9560 + int(state['instance_id'])
-        elif agent_mode == 'managed' and state.get('instance_id') is not None:
-            logstash_api_port = 9700 + int(state['instance_id'])
-        elif agent_mode == 'embedded':
-            logstash_api_port = AGENT_CONFIG.get('logstash_api_port', 9560)
-        else:
-            logstash_api_port = AGENT_CONFIG.get('logstash_api_port', 9600)
-        agent_state.update_state('api_port', logstash_api_port)
+        logstash_api_port = persist_resolved_logstash_api_port(
+            yml_port=AGENT_CONFIG.get("logstash_api_port"),
+            mode=agent_mode,
+        )
         # Persist normalized mode so later restarts and status_blob use the new vocabulary
         if not state.get('mode') or mode_legacy:
             agent_state.update_state('mode', agent_mode)
@@ -4016,7 +4072,11 @@ if __name__ == "__main__":
             if ssl_kw:
                 logger.info("%s FastAPI serving HTTPS (product-CA cert)", agent_mode.capitalize())
             else:
-                logger.warning("%s FastAPI serving HTTP (no agent server cert yet)", agent_mode.capitalize())
+                logger.warning(
+                    "%s FastAPI serving HTTP (LOGSTASH_AGENT_TLS off, UI not https, "
+                    "or product CA not pinned)",
+                    agent_mode.capitalize(),
+                )
             uvicorn.run(app, host="0.0.0.0", port=int(agent_port), **ssl_kw)
             sys.exit(0)
 
@@ -4056,8 +4116,8 @@ if __name__ == "__main__":
         logger.info("Agent FastAPI serving HTTPS on %s:%s (product-CA cert)", host, port)
     else:
         logger.warning(
-            "Agent FastAPI serving HTTP on %s:%s — set LOGSTASH_UI_URL + "
-            "LOGSTASHUI_AGENT_CSR_SECRET or enroll to obtain a server cert",
+            "Agent FastAPI serving HTTP on %s:%s — LOGSTASH_AGENT_TLS off, "
+            "UI URL not https, or product CA not pinned",
             host,
             port,
         )

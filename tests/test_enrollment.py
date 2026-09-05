@@ -196,6 +196,57 @@ class TestEnrollAgent:
             with pytest.raises(Exception, match="Failed to connect to logstashui"):
                 enrollment.enroll_agent(encoded, "http://down", "aid")
 
+    def test_http_ui_omits_csr_pem(self, monkeypatch):
+        encoded = _encoded_token({"enrollment_token": "x"})
+        response = MagicMock()
+        response.status_code = 200
+        response.raise_for_status = MagicMock()
+        response.headers = {}
+        response.text = "{}"
+        response.json.return_value = {
+            "success": True,
+            "api_key": "ak",
+            "policy_id": 1,
+            "connection_id": 1,
+            "policy_config": {},
+        }
+        with patch.object(enrollment, "get_callback_host", return_value="h"), patch.object(
+            enrollment, "get_callback_ip", return_value=None
+        ), patch(
+            "logstashagent.tls_trust.ensure_trust_from_token_payload", return_value=None
+        ), patch(
+            "logstashagent.tls_trust.ssl_verify_argument", return_value=False
+        ), patch.object(enrollment.requests, "post", return_value=response) as post:
+            enrollment.enroll_agent(encoded, "http://ui.example.com", "aid")
+        body = post.call_args.kwargs["json"]
+        assert "csr_pem" not in body
+        assert post.call_args.kwargs["verify"] is False
+
+    def test_tls_env_false_omits_csr_pem(self, monkeypatch):
+        monkeypatch.setenv("LOGSTASH_AGENT_TLS", "false")
+        encoded = _encoded_token({"enrollment_token": "x"})
+        response = MagicMock()
+        response.status_code = 200
+        response.raise_for_status = MagicMock()
+        response.headers = {}
+        response.text = "{}"
+        response.json.return_value = {
+            "success": True,
+            "api_key": "ak",
+            "policy_id": 1,
+            "connection_id": 1,
+            "policy_config": {},
+        }
+        with patch.object(enrollment, "get_callback_host", return_value="h"), patch.object(
+            enrollment, "get_callback_ip", return_value=None
+        ), patch(
+            "logstashagent.tls_trust.ensure_trust_from_token_payload", return_value=None
+        ), patch(
+            "logstashagent.tls_trust.ssl_verify_argument", return_value=True
+        ), patch.object(enrollment.requests, "post", return_value=response) as post:
+            enrollment.enroll_agent(encoded, "https://ui.example.com", "aid")
+        assert "csr_pem" not in post.call_args.kwargs["json"]
+
 
 class TestComputeHash:
     def test_sha256_hex(self):
@@ -256,6 +307,61 @@ class TestSaveEnrollmentConfig:
         assert ("policy_config", policy) in calls
         assert ("simulate_setup_pending", True) in calls
         assert ("instance_id", 2) in calls
+
+    def test_persists_logstash_via_ui(self):
+        """
+        Enrollment is one of the three channels carrying the flag. Dropping it
+        means the agent pulls from Elastic until the first check-in lands.
+        """
+        policy = {
+            "policy_type": "SIMULATE",
+            "logstash_source": "VERSION",
+            "logstash_version": "9.4.3",
+            "logstash_via_ui": True,
+        }
+
+        with patch.object(enrollment.agent_state, "update_state") as upd:
+            enrollment.save_enrollment_config(
+                api_key="key",
+                logstash_ui_url="http://ui",
+                policy_id=3,
+                connection_id=7,
+                policy_config=policy,
+            )
+
+        calls = [c[0] for c in upd.call_args_list]
+        assert ("logstash_via_ui", True) in calls
+
+    def test_via_ui_false_is_persisted(self):
+        """False must be written too — a PACKAGED policy has to clear a stale True."""
+        policy = {"policy_type": "PACKAGED", "logstash_via_ui": False}
+
+        with patch.object(enrollment.agent_state, "update_state") as upd:
+            enrollment.save_enrollment_config(
+                api_key="key",
+                logstash_ui_url="http://ui",
+                policy_id=3,
+                connection_id=7,
+                policy_config=policy,
+            )
+
+        calls = [c[0] for c in upd.call_args_list]
+        assert ("logstash_via_ui", False) in calls
+
+    def test_via_ui_absent_is_not_written(self):
+        policy = {"settings_path": "/etc/logstash"}
+
+        with patch.object(enrollment.agent_state, "update_state") as upd:
+            enrollment.save_enrollment_config(
+                api_key="key",
+                logstash_ui_url="http://ui",
+                policy_id=3,
+                connection_id=7,
+                policy_config=policy,
+            )
+
+        keys = [c[0][0] for c in upd.call_args_list]
+        assert "logstash_via_ui" not in keys
 
     def test_propagates_update_state_failure(self):
         with patch.object(

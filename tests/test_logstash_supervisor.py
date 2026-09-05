@@ -63,6 +63,7 @@ class TestSupervisorInit:
         assert sup.heap_max_gb is None
         assert sup.process is None
         assert sup.monitor_thread is None
+        assert sup._healthy_since is None
 
 
 # ---- TestStartLogstash ----

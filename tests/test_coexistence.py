@@ -25,6 +25,18 @@ def test_peek_mode_instance_from_argv():
     assert inst == 2
 
 
+def test_peek_host_alias_resolves_managed_state_dir():
+    d = agent_state.resolve_state_dir(["--mode", "host", "--instance", "1"])
+    assert d == agent_state.OPT_ROOT / "managed-1" / "state"
+
+
+def test_peek_default_does_not_use_instance_tree():
+    # default/agent are packaged aliases — instance tree is managed/simulate only
+    d = agent_state.resolve_state_dir(["--mode", "default", "--instance", "1"])
+    assert "managed-1" not in str(d)
+    assert "simulate-1" not in str(d)
+
+
 def test_resolve_state_dir_from_env(tmp_path, monkeypatch):
     agent_state.configure_state_dir(None)
     monkeypatch.setenv("LOGSTASH_AGENT_STATE_DIR", str(tmp_path / "m1-state"))

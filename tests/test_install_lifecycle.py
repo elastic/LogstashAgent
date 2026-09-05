@@ -119,3 +119,54 @@ def test_enable_simulate_services_raises_when_enable_fails():
     with patch.object(installer.subprocess, "run", side_effect=_fail):
         with pytest.raises(InstallError, match="Failed to enable/start"):
             installer.enable_simulate_services(1)
+
+
+def test_restart_running_agent_units_restarts_active_agent_not_logstash(monkeypatch):
+    monkeypatch.setattr(
+        "logstashagent.install_registry.list_instances",
+        lambda *a, **k: [
+            {
+                "id": "packaged",
+                "agent_unit": "logstash-agent",
+                "logstash_unit": "logstash",
+            },
+            {
+                "id": "managed-1",
+                "agent_unit": "logstash-agent@1",
+                "logstash_unit": "logstash-managed@1",
+            },
+            {
+                "id": "simulate-2",
+                "agent_unit": "lsagent-simulate@2",
+                "logstash_unit": "ls-simulate@2",
+            },
+        ],
+    )
+    calls = []
+
+    def fake_systemctl(action, unit, check=False):
+        calls.append((action, unit))
+        r = MagicMock(returncode=0, stdout="active\n", stderr="")
+        if action == "is-active":
+            if unit in ("logstash-agent", "logstash-agent@1"):
+                r.returncode = 0
+                r.stdout = "active\n"
+            else:
+                r.returncode = 3
+                r.stdout = "inactive\n"
+        return r
+
+    monkeypatch.setattr(installer, "_systemctl_cmd", fake_systemctl)
+    installer._restart_running_agent_units()
+
+    checked = [u for a, u in calls if a == "is-active"]
+    restarted = [u for a, u in calls if a == "restart"]
+    assert "logstash-agent" in checked
+    assert "logstash-agent@1" in checked
+    assert "lsagent-simulate@2" in checked
+    assert checked.count("logstash-agent") == 1
+    assert "logstash" not in checked
+    assert "logstash-managed@1" not in checked
+    assert "ls-simulate@2" not in checked
+    assert restarted == ["logstash-agent", "logstash-agent@1"]
+    assert "lsagent-simulate@2" not in restarted

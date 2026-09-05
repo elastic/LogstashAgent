@@ -5,6 +5,7 @@
 """Tests for logstashagent.agent_state (state file, agent id, encryption hooks)."""
 
 import json
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, mock_open, patch
 
@@ -228,3 +229,32 @@ class TestUpdateState:
 
         data = json.loads(isolated_state["state_file"].read_text(encoding="utf-8"))
         assert data["api_key"] == "fallback-plain"
+
+    def test_concurrent_update_state_preserves_both_keys(self, isolated_state):
+        agent_state.update_state("keep", "me")
+        agent_state.update_state("api_key", "secret-key")
+        start = threading.Event()
+        errors = []
+
+        def writer(key, value):
+            start.wait(timeout=2)
+            try:
+                for i in range(80):
+                    agent_state.update_state(key, {"n": i, "v": value})
+            except Exception as e:
+                errors.append(e)
+
+        t1 = threading.Thread(target=writer, args=("runtime_download", "a"))
+        t2 = threading.Thread(target=writer, args=("last_policy_apply", "b"))
+        t1.start()
+        t2.start()
+        start.set()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+        assert errors == []
+        state = agent_state.get_state()
+        assert state.get("keep") == "me"
+        assert state.get("api_key") == "secret-key"
+        assert (state.get("runtime_download") or {}).get("v") == "a"
+        assert (state.get("last_policy_apply") or {}).get("v") == "b"
+        json.loads(isolated_state["state_file"].read_text(encoding="utf-8"))

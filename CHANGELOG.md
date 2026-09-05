@@ -1,3 +1,52 @@
+## [0.5.2] - CLI modes, gated --help, env-vs-yml precedence - 09/02/2026
+
+Package version is **0.5.2**. Works with **LogstashUI 0.5.1 & 0.5.2**.
+
+### Added
+
+- Check-in `status_blob` includes `runtime_download` (`pending|running|ready|failed`, version, error). No progress bars.
+- Optional `LOGSTASH_AGENT_LOGSTASH_VIA_UI` (default false; env wins over state `logstash_via_ui`): tarball + `.sha512` from `{logstash_ui_url}/ConnectionManager/LogstashArtifact/{connection_id}/{filename}` with `Authorization: ApiKey` (raw enrollment key — never an `lsui_` admin token), product-CA trust, and **no Elastic fallback when on**. `connection_id` is in the path because a GET carries no body to narrow the API-key lookup.
+- Via-UI downloads handle the proxy's cache semantics: `503` (cold cache — the normal first response), `429` (serve cap) and `502` (upstream failed, logged loudly) are retried honouring `Retry-After`, falling back to exponential 15s→300s when the header is absent. `401`/`404`/`405` fail immediately. Bounded by `LOGSTASH_AGENT_ARTIFACT_DEADLINE_SEC` (default 3600); on expiry the next check-in retries.
+- Via-UI downloads resume: bytes land in `<download_dir>/.partial/<name>.part`, which survives an agent restart, so a death at 440/450 MB continues with `Range: bytes=<n>-` instead of re-pulling. `416` discards the partial and restarts from zero; orphans older than 24h are swept.
+- Agents report `logstash_via_ui` in the `GetConfigChanges` body, so toggling the proxy checkbox alone produces a `logstash_runtime` delta. The **persisted state** value is sent, not the env override, which would otherwise disagree with policy permanently. Check-in drift detection compares it too, since a checkbox flip does not move the revision number.
+- `logstash_via_ui` is now read from all three server channels: enrollment `policy_config` (previously dropped), check-in, and the config delta's `logstash_runtime.via_ui`.
+- `logstash-agent --version` prints agent version and exits (lightweight).
+- `LOGSTASH_AGENT_TLS` (default true) disables FastAPI SSL termination when false. Inbound HTTPS also requires an `https://` UI URL and a pinned product CA; leftover `agent-server.crt` is not enough. Not recommended.
+- `LOGSTASH_UI_TLS_INSECURE` (default false) skips verifying the LogstashUI certificate when the UI URL is `https://`. The agent still attempts the well-known CA pin and does not fail if it misses. `http://` UI URLs skip pin/verify entirely. Not recommended. Elastic artifact downloads still verify.
+
+### Changed
+
+- First-class CLI `--mode` values: **packaged**, **managed**, **simulate**, **embedded**. Aliases rewritten on load and argparse: `default`|`agent` → packaged, `host` → managed.
+- `--help`, admin commands, and `--enroll` no longer load agent yml or create `/etc/logstash` pipeline dirs.
+- Documented config precedence: systemd `agent.env` / Logstash env win over `logstash-agent.yml` when set (example yml, installer templates, README).
+- `resolve_path_settings_from_env(require_writable=True)`: missing directories are skipped; an explicit env path that exists but is not writable no longer falls back to `/etc/logstash`.
+- Missing VERSION tree: start a **background** download (per-version flock still in ensure) and **hold the whole policy revision** (no yml/jvm/log4j2/keystore/pipelines, no revision bump) until the tree exists. Next check-in after ready: snapshot → apply → flip `LOGSTASH_BINARY` immediately before the single restart.
+- Packaged/embedded: VERSION pin is a no-op (log once, no download). UI policy should not attach VERSION pins to those roles.
+- `install --enroll` skips overwriting `/opt/logstash-agent/bin/logstash-agent` when it is the same file or the same version; dest newer is not downgraded; unknown dest version refuses overwrite.
+- Dest older: prompt to upgrade in place (copy to `.new` + rename; `--yes` accepts). Either answer still enrolls.
+- After an accepted in-place replace, restart running agent units only.
+
+### Fixed
+
+- Empty or missing `settings_path` no longer becomes cwd (`Path('')` → `.`) during runtime-upgrade snapshot or rollback. Settings copy/restore are skipped; env and `meta.json` still land under `path_root`.
+- Check-in / node stats / health / simulate watchdog probed `localhost:9600` even when systemd `agent.env` had `LOGSTASH_API_PORT=9561`. They now use env-first `resolve_logstash_api_port` and persist the resolved int into `logstash_api_port` and `api_port` so state matches what we probe.
+- **Policy `jvm.options` was written but never applied on managed/simulate instances.** JVM settings were absent from the `java` command line. `logstash.lib.sh` finds jvm.options by scanning `"$@"` for an argv entry *equal to* `--path.settings` and reading the next one; both Logstash units passed the equals form (`--path.settings=<dir>`), which never matches, so `LS_JVM_OPTS` was never exported and Logstash silently used the stock jvm.options from `LOGSTASH_HOME`. `logstash.yml` and `log4j2.properties` were unaffected because the Java settings loader accepts either form — which is why this was the only setting that went missing. Present since multi-instance units were introduced, so managed/simulate JVM tuning had never worked. Packaged (distro `logstash.service`) and embedded (Popen argv) already used the two-argument form and were never affected.
+- Both Logstash units now pass `--path.settings` as two arguments, **and** the per-instance env file exports `LS_JVM_OPTS` outright, so correctness no longer rests on that argv scan. The env line is written only when jvm.options exists — naming a missing file makes `JvmOptionsParser` fail and Logstash refuse to start — and is added/removed as policy starts or stops supplying the file. A test asserts no shipped unit uses the equals form.
+- jvm.options is now written mode `0644` by both writers. `logstash.lib.sh` requires `[ -r ]` to pass **for the logstash user**, so under a restrictive umask a root-owned `0600` file reproduced this exact bug — and, with `LS_JVM_OPTS` set, would turn it into a start failure. Newly relevant now that Logstash actually runs as `logstash` rather than root.
+- Already-enrolled managed/simulate hosts self-heal: on controller start a stale unit (still equals-form) or an env file lacking `LS_JVM_OPTS` triggers a repair. The env half needs no privileges and **on its own fixes the bug**; refreshing `ExecStart` needs root and goes through the existing root → `sudo -n … setup-simulate` escalation, falling back to a warning pointing at `sudo logstash-agent configure`. The Logstash unit must still be restarted — `daemon-reload` does not re-exec a running process.
+- **Install never created the `logstash` user.** The account was only ever *looked up* — it existed solely as a side effect of installing the Logstash DEB/RPM. On a host without the package, install silently produced root-owned directories, systemd units with **no `User=`** (so both the agent and Logstash ran as root), and a sudoers file granting rights to a nonexistent user. `install`/`configure`/`setup-simulate` now create the system group and user the way the package scriptlets do (`--system`, `--gid logstash`, home `/usr/share/logstash`, `--no-create-home`, nologin shell), before any directory is chowned. Idempotent: a host that already has the Logstash package runs no commands. If the account cannot be created the install **aborts** with the manual `groupadd`/`useradd` commands rather than continuing as root.
+- All five systemd units now declare `User=logstash`/`Group=logstash` unconditionally. The packaged unit used to omit them when the account was missing, and the four multi-instance templates shipped with them commented out and uncommented only if the account happened to resolve.
+- `sudo logstash-agent configure` is now a one-shot repair for hosts installed before the above: it creates the account, re-applies ownership to `config`/`state`/`logs`/`cache`/`logstash-versions` and every `managed-*`/`simulate-*` tree, fixes `state/.secret_key`, and rewrites all unit files — including the four multi-instance templates, which `configure` previously never touched. `bin/` is deliberately left root-owned, since sudoers grants `logstash` NOPASSWD on `bin/logstash-agent`. Units must be restarted for `User=` to take effect.
+- `create_directories()` and `configure_logstash()` no longer log `✓ ... (owned by logstash)` when ownership actually fell back to root — the false success message that hid the missing account.
+- `verify_logstash_installed()` no longer counts the `logstash` account as evidence that Logstash is installed, since the installer now creates it.
+- systemd `logstash-agent@N` failed immediately: argparse rejected `--mode managed` (`invalid choice`). Units already passed managed; CLI validation had not.
+- `--mode host` now maps to **managed** (0.5.1 mapped it to packaged). Same rewrite in argv peek, controller startup logs, and Logstash unit name (`logstash-managed@N`).
+- `--enroll` no longer creates pipeline dirs; packaged/managed are included in simulation-style Logstash restart dispatch.
+- Embedded supervisor records `_healthy_since` on first healthy API response and clears it on restart / sustained unresponsive (pipeline-bus warmup). Tests existed; the field never landed.
+- `restart_logstash` unit tests mock `systemctl_via_sudo` so they do not need a host `systemctl` (macOS/Windows).
+- Logstash pin changes (`VERSION` X→Y and `SYSTEM` ↔ `VERSION`) snapshot instance config+env, wait 180s for the API after restart, and restore the snapshot plus the previous binary if the new process never answers. Incomplete snapshots roll back on controller start / next check-in.
+
+
 ## [0.5.1] - Agent roles, multi-instance, TLS, pure-Python keystores - 08/31/2026
 
 Package version is **0.5.1**. Pair with **LogstashUI 0.5.1**.

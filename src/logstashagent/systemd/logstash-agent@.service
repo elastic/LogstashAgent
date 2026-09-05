@@ -16,9 +16,9 @@ RestartSec=10
 WorkingDirectory=/opt/logstash-agent/managed-%i
 StandardOutput=journal
 StandardError=journal
-# Prefer logstash user when present (installer rewrites User= as needed)
-# User=logstash
-# Group=logstash
+# The installer guarantees this account exists (ensure_logstash_user)
+User=logstash
+Group=logstash
 
 [Install]
 WantedBy=multi-user.target

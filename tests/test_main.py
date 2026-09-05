@@ -390,19 +390,19 @@ class TestNormalizeAgentMode:
         assert n["mode"] == "packaged"
         assert n["_mode_legacy"] == "agent"
 
-    def test_legacy_host_maps_to_packaged(self):
+    def test_legacy_host_maps_to_managed(self):
         from logstashagent.main import normalize_agent_mode
 
         n = normalize_agent_mode({"mode": "host"})
-        assert n["mode"] == "packaged"
+        assert n["mode"] == "managed"
         assert n["_mode_legacy"] == "host"
 
-    def test_modern_default_no_legacy(self):
+    def test_default_rewritten_to_packaged(self):
         from logstashagent.main import normalize_agent_mode
 
         n = normalize_agent_mode({"mode": "default"})
-        assert n["mode"] == "default"
-        assert "_mode_legacy" not in n or n.get("_mode_legacy") is None
+        assert n["mode"] == "packaged"
+        assert n["_mode_legacy"] == "default"
 
     def test_packaged_and_managed_first_class(self):
         from logstashagent.main import normalize_agent_mode
