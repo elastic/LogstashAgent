@@ -11,7 +11,12 @@ from logstashagent import tls_server
 
 
 def test_build_csr_and_persist(tmp_path, monkeypatch):
+    from logstashagent import tls_trust
+
     monkeypatch.setattr(tls_server, "tls_server_dir", lambda: tmp_path)
+    monkeypatch.setattr(tls_trust, "tls_dir", lambda: tmp_path)
+    monkeypatch.delenv("LOGSTASH_UI_URL", raising=False)
+    monkeypatch.delenv("LOGSTASHUI_URL", raising=False)
 
     csr_pem = tls_server.build_csr_pem(sans=["myagent", "localhost"])
     assert b"BEGIN CERTIFICATE REQUEST" in csr_pem
@@ -43,10 +48,61 @@ def test_build_csr_and_persist(tmp_path, monkeypatch):
     # Self-signed test leaf lacks host SANs → re-issue is expected until UI signs full CSR
     assert tls_server.cert_needs_reissue(renew_within_days=7) is True
     kw = tls_server.uvicorn_ssl_kwargs()
-    assert "ssl_certfile" in kw
-    assert "ssl_keyfile" in kw
+    assert kw == {}
 
 
 def test_cert_needs_reissue_when_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(tls_server, "tls_server_dir", lambda: tmp_path)
     assert tls_server.cert_needs_reissue()
+
+
+def test_uvicorn_ssl_kwargs_empty_when_tls_env_false(tmp_path, monkeypatch):
+    from logstashagent import tls_trust
+
+    monkeypatch.setattr(tls_server, "tls_server_dir", lambda: tmp_path)
+    monkeypatch.setattr(tls_trust, "tls_dir", lambda: tmp_path)
+    monkeypatch.setenv("LOGSTASH_AGENT_TLS", "false")
+    monkeypatch.setenv("LOGSTASH_UI_URL", "https://ui.example.com")
+    (tmp_path / tls_trust.CA_FILENAME).write_text("x", encoding="utf-8")
+    (tmp_path / tls_trust.FINGERPRINT_FILENAME).write_text("f" * 64, encoding="utf-8")
+    (tmp_path / tls_server.CERT_FILENAME).write_text("cert", encoding="utf-8")
+    (tmp_path / tls_server.KEY_FILENAME).write_text("key", encoding="utf-8")
+    assert tls_server.uvicorn_ssl_kwargs() == {}
+
+
+def test_uvicorn_ssl_kwargs_when_gate_open(tmp_path, monkeypatch):
+    from logstashagent import tls_trust
+
+    monkeypatch.setattr(tls_server, "tls_server_dir", lambda: tmp_path)
+    monkeypatch.setattr(tls_trust, "tls_dir", lambda: tmp_path)
+    monkeypatch.setenv("LOGSTASH_AGENT_TLS", "true")
+    monkeypatch.setenv("LOGSTASH_UI_URL", "https://ui.example.com")
+    (tmp_path / tls_trust.CA_FILENAME).write_text("x", encoding="utf-8")
+    (tmp_path / tls_trust.FINGERPRINT_FILENAME).write_text("f" * 64, encoding="utf-8")
+    (tmp_path / tls_server.CERT_FILENAME).write_text("cert", encoding="utf-8")
+    (tmp_path / tls_server.KEY_FILENAME).write_text("key", encoding="utf-8")
+    kw = tls_server.uvicorn_ssl_kwargs()
+    assert kw["ssl_certfile"] == str(tls_server.cert_path())
+    assert kw["ssl_keyfile"] == str(tls_server.key_path())
+
+
+def test_ensure_agent_server_tls_skips_when_tls_disabled(tmp_path, monkeypatch):
+    monkeypatch.setattr(tls_server, "tls_server_dir", lambda: tmp_path)
+    monkeypatch.setenv("LOGSTASH_AGENT_TLS", "false")
+    monkeypatch.setenv("LOGSTASH_UI_URL", "https://ui.example.com")
+    called = {"issue": 0}
+
+    def boom(*a, **k):
+        called["issue"] += 1
+        raise AssertionError("must not issue")
+
+    monkeypatch.setattr(tls_server, "issue_via_ui", boom)
+    assert tls_server.ensure_agent_server_tls(retries=1, retry_interval_sec=0) is False
+    assert called["issue"] == 0
+
+
+def test_csr_pem_for_request_none_when_gate_closed(tmp_path, monkeypatch):
+    monkeypatch.setattr(tls_server, "tls_server_dir", lambda: tmp_path)
+    monkeypatch.setenv("LOGSTASH_AGENT_TLS", "false")
+    monkeypatch.setenv("LOGSTASH_UI_URL", "https://ui.example.com")
+    assert tls_server.csr_pem_for_request() is None

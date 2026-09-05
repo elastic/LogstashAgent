@@ -40,6 +40,7 @@ def test_write_config_packaged_mode(tmp_path):
     assert "mode: packaged" in content
     assert "mode: agent" not in content
     assert "mode: default" not in content
+    assert "runtime prefers" in content.lower() or "agent.env" in content
 
 
 def test_write_config_simulate_mode(tmp_path):
@@ -70,6 +71,7 @@ def test_write_config_simulate_mode(tmp_path):
     assert "instance_id: 2" in content
     assert "port: 9502" in content
     assert "logstash_api_port: 9562" in content
+    assert "runtime prefers" in content.lower() or "agent.env" in content
 
 
 def test_materialize_simulate_instance(tmp_path):

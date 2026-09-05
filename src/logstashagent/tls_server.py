@@ -326,7 +326,7 @@ def issue_via_ui(
         return False
 
     # IssueServerCert is HTTPS; bootstrap may still be racing — use verify when pinned
-    verify = ssl_verify_argument()
+    verify = ssl_verify_argument(ui_url)
     try:
         resp = requests.post(url, json=body, headers=headers, timeout=timeout, verify=verify)
         if resp.status_code >= 400:
@@ -355,10 +355,7 @@ def ensure_agent_server_tls(
     Returns True if cert+key are ready for uvicorn SSL.
     Retries while UI is still starting (compose).
     """
-    if not force and not cert_needs_reissue():
-        return True
-
-    ensure_private_key()
+    from logstashagent import tls_trust
 
     ui_url = None
     api_key = None
@@ -381,11 +378,23 @@ def ensure_agent_server_tls(
             or ""
         ).strip() or None
 
+    if not tls_trust.agent_tls_enabled() or not tls_trust.ui_url_is_tls(ui_url):
+        logger.warning(
+            "Agent FastAPI TLS skipped (LOGSTASH_AGENT_TLS=%s, ui_tls=%s)",
+            tls_trust.agent_tls_enabled(),
+            tls_trust.ui_url_is_tls(ui_url),
+        )
+        return False
+
+    if not force and not cert_needs_reissue() and tls_trust.product_ca_already_pinned():
+        return True
+
+    ensure_private_key()
+
     if not ui_url:
         logger.warning("No logstash_ui_url; cannot issue agent server certificate")
-        return has_server_cert()
+        return False
 
-    from logstashagent import tls_trust
     import time
 
     for attempt in range(1, max(1, retries) + 1):
@@ -398,6 +407,15 @@ def ensure_agent_server_tls(
                 attempt,
                 retries,
                 e,
+            )
+            time.sleep(retry_interval_sec)
+            continue
+
+        if not tls_trust.product_ca_already_pinned():
+            logger.warning(
+                "Product CA not pinned after fetch attempt %s/%s; not issuing server cert",
+                attempt,
+                retries,
             )
             time.sleep(retry_interval_sec)
             continue
@@ -418,12 +436,20 @@ def ensure_agent_server_tls(
         )
         time.sleep(retry_interval_sec)
 
+    if not tls_trust.product_ca_already_pinned():
+        logger.warning(
+            "Agent FastAPI TLS skipped: product CA absent after wait "
+            "(env wants TLS; cannot terminate SSL)"
+        )
+        return False
     return has_server_cert() and not cert_needs_reissue()
 
 
 def uvicorn_ssl_kwargs() -> dict:
     """Kwargs for uvicorn.run when cert is ready; empty dict if not."""
-    if not has_server_cert():
+    from logstashagent.tls_trust import inbound_tls_ok
+
+    if not inbound_tls_ok() or not has_server_cert():
         return {}
     return {
         "ssl_certfile": str(cert_path()),
@@ -433,6 +459,10 @@ def uvicorn_ssl_kwargs() -> dict:
 
 def csr_pem_for_request() -> Optional[str]:
     """CSR string to attach to enroll/check-in when re-issue needed."""
+    from logstashagent.tls_trust import inbound_tls_ok
+
+    if not inbound_tls_ok():
+        return None
     if not cert_needs_reissue():
         return None
     return build_csr_pem().decode("utf-8")

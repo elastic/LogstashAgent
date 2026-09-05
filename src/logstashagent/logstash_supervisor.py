@@ -85,6 +85,8 @@ class LogstashSupervisor:
         # Logstash health state for request queuing
         self.is_healthy = False  # Set to True once Logstash API responds
         self.is_restarting = False  # Set to True during restart process
+        # Monotonic timestamp of the False→True health transition (pipeline-bus warmup).
+        self._healthy_since: float | None = None
 
         logger.info(
             "LogstashSupervisor initialized (process=embedded, legacy_host=%s, "
@@ -402,6 +404,7 @@ class LogstashSupervisor:
         self.restart_count += 1
         self.is_restarting = True
         self.is_healthy = False
+        self._healthy_since = None
         logger.warning(f"Restarting Logstash (restart #{self.restart_count}): {reason}")
         logger.debug(f"[RESTART] Restart initiated - count: {self.restart_count}, reason: {reason}")
 
@@ -600,12 +603,15 @@ class LogstashSupervisor:
             logger.warning(f"Logstash API unresponsive ({self.api_unresponsive_count}/{self.api_unresponsive_threshold})")
             if self.api_unresponsive_count >= self.api_unresponsive_threshold:
                 self.is_healthy = False
+                self._healthy_since = None
                 return f"Logstash API unresponsive for {self.api_unresponsive_count * 5}s"
             return None
         else:
             # Reset unresponsive counter and mark healthy if we get data
             self.api_unresponsive_count = 0
             self.is_healthy = True
+            if self._healthy_since is None:
+                self._healthy_since = time.monotonic()
 
         # Check JVM heap (still monitor but less critical)
         if heap_percent and heap_percent > self.heap_threshold_percent:

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -159,10 +160,41 @@ class TestLogstashPathResolution:
         cfg.chmod(0o555)
         monkeypatch.setenv(ENV_LOGSTASH_PATH_SETTINGS, str(cfg))
         try:
-            assert resolve_path_settings_from_env(require_writable=True) is None
+            # Must not fall back to host /etc/logstash if the explicit path exists
+            # but is not writable.
+            with patch(
+                "logstashagent.ls_keystore_utils.resolve.CANDIDATES",
+                [str(tmp_path / "package-settings")],
+            ):
+                assert resolve_path_settings_from_env(require_writable=True) is None
             assert resolve_path_settings_from_env(require_writable=False) == cfg.resolve()
         finally:
             cfg.chmod(0o755)
+
+    def test_path_settings_missing_env_falls_through(
+        self, clear_logstash_env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setenv(
+            ENV_LOGSTASH_PATH_SETTINGS, str(tmp_path / "does-not-exist")
+        )
+        fallback = tmp_path / "fallback"
+        fallback.mkdir()
+        with patch(
+            "logstashagent.ls_keystore_utils.resolve.CANDIDATES", [str(fallback)]
+        ):
+            assert (
+                resolve_path_settings_from_env(require_writable=True)
+                == fallback.resolve()
+            )
+
+    def test_path_settings_require_writable_skips_missing_package_dir(
+        self, clear_logstash_env, monkeypatch: pytest.MonkeyPatch
+    ):
+        with patch(
+            "logstashagent.ls_keystore_utils.resolve.CANDIDATES",
+            ["/nonexistent/logstash-settings"],
+        ):
+            assert resolve_path_settings_from_env(require_writable=True) is None
 
     def test_bin_missing_returns_none_without_defaults(
         self, clear_logstash_env, monkeypatch: pytest.MonkeyPatch

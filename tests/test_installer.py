@@ -44,11 +44,7 @@ def test_install_paths_defined():
 
 def test_systemd_service_template():
     """Test that the generated systemd service content is properly formatted"""
-    with patch('logstashagent.installer.pwd') as mock_pwd, \
-         patch('logstashagent.installer.grp') as mock_grp:
-        mock_pwd.getpwnam.return_value = MagicMock()
-        mock_grp.getgrnam.return_value = MagicMock()
-        template = installer._build_systemd_service()
+    template = installer._build_systemd_service()
 
     assert '[Unit]' in template
     assert '[Service]' in template
@@ -58,6 +54,283 @@ def test_systemd_service_template():
     assert 'ExecStart=/opt/logstash-agent/bin/logstash-agent --run' in template
     assert 'Restart=always' in template
     assert 'WorkingDirectory=/opt/logstash-agent/state' in template
+
+
+def test_systemd_service_always_sets_user_even_if_lookup_fails():
+    """
+    Regression guard: the unit must never be written without User=logstash.
+    It used to omit it when the account was missing, silently running as root.
+    """
+    with patch('logstashagent.installer.pwd') as mock_pwd, \
+         patch('logstashagent.installer.grp') as mock_grp:
+        mock_pwd.getpwnam.side_effect = KeyError('logstash')
+        mock_grp.getgrnam.side_effect = KeyError('logstash')
+        template = installer._build_systemd_service()
+
+    assert 'User=logstash' in template
+    assert 'Group=logstash' in template
+    assert '# User=logstash' not in template
+
+
+class _FakeAccountDb:
+    """
+    Stands in for pwd/grp, backed by mutable sets so that a successful
+    groupadd/useradd makes the subsequent lookup succeed.
+    """
+
+    def __init__(self, *, users=(), groups=()):
+        self.users = set(users)
+        self.groups = set(groups)
+
+    def getpwnam(self, name):
+        if name not in self.users:
+            raise KeyError(name)
+        return MagicMock(pw_uid=1000)
+
+    def getgrnam(self, name):
+        if name not in self.groups:
+            raise KeyError(name)
+        return MagicMock(gr_gid=1000)
+
+
+@pytest.fixture
+def account_env(monkeypatch):
+    """
+    Patch pwd/grp with a fake account db and subprocess with a recorder whose
+    successful calls populate that db. Returns (db, calls, set_result).
+    """
+    db = _FakeAccountDb()
+    calls = []
+    result = {'returncode': 0, 'stderr': '', 'stdout': ''}
+
+    fake_pwd = MagicMock()
+    fake_pwd.getpwnam.side_effect = db.getpwnam
+    fake_grp = MagicMock()
+    fake_grp.getgrnam.side_effect = db.getgrnam
+    monkeypatch.setattr(installer, 'pwd', fake_pwd)
+    monkeypatch.setattr(installer, 'grp', fake_grp)
+
+    def fake_run(argv, **kwargs):
+        calls.append({'argv': argv, 'kwargs': kwargs})
+        if result['returncode'] in (0, installer._USERADD_EEXIST):
+            if 'groupadd' in argv[0]:
+                db.groups.add('logstash')
+            elif 'useradd' in argv[0]:
+                db.users.add('logstash')
+        return MagicMock(
+            returncode=result['returncode'],
+            stderr=result['stderr'],
+            stdout=result['stdout'],
+        )
+
+    monkeypatch.setattr(installer.subprocess, 'run', fake_run)
+    return db, calls, result
+
+
+def test_sbin_tool_prefers_absolute_path(monkeypatch):
+    """
+    /usr/sbin is not on root's PATH on every distro, and the frozen binary's
+    environment is not the operator's shell.
+    """
+    monkeypatch.setattr(installer.os.path, 'isfile', lambda p: p == '/usr/sbin/useradd')
+    monkeypatch.setattr(installer.os, 'access', lambda p, m: True)
+    assert installer._sbin_tool('useradd') == '/usr/sbin/useradd'
+
+    # RHEL layout
+    monkeypatch.setattr(installer.os.path, 'isfile', lambda p: p == '/sbin/useradd')
+    assert installer._sbin_tool('useradd') == '/sbin/useradd'
+
+    # Neither present (e.g. macOS dev box): fall back to the bare name
+    monkeypatch.setattr(installer.os.path, 'isfile', lambda p: False)
+    assert installer._sbin_tool('useradd') == 'useradd'
+
+
+def test_nologin_shell_resolution(monkeypatch):
+    monkeypatch.setattr(installer.os.path, 'isfile', lambda p: p == '/usr/sbin/nologin')
+    assert installer._nologin_shell() == '/usr/sbin/nologin'
+
+    monkeypatch.setattr(installer.os.path, 'isfile', lambda p: p == '/sbin/nologin')
+    assert installer._nologin_shell() == '/sbin/nologin'
+
+    monkeypatch.setattr(installer.os.path, 'isfile', lambda p: False)
+    assert installer._nologin_shell() == '/bin/false'
+
+
+def test_ensure_logstash_user_idempotent_when_present(account_env):
+    """A host with the Logstash DEB/RPM must run no commands at all."""
+    db, calls, _ = account_env
+    db.users.add('logstash')
+    db.groups.add('logstash')
+
+    uid, gid = installer.ensure_logstash_user()
+
+    assert (uid, gid) == (1000, 1000)
+    assert calls == [], "must not touch an existing account"
+
+
+def test_ensure_logstash_user_creates_group_and_user(account_env):
+    db, calls, _ = account_env
+
+    uid, gid = installer.ensure_logstash_user()
+
+    assert (uid, gid) == (1000, 1000)
+    assert len(calls) == 2
+    groupadd, useradd = calls[0]['argv'], calls[1]['argv']
+
+    assert groupadd[0].endswith('groupadd')
+    assert '--system' in groupadd
+    assert groupadd[-1] == 'logstash'
+
+    assert useradd[0].endswith('useradd')
+    assert '--system' in useradd
+    assert '--no-create-home' in useradd
+    assert useradd[useradd.index('--gid') + 1] == 'logstash'
+    assert useradd[useradd.index('--home-dir') + 1] == '/usr/share/logstash'
+    assert 'nologin' in useradd[useradd.index('--shell') + 1] or \
+        useradd[useradd.index('--shell') + 1] == '/bin/false'
+    assert useradd[-1] == 'logstash'
+
+
+def test_ensure_logstash_user_creates_user_only_when_group_exists(account_env):
+    """Group-present-but-user-missing is a normal state."""
+    db, calls, _ = account_env
+    db.groups.add('logstash')
+
+    installer.ensure_logstash_user()
+
+    assert len(calls) == 1
+    assert calls[0]['argv'][0].endswith('useradd')
+
+
+def test_ensure_logstash_user_creates_group_only_when_user_exists(account_env):
+    """Must not try to change an existing account's primary group."""
+    db, calls, _ = account_env
+    db.users.add('logstash')
+
+    installer.ensure_logstash_user()
+
+    assert len(calls) == 1
+    assert calls[0]['argv'][0].endswith('groupadd')
+
+
+def test_ensure_logstash_user_passes_host_env(account_env):
+    """
+    PyInstaller's LD_LIBRARY_PATH breaks distro tools linked against a newer
+    libcrypto; these calls must go out with a cleaned environment.
+    """
+    db, calls, _ = account_env
+
+    installer.ensure_logstash_user()
+
+    for call in calls:
+        env = call['kwargs'].get('env')
+        assert env is not None, "must pass env=host_subprocess_env()"
+        assert 'LD_LIBRARY_PATH' not in env or '_internal' not in env['LD_LIBRARY_PATH']
+        assert call['kwargs']['check'] is False
+
+
+def test_ensure_logstash_user_tolerates_already_exists(account_env, monkeypatch):
+    """
+    Exit 9 == 'name already in use'. Covers a race with a package install and
+    an LDAP/SSSD account useradd refuses to shadow.
+    """
+    db, calls, result = account_env
+    result['returncode'] = installer._USERADD_EEXIST
+    result['stderr'] = 'useradd: user logstash already exists'
+
+    uid, gid = installer.ensure_logstash_user()
+
+    assert (uid, gid) == (1000, 1000)
+    assert len(calls) == 2
+
+
+def test_ensure_logstash_user_raises_with_manual_commands(account_env):
+    db, calls, result = account_env
+    result['returncode'] = 1
+    result['stderr'] = 'useradd: cannot lock /etc/passwd'
+
+    with pytest.raises(installer.InstallError) as exc:
+        installer.ensure_logstash_user()
+
+    msg = str(exc.value)
+    assert 'cannot lock /etc/passwd' in msg
+    assert 'groupadd' in msg and 'useradd' in msg, "must include manual commands"
+
+
+def test_ensure_logstash_user_raises_when_tool_missing(account_env, monkeypatch):
+    db, _calls, _ = account_env
+
+    def boom(argv, **kwargs):
+        raise FileNotFoundError('useradd')
+
+    monkeypatch.setattr(installer.subprocess, 'run', boom)
+
+    with pytest.raises(installer.InstallError) as exc:
+        installer.ensure_logstash_user()
+
+    assert 'groupadd' in str(exc.value)
+
+
+def test_ensure_logstash_user_raises_if_still_unresolvable(account_env, monkeypatch):
+    """A tool that reports success but leaves no resolvable account must fail."""
+    db, _calls, _ = account_env
+
+    def lying_run(argv, **kwargs):
+        return MagicMock(returncode=0, stderr='', stdout='')
+
+    monkeypatch.setattr(installer.subprocess, 'run', lying_run)
+
+    with pytest.raises(installer.InstallError, match='still does not resolve'):
+        installer.ensure_logstash_user()
+
+
+def test_verify_logstash_installed_ignores_account(monkeypatch):
+    """
+    The account is created by the installer now, so it is no longer evidence
+    that the Logstash package is present.
+    """
+    monkeypatch.setattr(
+        installer.os.path, 'isdir', lambda p: p in ('/etc/logstash', '/usr/share/logstash')
+    )
+    fake_pwd = MagicMock()
+    fake_pwd.getpwnam.side_effect = KeyError('logstash')
+    monkeypatch.setattr(installer, 'pwd', fake_pwd)
+
+    assert installer.verify_logstash_installed() is True
+
+
+def test_repair_agent_ownership_leaves_bin_root_owned(tmp_path, monkeypatch):
+    """
+    Escalation guard: sudoers grants logstash NOPASSWD on bin/logstash-agent,
+    so logstash must never own that directory.
+    """
+    for name in ('bin', 'config', 'state', 'logs', 'cache', 'logstash-versions'):
+        (tmp_path / name).mkdir()
+    (tmp_path / 'simulate-1').mkdir()
+
+    monkeypatch.setitem(installer.INSTALL_PATHS, 'opt_root', str(tmp_path))
+    for key, name in (
+        ('config_dir', 'config'), ('state_dir', 'state'),
+        ('log_dir', 'logs'), ('cache_dir', 'cache'),
+    ):
+        monkeypatch.setitem(installer.INSTALL_PATHS, key, str(tmp_path / name))
+
+    chowned = []
+    monkeypatch.setattr(
+        installer, 'get_logstash_uid_gid', lambda: (1000, 1000)
+    )
+    monkeypatch.setattr(
+        installer.os, 'chown', lambda p, u, g: chowned.append(str(p)), raising=False
+    )
+    monkeypatch.setattr(installer, 'install_multi_instance_unit_templates', lambda: None)
+
+    installer.repair_agent_ownership()
+
+    assert str(tmp_path / 'config') in chowned
+    assert str(tmp_path / 'state') in chowned
+    assert str(tmp_path / 'logstash-versions') in chowned
+    assert str(tmp_path / 'simulate-1') in chowned
+    assert str(tmp_path / 'bin') not in chowned, "bin/ must stay root-owned"
 
 
 def test_github_release_url_format():

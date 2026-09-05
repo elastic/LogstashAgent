@@ -13,11 +13,13 @@ import hashlib
 import base64
 import subprocess
 import os
+import shutil
 from pathlib import Path
 from datetime import datetime, timezone
 from cryptography.fernet import Fernet
 from . import agent_state
 from . import log_analyzer
+from .logstash_api import persist_resolved_logstash_api_port, resolve_logstash_api_port
 from .ls_keystore_utils import LogstashKeystore
 from .ls_keystore_utils.exceptions import (
     LogstashKeystoreException,
@@ -488,32 +490,731 @@ def apply_keystore_password_change(
 _log_watcher: Optional[log_analyzer.LogstashLogWatcher] = None
 
 
-def update_env_logstash_binary(env_file: Optional[str], binary: str) -> bool:
+def _set_env_file_var(env_file: Optional[str], key: str, value: Optional[str]) -> bool:
     """
-    Set or replace LOGSTASH_BINARY= in a multi-instance env file
+    Set, replace, or remove ``key=`` in a multi-instance env file
     (e.g. /opt/logstash-agent/simulate-N/env or managed-N/env) without sudo
-    when the agent owns the tree.
+    when the agent owns the tree. ``value=None`` deletes the line.
+
+    Every other line is preserved verbatim, so LOGSTASH_KEYSTORE_PASS and the
+    path flags survive.
     """
-    if not env_file or not binary:
+    if not env_file or not key:
         return False
     path = Path(env_file)
     try:
         lines = []
         if path.exists():
             lines = path.read_text(encoding='utf-8').splitlines()
-        filtered = [ln for ln in lines if not ln.startswith('LOGSTASH_BINARY=')]
-        filtered.append(f'LOGSTASH_BINARY={binary}')
+        prefix = f'{key}='
+        filtered = [ln for ln in lines if not ln.startswith(prefix)]
+        if value is not None:
+            filtered.append(f'{prefix}{value}')
+        elif len(filtered) == len(lines):
+            return True  # nothing to remove
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('\n'.join(filtered) + '\n', encoding='utf-8')
         try:
             os.chmod(path, 0o640)
         except OSError:
             pass
-        logger.info(f"Updated LOGSTASH_BINARY in {path} -> {binary}")
+        if value is None:
+            logger.info(f"Removed {key} from {path}")
+        else:
+            logger.info(f"Updated {key} in {path} -> {value}")
         return True
     except Exception as e:
-        logger.error(f"Failed to update LOGSTASH_BINARY in {env_file}: {e}")
+        logger.error(f"Failed to update {key} in {env_file}: {e}")
         return False
+
+
+def update_env_logstash_binary(env_file: Optional[str], binary: str) -> bool:
+    """Set or replace LOGSTASH_BINARY= in a multi-instance env file."""
+    if not binary:
+        return False
+    return _set_env_file_var(env_file, 'LOGSTASH_BINARY', binary)
+
+
+def ensure_env_jvm_opts(env_file: Optional[str], settings_path: Optional[str]) -> bool:
+    """
+    Keep LS_JVM_OPTS in a multi-instance env file pointed at the policy-pushed
+    jvm.options under path.settings.
+
+    Without this, Logstash finds jvm.options only via the argv scan in
+    logstash.lib.sh, which matches an argv entry *equal to* ``--path.settings``
+    and reads the next one. Anything else (notably ``--path.settings=<dir>``)
+    silently falls back to the stock jvm.options in LOGSTASH_HOME, so
+    policy-pushed heap settings never reach the JVM.
+
+    The line is removed when the file is absent: LS_JVM_OPTS naming a missing
+    file makes JvmOptionsParser fail and Logstash refuse to start.
+    """
+    if not env_file or not settings_path:
+        return False
+    jvm_options = Path(settings_path) / 'jvm.options'
+    if not jvm_options.is_file():
+        return _set_env_file_var(env_file, 'LS_JVM_OPTS', None)
+    return _set_env_file_var(env_file, 'LS_JVM_OPTS', str(jvm_options))
+
+
+def _installed_unit_is_stale(unit_path: Path) -> bool:
+    """
+    True when an installed Logstash unit still uses ``--path.settings=<dir>``.
+
+    Deliberately a marker check rather than a diff against the bundled template,
+    so a deliberate operator edit elsewhere in the unit is not clobbered.
+    """
+    try:
+        if not unit_path.is_file():
+            return False
+        return '--path.settings=' in unit_path.read_text(encoding='utf-8')
+    except OSError as exc:
+        logger.debug("Could not read %s: %s", unit_path, exc)
+        return False
+
+
+def heal_stale_logstash_launch(state: Optional[dict] = None) -> bool:
+    """
+    Repair managed/simulate instances installed before the jvm.options fix.
+
+    Two things go stale on such a host, with different privileges:
+
+    * the instance env file, which the agent owns and can rewrite directly —
+      adding LS_JVM_OPTS here is on its own enough to fix the bug;
+    * the unit file under /etc/systemd/system, which is root-owned. The agent
+      now runs as ``User=logstash``, so this goes through the existing
+      root → ``sudo -n … setup-simulate`` escalation in ensure_simulate_setup().
+
+    Returns True if anything was changed. Either way the Logstash unit must be
+    restarted for a new ExecStart or env value to take effect — daemon-reload
+    does not re-exec a running process.
+    """
+    from logstashagent import installer
+
+    state = state if state is not None else agent_state.get_state()
+    mode = str(state.get('mode') or '').lower()
+    if mode not in ('managed', 'simulate'):
+        return False
+
+    changed = False
+    settings_path = state.get('settings_path')
+    env_file = state.get('keystore_env_file')
+    if env_file and settings_path:
+        before = ''
+        try:
+            before = Path(env_file).read_text(encoding='utf-8')
+        except OSError:
+            pass
+        if ensure_env_jvm_opts(env_file, settings_path):
+            try:
+                changed = Path(env_file).read_text(encoding='utf-8') != before
+            except OSError:
+                changed = True
+
+    unit_key = 'logstash_managed_unit' if mode == 'managed' else 'ls_simulate_unit'
+    unit_path = Path(installer.INSTALL_PATHS.get(unit_key, ''))
+    if not _installed_unit_is_stale(unit_path):
+        return changed
+
+    logger.warning(
+        "%s still launches Logstash with --path.settings=<dir>; jvm.options is "
+        "ignored in that form. Reinstalling unit templates.",
+        unit_path,
+    )
+    try:
+        if hasattr(os, 'geteuid') and os.geteuid() == 0:
+            installer.install_multi_instance_unit_templates()
+            logger.info("✓ Reinstalled multi-instance unit templates")
+            changed = True
+        else:
+            result = installer.ensure_simulate_setup(
+                installer.policy_config_from_state(state)
+            )
+            if result.get('status') == 'complete':
+                logger.info("✓ Unit templates refreshed via %s", result.get('via'))
+                changed = True
+            else:
+                logger.warning(
+                    "Could not refresh unit templates (%s). LS_JVM_OPTS in the "
+                    "instance env file still applies jvm.options; run "
+                    "'sudo logstash-agent configure' to update ExecStart.",
+                    result.get('status'),
+                )
+    except Exception as exc:
+        logger.warning(
+            "Unit template refresh failed: %s. LS_JVM_OPTS in the instance env "
+            "file still applies jvm.options.",
+            exc,
+        )
+
+    if changed:
+        logger.warning(
+            "Restart the Logstash unit (%s) to pick up the corrected launch "
+            "configuration.",
+            state.get('logstash_unit') or unit_path.name,
+        )
+    return changed
+
+
+RUNTIME_SNAPSHOT_NAME = '.runtime-snapshot'
+RUNTIME_UPGRADE_HEALTH_TIMEOUT = 180.0
+RUNTIME_UPGRADE_HEALTH_POLL = 2.0
+
+_VERSION_DOWNLOAD_LOCK = threading.Lock()
+_VERSION_DOWNLOAD_THREADS: dict[str, threading.Thread] = {}
+_VERSION_DOWNLOAD_STATUS: dict[str, dict] = {}
+_IGNORED_VERSION_PINS: set[str] = set()
+
+_SNAPSHOT_SETTING_FILES = (
+    'logstash.yml',
+    'jvm.options',
+    'log4j2.properties',
+    'pipelines.yml',
+    'logstash.keystore',
+)
+# Pipeline .conf files live in conf.d (update_pipelines). Copy pipelines/ too if present.
+_SNAPSHOT_SETTING_DIRS = (
+    'pipelines',
+    'conf.d',
+)
+
+
+def _empty_runtime_prep(**overrides) -> dict:
+    prep = {
+        'ok': True,
+        'changed': False,
+        'held': False,
+        'desired_binary': None,
+        'snapshot_dir': None,
+        'previous': {},
+        'error': None,
+        'source': None,
+        'version': None,
+        'download_dir': None,
+    }
+    prep.update(overrides)
+    return prep
+
+
+def _stamp_runtime_download(fields: dict, *, overwrite: bool = False) -> None:
+    current = dict((agent_state.get_state() or {}).get('runtime_download') or {})
+    new_ver = fields.get('version')
+    cur_ver = current.get('version')
+    if not overwrite and cur_ver and new_ver and cur_ver != new_ver:
+        return
+    if overwrite:
+        current = dict(fields)
+    else:
+        current.update(fields)
+    agent_state.update_state('runtime_download', current)
+
+
+def _set_download_memory(version: str, **fields) -> dict:
+    with _VERSION_DOWNLOAD_LOCK:
+        cur = dict(_VERSION_DOWNLOAD_STATUS.get(version) or {})
+        cur.update(fields)
+        cur['version'] = version
+        _VERSION_DOWNLOAD_STATUS[version] = cur
+        return dict(cur)
+
+
+def _download_thread_alive(version: str) -> threading.Thread | None:
+    with _VERSION_DOWNLOAD_LOCK:
+        t = _VERSION_DOWNLOAD_THREADS.get(version)
+        if t is not None and t.is_alive():
+            return t
+        return None
+
+
+def _download_memory(version: str) -> dict | None:
+    with _VERSION_DOWNLOAD_LOCK:
+        st = _VERSION_DOWNLOAD_STATUS.get(version)
+        return dict(st) if st else None
+
+
+def _flush_runtime_download(version: str, download_dir: str | None = None) -> None:
+    """Persist in-memory worker status onto agent_state (controller thread only)."""
+    mem = _download_memory(version)
+    alive = _download_thread_alive(version)
+    ddir = download_dir or (mem or {}).get('dir') or ''
+    if alive is not None:
+        blob = {
+            'status': (mem or {}).get('status') or 'running',
+            'version': version,
+            'dir': ddir,
+            'error': None,
+            'started_at': (mem or {}).get('started_at'),
+        }
+        _stamp_runtime_download(blob)
+        return
+    if not mem:
+        return
+    present = False
+    if ddir:
+        from .logstash_download import version_is_present
+
+        present = version_is_present(version, ddir)
+    if present:
+        blob = {
+            'status': 'ready',
+            'version': version,
+            'dir': ddir,
+            'error': None,
+            'started_at': mem.get('started_at'),
+        }
+    else:
+        blob = {
+            'status': 'failed',
+            'version': version,
+            'dir': ddir,
+            'error': mem.get('error'),
+            'started_at': mem.get('started_at'),
+        }
+    _stamp_runtime_download(blob)
+
+
+def _flush_runtime_downloads_for_checkin() -> None:
+    with _VERSION_DOWNLOAD_LOCK:
+        versions = list(_VERSION_DOWNLOAD_STATUS.keys())
+    state = agent_state.get_state() or {}
+    rd = state.get('runtime_download') or {}
+    ver = (rd.get('version') or '').strip()
+    if ver and ver not in versions:
+        versions.append(ver)
+    ddir = rd.get('dir') or state.get('logstash_download_dir') or ''
+    for v in versions:
+        mem = _download_memory(v)
+        _flush_runtime_download(v, (mem or {}).get('dir') or ddir)
+
+
+def _maybe_persist_via_ui(payload) -> None:
+    if not isinstance(payload, dict):
+        return
+    if 'logstash_via_ui' in payload:
+        agent_state.update_state('logstash_via_ui', payload['logstash_via_ui'])
+    elif 'via_ui' in payload:
+        agent_state.update_state('logstash_via_ui', payload['via_ui'])
+
+
+def _version_download_worker(version: str, download_dir: str) -> None:
+    try:
+        _set_download_memory(
+            version, status='running', dir=download_dir, error=None
+        )
+        from .logstash_download import ensure_logstash_version
+
+        ensure_logstash_version(version, download_dir)
+        _set_download_memory(
+            version, status='ready', dir=download_dir, error=None
+        )
+    except Exception as e:
+        logger.error('VERSION download failed for %s: %s', version, e)
+        _set_download_memory(
+            version, status='failed', dir=download_dir, error=str(e)
+        )
+    finally:
+        with _VERSION_DOWNLOAD_LOCK:
+            cur = _VERSION_DOWNLOAD_THREADS.get(version)
+            if cur is threading.current_thread():
+                _VERSION_DOWNLOAD_THREADS.pop(version, None)
+
+
+def _start_version_download(version: str, download_dir: str) -> threading.Thread:
+    with _VERSION_DOWNLOAD_LOCK:
+        existing = _VERSION_DOWNLOAD_THREADS.get(version)
+        if existing is not None and existing.is_alive():
+            return existing
+        started_at = datetime.now(timezone.utc).isoformat()
+        _VERSION_DOWNLOAD_STATUS[version] = {
+            'status': 'pending',
+            'version': version,
+            'dir': download_dir,
+            'error': None,
+            'started_at': started_at,
+        }
+        blob = dict(_VERSION_DOWNLOAD_STATUS[version])
+        t = threading.Thread(
+            target=_version_download_worker,
+            args=(version, download_dir),
+            daemon=True,
+            name=f'logstash-download-{version}',
+        )
+        _VERSION_DOWNLOAD_THREADS[version] = t
+        t.start()
+    _stamp_runtime_download(blob, overwrite=True)
+    return t
+
+
+def _canonical_run_mode(mode: str | None) -> str:
+    raw = (mode or '').strip().lower()
+    if raw in ('default', 'agent'):
+        return 'packaged'
+    if raw == 'host':
+        return 'managed'
+    return raw
+
+
+def _optional_settings_path(raw) -> Path | None:
+    """Return a settings dir Path, or None when missing/empty/whitespace.
+
+    Never Path(''): pathlib turns that into '.', which is cwd.
+    """
+    s = str(raw or '').strip()
+    if not s:
+        return None
+    return Path(s)
+
+
+def _runtime_path_root(state: dict) -> Path | None:
+    raw = (state.get('path_root') or '').strip()
+    if raw:
+        return Path(raw)
+    env_file = (state.get('keystore_env_file') or '').strip()
+    if env_file.replace('\\', '/').endswith('/env'):
+        return Path(env_file).parent
+    settings = _optional_settings_path(state.get('settings_path'))
+    if settings is not None:
+        return settings
+    return None
+
+
+def _copy_if_exists(src: Path, dest: Path) -> None:
+    if src.is_file():
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+    elif src.is_dir():
+        if dest.exists():
+            shutil.rmtree(dest)
+        shutil.copytree(src, dest)
+
+
+def _write_runtime_snapshot(state: dict, previous: dict, desired: dict) -> Path:
+    root = _runtime_path_root(state)
+    if root is None:
+        raise RuntimeError('no path_root for runtime snapshot')
+    snap = root / RUNTIME_SNAPSHOT_NAME
+    if snap.exists():
+        raise RuntimeError(f'refusing to overwrite existing runtime snapshot at {snap}')
+    snap.mkdir(parents=True, exist_ok=True)
+    settings = _optional_settings_path(state.get('settings_path'))
+    if settings is not None:
+        settings_dest = snap / 'settings'
+        settings_dest.mkdir(parents=True, exist_ok=True)
+        for name in _SNAPSHOT_SETTING_FILES:
+            _copy_if_exists(settings / name, settings_dest / name)
+        for dirname in _SNAPSHOT_SETTING_DIRS:
+            _copy_if_exists(settings / dirname, settings_dest / dirname)
+    env_file = previous.get('env_file')
+    if env_file and Path(env_file).is_file():
+        shutil.copy2(env_file, snap / 'env')
+    meta = {
+        'previous': previous,
+        'desired': desired,
+    }
+    (snap / 'meta.json').write_text(json.dumps(meta, indent=2) + '\n', encoding='utf-8')
+    return snap
+
+
+def _restore_runtime_snapshot(prep: dict) -> bool:
+    snap = Path(prep.get('snapshot_dir') or '')
+    if not snap.is_dir():
+        return False
+    try:
+        meta = json.loads((snap / 'meta.json').read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError) as e:
+        logger.error('Invalid runtime snapshot meta: %s', e)
+        return False
+    previous = meta.get('previous') or prep.get('previous') or {}
+    try:
+        settings = _optional_settings_path(previous.get('settings_path'))
+        src_settings = snap / 'settings'
+        if src_settings.is_dir() and settings is not None:
+            settings.mkdir(parents=True, exist_ok=True)
+            for name in _SNAPSHOT_SETTING_FILES:
+                _copy_if_exists(src_settings / name, settings / name)
+            for dirname in _SNAPSHOT_SETTING_DIRS:
+                dir_src = src_settings / dirname
+                if dir_src.exists():
+                    _copy_if_exists(dir_src, settings / dirname)
+        env_file = previous.get('env_file')
+        env_src = snap / 'env'
+        if env_file and env_src.is_file():
+            Path(env_file).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(env_src, env_file)
+    except (OSError, shutil.Error) as e:
+        logger.error('Failed to restore runtime snapshot at %s: %s', snap, e)
+        return False
+    return True
+
+
+def prepare_runtime_upgrade(runtime: dict | None) -> dict:
+    """
+    Resolve the desired Logstash binary and snapshot current config.
+
+    Missing VERSION trees start one background download and hold the revision
+    (ok=True, changed=False, held=True). Does not flip LOGSTASH_BINARY or
+    agent-state pin fields.
+    """
+    if not runtime or runtime is False:
+        return _empty_runtime_prep()
+    state = agent_state.get_state() or {}
+    mode = _canonical_run_mode(state.get('mode'))
+    _maybe_persist_via_ui(runtime)
+    if mode not in ('managed', 'simulate'):
+        source = (runtime.get('source') or '').upper()
+        if source == 'VERSION':
+            ver = (runtime.get('version') or '').strip() or '(none)'
+            key = f'{mode}:{ver}'
+            if key not in _IGNORED_VERSION_PINS:
+                _IGNORED_VERSION_PINS.add(key)
+                logger.warning(
+                    'Ignoring VERSION pin %s in %s mode (no download)',
+                    ver,
+                    mode or 'unknown',
+                )
+        return _empty_runtime_prep()
+
+    from .logstash_download import (
+        resolve_binary_from_policy,
+        LogstashDownloadError,
+        DEFAULT_DOWNLOAD_ROOT,
+        normalize_download_dir,
+        version_is_present,
+    )
+
+    source = (runtime.get('source') or 'SYSTEM').upper()
+    version = (runtime.get('version') or '').strip()
+    download_dir = normalize_download_dir(
+        (runtime.get('download_dir') or DEFAULT_DOWNLOAD_ROOT).strip()
+    )
+    binary_path = runtime.get('binary_path') or '/usr/share/logstash/bin'
+
+    if source == 'VERSION' and version:
+        inflight = _download_thread_alive(version)
+        present = version_is_present(version, download_dir)
+        if inflight is not None or not present:
+            _flush_runtime_download(version, download_dir)
+            if inflight is None:
+                _start_version_download(version, download_dir)
+            logger.info(
+                'Holding policy revision until VERSION %s download finishes (present=%s inflight=%s)',
+                version,
+                present,
+                inflight is not None,
+            )
+            return _empty_runtime_prep(
+                held=True, source=source, version=version, download_dir=download_dir
+            )
+        _flush_runtime_download(version, download_dir)
+
+    try:
+        binary = str(
+            resolve_binary_from_policy(
+                logstash_source=source,
+                logstash_version=version,
+                logstash_download_dir=download_dir,
+                binary_path=binary_path,
+            )
+        )
+    except LogstashDownloadError as e:
+        logger.error('Logstash runtime prepare failed: %s', e)
+        return _empty_runtime_prep(ok=False, error=str(e), source=source, version=version)
+    except Exception as e:
+        logger.error('Unexpected error preparing logstash_runtime: %s', e, exc_info=True)
+        return _empty_runtime_prep(ok=False, error=str(e), source=source, version=version)
+
+    if source == 'VERSION' and version:
+        try:
+            from logstashagent import install_registry as _reg
+
+            _reg.register_logstash_version(
+                version=version,
+                binary=binary,
+                download_dir=download_dir,
+                used_by=state.get('agent_id') or state.get('deployment_id'),
+            )
+        except Exception as e:
+            logger.debug('Could not record VERSION tree in install registry: %s', e)
+
+    prev_binary = str(state.get('logstash_binary') or '')
+    prev_source = (state.get('logstash_source') or 'SYSTEM').upper()
+    prev_version = (state.get('logstash_version') or '').strip()
+    if prev_binary == binary and prev_source == source and prev_version == version:
+        return _empty_runtime_prep(
+            desired_binary=binary, source=source, version=version, download_dir=download_dir
+        )
+
+    previous = {
+        'binary': prev_binary,
+        'source': prev_source,
+        'version': prev_version,
+        'env_file': state.get('keystore_env_file'),
+        'settings_path': state.get('settings_path'),
+        'api_port': state.get('logstash_api_port') or 9600,
+    }
+    desired = {'binary': binary, 'source': source, 'version': version, 'download_dir': download_dir}
+    root = _runtime_path_root(state)
+    preexisting_snapshot = bool(root is not None and (root / RUNTIME_SNAPSHOT_NAME).exists())
+    try:
+        snap = _write_runtime_snapshot(state, previous, desired)
+    except Exception as e:
+        logger.error('Runtime snapshot failed: %s', e, exc_info=True)
+        if root is not None and not preexisting_snapshot:
+            shutil.rmtree(root / RUNTIME_SNAPSHOT_NAME, ignore_errors=True)
+        return _empty_runtime_prep(ok=False, error=str(e), source=source, version=version)
+
+    logger.info('Runtime upgrade prepared: %s -> %s snapshot=%s', prev_binary, binary, snap)
+    return {
+        'ok': True,
+        'changed': True,
+        'held': False,
+        'desired_binary': binary,
+        'snapshot_dir': str(snap),
+        'previous': previous,
+        'error': None,
+        'source': source,
+        'version': version,
+        'download_dir': download_dir,
+    }
+
+
+def flip_runtime_env(prep: dict) -> bool:
+    if not prep or not prep.get('changed'):
+        return True
+    env_file = (prep.get('previous') or {}).get('env_file')
+    binary = prep.get('desired_binary')
+    return update_env_logstash_binary(env_file, binary)
+
+
+def commit_runtime_upgrade(prep: dict) -> None:
+    if not prep or not prep.get('changed'):
+        return
+    source = prep.get('source') or 'SYSTEM'
+    version = (prep.get('version') or '').strip()
+    binary = prep.get('desired_binary')
+    download_dir = prep.get('download_dir')
+    bin_dir = str(Path(binary).parent) if binary and Path(binary).name in ('logstash', 'logstash.bat') else binary
+    agent_state.update_state('logstash_source', source)
+    agent_state.update_state('logstash_version', version)
+    if download_dir:
+        agent_state.update_state('logstash_download_dir', download_dir)
+    if bin_dir:
+        agent_state.update_state('binary_path', bin_dir)
+    if binary:
+        agent_state.update_state('logstash_binary', binary)
+    if source == 'VERSION' and version:
+        agent_state.update_state('logstash_version_resolved', version)
+    elif source == 'SYSTEM':
+        agent_state.update_state('logstash_version_resolved', '')
+    state = agent_state.get_state() or {}
+    try:
+        from logstashagent import install_registry as _reg
+
+        role = _canonical_run_mode(state.get('mode'))
+        iid = state.get('instance_id')
+        if role in ('managed', 'simulate') and iid is not None:
+            key = _reg.instance_key(role, int(iid))
+            reg = _reg.load_registry()
+            inst = (reg.get('instances') or {}).get(key)
+            if inst:
+                inst['logstash_source'] = source
+                inst['logstash_version'] = version
+                inst['logstash_binary'] = binary
+                reg['instances'][key] = inst
+                _reg.save_registry(reg)
+    except Exception as e:
+        logger.debug('Could not stamp instance VERSION pin: %s', e)
+    snap = prep.get('snapshot_dir')
+    if snap:
+        shutil.rmtree(snap, ignore_errors=True)
+    logger.info('Runtime upgrade committed: binary=%s version=%s', binary, version or '(none)')
+
+
+def rollback_runtime_upgrade(prep: dict, *, restart: bool = True) -> bool:
+    if not prep or not prep.get('changed'):
+        return True
+    restored = _restore_runtime_snapshot(prep)
+    if not restored:
+        logger.error('Runtime upgrade rollback failed to restore snapshot at %s', prep.get('snapshot_dir'))
+        return False
+    if restart:
+        if not restart_logstash():
+            logger.error('Runtime upgrade rollback restored files but restart failed')
+            return False
+    snap = prep.get('snapshot_dir')
+    if snap:
+        shutil.rmtree(snap, ignore_errors=True)
+    logger.warning('Runtime upgrade rolled back to binary=%s', (prep.get('previous') or {}).get('binary'))
+    return True
+
+
+def recover_incomplete_runtime_upgrade() -> bool:
+    state = agent_state.get_state() or {}
+    if _canonical_run_mode(state.get('mode')) not in ('managed', 'simulate'):
+        return False
+    root = _runtime_path_root(state)
+    if root is None:
+        return False
+    snap = root / RUNTIME_SNAPSHOT_NAME
+    if not snap.is_dir():
+        return False
+    try:
+        meta = json.loads((snap / 'meta.json').read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError) as e:
+        logger.error('Cannot recover runtime snapshot: %s — discarding unreadable snapshot at %s', e, snap)
+        shutil.rmtree(snap, ignore_errors=True)
+        return False
+    desired = meta.get('desired') or {}
+    cur_source = (state.get('logstash_source') or 'SYSTEM').upper()
+    cur_version = (state.get('logstash_version') or '').strip()
+    cur_binary = str(state.get('logstash_binary') or '')
+    desired_source = (desired.get('source') or 'SYSTEM').upper()
+    desired_version = (desired.get('version') or '').strip()
+    desired_binary = str(desired.get('binary') or '')
+    if cur_source == desired_source and cur_version == desired_version and cur_binary == desired_binary:
+        logger.info('Leftover runtime snapshot matches committed pin; discarding %s', snap)
+        shutil.rmtree(snap, ignore_errors=True)
+        return True
+    logger.warning('Incomplete runtime upgrade snapshot found at %s — rolling back', snap)
+    prep = {
+        'ok': True,
+        'changed': True,
+        'snapshot_dir': str(snap),
+        'previous': meta.get('previous') or {},
+        'desired_binary': desired.get('binary'),
+        'source': desired.get('source'),
+        'version': desired.get('version'),
+        'download_dir': desired.get('download_dir'),
+        'error': None,
+    }
+    return rollback_runtime_upgrade(prep, restart=True)
+
+
+def wait_for_logstash_api(api_port: int, timeout: float | None = None) -> bool:
+    """Poll node info until accessible or timeout (seconds)."""
+    limit = RUNTIME_UPGRADE_HEALTH_TIMEOUT if timeout is None else timeout
+    deadline = time.monotonic() + max(0.0, float(limit))
+    while True:
+        status = get_logstash_api_status(api_port)
+        if status.get('accessible'):
+            return True
+        if time.monotonic() >= deadline:
+            logger.error('Logstash API at port %s did not answer within %ss', api_port, limit)
+            return False
+        time.sleep(RUNTIME_UPGRADE_HEALTH_POLL)
+
+
+def finalize_runtime_upgrade(prep: dict, restart_ok: bool) -> bool:
+    """Commit if the new process answers; otherwise rollback. True = keep new pin."""
+    if not prep or not prep.get('changed'):
+        return True
+    if restart_ok:
+        api_port = resolve_logstash_api_port()
+        if wait_for_logstash_api(api_port):
+            commit_runtime_upgrade(prep)
+            return True
+    rollback_runtime_upgrade(prep, restart=True)
+    return False
 
 
 def apply_logstash_runtime(runtime: dict) -> dict:
@@ -715,10 +1416,18 @@ def update_jvm_options(settings_path, content):
     try:
         jvm_options_path = settings_path + 'jvm.options'
         logger.info(f"Updating jvm.options at {jvm_options_path}")
-        
+
         with open(jvm_options_path, 'w', encoding='utf-8') as f:
-            f.write(content)
-        
+            f.write(content if content.endswith('\n') else content + '\n')
+
+        # World-readable on purpose: logstash.lib.sh only honours the file when
+        # `[ -r "$dir/jvm.options" ]` passes for the logstash user, and a
+        # restrictive umask would otherwise revert Logstash to stock JVM settings.
+        try:
+            os.chmod(jvm_options_path, 0o644)
+        except OSError as exc:
+            logger.warning("Could not set mode 0644 on %s: %s", jvm_options_path, exc)
+
         logger.info("Successfully updated jvm.options")
         return True
     except Exception as e:
@@ -1278,7 +1987,14 @@ def _logstash_unit_name() -> str:
     unit = state.get('logstash_unit')
     if unit:
         return unit
+    # Keep in sync with agent_state._MODE_ALIASES (do not import main).
+    _mode_aliases = {
+        'default': 'packaged',
+        'agent': 'packaged',
+        'host': 'managed',
+    }
     mode = (state.get('mode') or 'default').lower()
+    mode = _mode_aliases.get(mode, mode)
     instance_id = state.get('instance_id')
     if mode == 'managed' and instance_id is not None:
         return f'logstash-managed@{instance_id}'
@@ -1407,68 +2123,93 @@ def _apply_merged_plan(settings_path, plan, policy_res, snmp_res):
 
     ks_ok = True
     pl_ok = True
+    aborted = bool((policy_res or {}).get('aborted'))
 
-    # Keystore first — pipelines may reference these keys. Single batched
-    # keystore write covers both policy and SNMP keys (pure-Python by default).
-    if ks_has:
-        logger.info(f"Merged keystore apply: {len(ks['set'])} set, {len(ks['delete'])} delete")
-        ks_ok = update_keystore(settings_path, ks)
-        if not ks_ok:
-            logger.error("Merged keystore apply failed")
+    # Do not apply keystore/pipelines after an aborted config rollout.
+    # Restore the runtime snapshot first (existing rollback branch below).
+    if not aborted:
+        # Keystore first — pipelines may reference these keys. Single batched
+        # keystore write covers both policy and SNMP keys (pure-Python by default).
+        if ks_has:
+            logger.info(f"Merged keystore apply: {len(ks['set'])} set, {len(ks['delete'])} delete")
+            ks_ok = update_keystore(settings_path, ks)
+            if not ks_ok:
+                logger.error("Merged keystore apply failed")
 
-    # Pipelines — single pipelines.yml rewrite covering policy + SNMP.
-    if pl_has:
-        logger.info(f"Merged pipeline apply: {len(pl['set'])} set, {len(pl['delete'])} delete")
-        pl_ok = update_pipelines(settings_path, pl)
-        if not pl_ok:
-            logger.error("Merged pipeline apply failed")
+        # Pipelines — single pipelines.yml rewrite covering policy + SNMP.
+        if pl_has:
+            logger.info(f"Merged pipeline apply: {len(pl['set'])} set, {len(pl['delete'])} delete")
+            pl_ok = update_pipelines(settings_path, pl)
+            if not pl_ok:
+                logger.error("Merged pipeline apply failed")
 
     # Restart is required for config-file / keystore-password changes (policy
     # channel) or whenever keystore VALUES were added/updated. Pipeline changes
     # and pure keystore deletes reload dynamically — no restart.
+    runtime_prep = (policy_res or {}).get('runtime_prep') or _empty_runtime_prep()
     requires_restart = bool(ks['set'])
     if policy_res:
         requires_restart = requires_restart or policy_res.get('requires_restart', False)
+    if runtime_prep.get('changed'):
+        requires_restart = True
 
     keystore_apply_ok = (not ks_has) or ks_ok
     restart_failed = False
-    if requires_restart and keystore_apply_ok:
-        logger.info("Applying merged changes — restarting Logstash once...")
-        if restart_logstash():
-            logger.info("Logstash restart completed successfully")
+    upgrade_rolled_back = False
+
+    writes_ok = keystore_apply_ok and ((not pl_has) or pl_ok)
+    if runtime_prep.get('changed') and (not writes_ok or aborted):
+        rollback_runtime_upgrade(runtime_prep, restart=False)
+        upgrade_rolled_back = True
+    elif requires_restart and writes_ok and not aborted:
+        if runtime_prep.get('changed') and not flip_runtime_env(runtime_prep):
+            logger.error('Failed to flip LOGSTASH_BINARY — restoring snapshot')
+            rollback_runtime_upgrade(runtime_prep, restart=False)
+            upgrade_rolled_back = True
         else:
-            logger.error("Logstash restart failed - manual intervention may be required")
-            restart_failed = True
-    elif pl_has and pl_ok and not ks['set']:
+            logger.info("Applying merged changes — restarting Logstash once...")
+            if restart_logstash():
+                logger.info("Logstash restart completed successfully")
+                if runtime_prep.get('changed'):
+                    if not finalize_runtime_upgrade(runtime_prep, restart_ok=True):
+                        upgrade_rolled_back = True
+            else:
+                logger.error("Logstash restart failed - manual intervention may be required")
+                restart_failed = True
+                if runtime_prep.get('changed'):
+                    finalize_runtime_upgrade(runtime_prep, restart_ok=False)
+                    upgrade_rolled_back = True
+    elif pl_has and pl_ok and not ks['set'] and not runtime_prep.get('changed') and not aborted:
         logger.info("Pipeline-only changes applied - Logstash restart not required")
 
     # --- Update SNMP hash namespaces (only for parts that applied cleanly) ---
     if snmp_res and snmp_res.get('ran'):
-        if (snmp_res.get('pipeline_set') or snmp_res.get('pipeline_delete_names')) and pl_ok:
-            snmp_pl_state = agent_state.get_state().get('snmp_pipelines', {})
-            for name in snmp_res.get('pipeline_delete_names', []):
-                snmp_pl_state.pop(name, None)
-            for name, phash in (snmp_res.get('pipeline_set') or {}).items():
-                snmp_pl_state[name] = phash
-            agent_state.update_state('snmp_pipelines', snmp_pl_state)
-            logger.info(
-                f"Applied SNMP pipeline changes: {len(snmp_res.get('pipeline_set') or {})} set, "
-                f"{len(snmp_res.get('pipeline_delete_names') or [])} delete"
-            )
-        if (snmp_res.get('keystore_set_names') or snmp_res.get('keystore_delete_names')) \
-                and ks_ok and not snmp_res.get('keystore_skipped'):
-            regular_ks = agent_state.get_state().get('keystore', {})
-            snmp_ks_state = agent_state.get_state().get('snmp_keystore', {})
-            for name in snmp_res.get('keystore_delete_names', []):
-                snmp_ks_state.pop(name, None)
-            for name in snmp_res.get('keystore_set_names', []):
-                if name in regular_ks:
-                    snmp_ks_state[name] = regular_ks[name]
-            agent_state.update_state('snmp_keystore', snmp_ks_state)
-            logger.info(
-                f"Applied SNMP keystore changes: {len(snmp_res.get('keystore_set_names') or [])} set, "
-                f"{len(snmp_res.get('keystore_delete_names') or [])} delete"
-            )
+        if not upgrade_rolled_back and not aborted:
+            if (snmp_res.get('pipeline_set') or snmp_res.get('pipeline_delete_names')) and pl_ok:
+                snmp_pl_state = agent_state.get_state().get('snmp_pipelines', {})
+                for name in snmp_res.get('pipeline_delete_names', []):
+                    snmp_pl_state.pop(name, None)
+                for name, phash in (snmp_res.get('pipeline_set') or {}).items():
+                    snmp_pl_state[name] = phash
+                agent_state.update_state('snmp_pipelines', snmp_pl_state)
+                logger.info(
+                    f"Applied SNMP pipeline changes: {len(snmp_res.get('pipeline_set') or {})} set, "
+                    f"{len(snmp_res.get('pipeline_delete_names') or [])} delete"
+                )
+            if (snmp_res.get('keystore_set_names') or snmp_res.get('keystore_delete_names')) \
+                    and ks_ok and not snmp_res.get('keystore_skipped'):
+                regular_ks = agent_state.get_state().get('keystore', {})
+                snmp_ks_state = agent_state.get_state().get('snmp_keystore', {})
+                for name in snmp_res.get('keystore_delete_names', []):
+                    snmp_ks_state.pop(name, None)
+                for name in snmp_res.get('keystore_set_names', []):
+                    if name in regular_ks:
+                        snmp_ks_state[name] = regular_ks[name]
+                agent_state.update_state('snmp_keystore', snmp_ks_state)
+                logger.info(
+                    f"Applied SNMP keystore changes: {len(snmp_res.get('keystore_set_names') or [])} set, "
+                    f"{len(snmp_res.get('keystore_delete_names') or [])} delete"
+                )
 
         # Record this source's independent apply status (Phase 2). Note:
         # `keystore_skipped` is checked directly because in that case
@@ -1497,8 +2238,9 @@ def _apply_merged_plan(settings_path, plan, policy_res, snmp_res):
             policy_failed.append('pipelines update failed')
         if restart_failed:
             policy_failed.append('logstash restart failed')
+        if upgrade_rolled_back:
+            policy_failed.append('logstash runtime upgrade rolled back')
 
-        aborted = policy_res.get('aborted', False)
         policy_files_updated = policy_res.get('files_updated', False)
 
         # Bump revision unless the rollout aborted or a policy change failed to
@@ -1644,6 +2386,14 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
             'logstash_source': state.get('logstash_source') or 'SYSTEM',
             'logstash_version': state.get('logstash_version') or '',
             'logstash_download_dir': state.get('logstash_download_dir') or '',
+            # Participates in the server's runtime_changed comparison. Without
+            # it the server assumes False, so ticking the proxy checkbox on an
+            # otherwise unchanged policy would yield no delta and no error — the
+            # agent would keep pulling from Elastic forever. Deliberately the
+            # persisted state value, not logstash_via_ui_enabled(): reporting the
+            # env override would disagree with policy permanently and re-trigger
+            # a runtime delta on every check-in.
+            'logstash_via_ui': bool(state.get('logstash_via_ui')),
             'keystore': keystore_state,
             'keystore_password_hash': state.get('keystore_password_hash', ''),
             'pipelines': pipelines_state,
@@ -1670,7 +2420,7 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
             json=request_data,
             headers=headers,
             timeout=30,
-            verify=ssl_verify_argument(),
+            verify=ssl_verify_argument(logstash_ui_url),
         )
         
         if response.status_code >= 400:
@@ -1705,17 +2455,44 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
             failed_operations = []
             rollout_aborted = False
 
-            # Update logstash.yml if changed
-            logstash_yml_content = changes.get('logstash_yml')
-            if logstash_yml_content and logstash_yml_content != False:
-                logger.info("Configuration change found for logstash.yml")
-                if update_logstash_yml(settings_path, logstash_yml_content):
+            runtime_prep = _empty_runtime_prep()
+            runtime = changes.get('logstash_runtime')
+            if runtime and runtime != False:
+                logger.info("Logstash runtime change detected (source/version/binary) — prepare first")
+                runtime_prep = prepare_runtime_upgrade(runtime)
+                if not runtime_prep.get('ok'):
+                    logger.error(
+                        "Failed to prepare logstash_runtime: %s — aborting rollout",
+                        runtime_prep.get('error'),
+                    )
+                    failed_operations.append(
+                        f"logstash_runtime apply failed: {runtime_prep.get('error')}"
+                    )
+                    rollout_aborted = True
+                elif runtime_prep.get('held'):
+                    logger.info(
+                        "Holding policy revision until Logstash %s is downloaded",
+                        runtime_prep.get('version') or 'VERSION',
+                    )
+                    rollout_aborted = True
+                elif runtime_prep.get('changed'):
                     files_updated = True
                     requires_restart = True
-                else:
-                    logger.error("Failed to update logstash.yml - aborting rollout")
-                    failed_operations.append('logstash.yml write failed')
-                    rollout_aborted = True
+                    if runtime_prep.get('desired_binary'):
+                        binary_path = str(Path(runtime_prep['desired_binary']).parent)
+
+            # Update logstash.yml if changed
+            if not rollout_aborted:
+                logstash_yml_content = changes.get('logstash_yml')
+                if logstash_yml_content and logstash_yml_content != False:
+                    logger.info("Configuration change found for logstash.yml")
+                    if update_logstash_yml(settings_path, logstash_yml_content):
+                        files_updated = True
+                        requires_restart = True
+                    else:
+                        logger.error("Failed to update logstash.yml - aborting rollout")
+                        failed_operations.append('logstash.yml write failed')
+                        rollout_aborted = True
 
             # Update jvm.options if changed
             if not rollout_aborted:
@@ -1725,6 +2502,9 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
                     if update_jvm_options(settings_path, jvm_options_content):
                         files_updated = True
                         requires_restart = True
+                        # A first-time jvm.options needs LS_JVM_OPTS added to the
+                        # instance env file before the restart below picks it up.
+                        ensure_env_jvm_opts(state.get('keystore_env_file'), settings_path)
                     else:
                         logger.error("Failed to update jvm.options - aborting rollout")
                         failed_operations.append('jvm.options write failed')
@@ -1748,29 +2528,6 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
                 logger.info(f"Configuration change found for settings_path: {changes.get('settings_path')}")
             if changes.get('logs_path') and changes.get('logs_path') != False:
                 logger.info(f"Configuration change found for logs_path: {changes.get('logs_path')}")
-
-            # Apply Logstash binary source (SYSTEM vs VERSION download) before keystore/pipelines
-            if not rollout_aborted:
-                runtime = changes.get('logstash_runtime')
-                if runtime and runtime != False:
-                    logger.info("Logstash runtime change detected (source/version/binary)")
-                    rt_result = apply_logstash_runtime(runtime)
-                    if rt_result.get('success'):
-                        files_updated = True
-                        if rt_result.get('requires_restart'):
-                            requires_restart = True
-                        # Prefer server binary_path state already updated inside apply
-                        if rt_result.get('binary'):
-                            binary_path = str(Path(rt_result['binary']).parent)
-                    else:
-                        logger.error(
-                            "Failed to apply logstash_runtime: %s — aborting rollout",
-                            rt_result.get('error'),
-                        )
-                        failed_operations.append(
-                            f"logstash_runtime apply failed: {rt_result.get('error')}"
-                        )
-                        rollout_aborted = True
 
             # Handle keystore password change/clear (must run BEFORE keystore key changes)
             # Protocol: false=no-op, null=clear to unauth, string=encrypted set/rotate
@@ -1864,26 +2621,43 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
                     'failed_operations': failed_operations,
                     'aborted': rollout_aborted,
                     'snmp_changes': result.get('snmp_changes'),
+                    'runtime_prep': runtime_prep,
                 }
 
+            if rollout_aborted and runtime_prep.get('changed'):
+                logger.error("Config apply failed after runtime prepare — restoring snapshot (no env flip)")
+                rollback_runtime_upgrade(runtime_prep, restart=False)
+
             if rollout_aborted:
-                logger.error(f"Rollout aborted due to failures: {failed_operations}")
+                if runtime_prep.get('held') and not failed_operations:
+                    logger.info(
+                        "Rollout held pending VERSION download (revision not bumped)"
+                    )
+                else:
+                    logger.error(f"Rollout aborted due to failures: {failed_operations}")
             elif files_updated:
-                # All updates succeeded — restart if needed and increment revision
                 if requires_restart:
                     if files_existed:
-                        logger.info("Configuration files updated, restarting Logstash service...")
-                        if restart_logstash():
-                            logger.info("Logstash restart completed successfully")
-                        else:
-                            logger.error("Logstash restart failed - manual intervention may be required")
-                            failed_operations.append('logstash restart failed')
+                        flipped = True
+                        if runtime_prep.get('changed'):
+                            flipped = flip_runtime_env(runtime_prep)
+                            if not flipped:
+                                rollback_runtime_upgrade(runtime_prep, restart=False)
+                                failed_operations.append('logstash runtime upgrade rolled back')
+                        if flipped:
+                            logger.info("Configuration files updated, restarting Logstash service...")
+                            restart_ok = restart_logstash()
+                            if not restart_ok:
+                                logger.error("Logstash restart failed - manual intervention may be required")
+                                failed_operations.append('logstash restart failed')
+                            if runtime_prep.get('changed'):
+                                if not finalize_runtime_upgrade(runtime_prep, restart_ok=restart_ok):
+                                    failed_operations.append('logstash runtime upgrade rolled back')
                     else:
                         logger.info("Configuration files created - Logstash restart skipped (files didn't exist previously)")
                 else:
                     logger.info("Pipeline-only changes applied - Logstash restart not required")
 
-                # Update agent's revision number to match server after successful changes
                 if not failed_operations:
                     server_revision = result.get('current_revision')
                     if server_revision is not None:
@@ -1921,14 +2695,16 @@ def get_config_changes(server_settings_path=None, server_logs_path=None, server_
         return None
 
 
-def get_logstash_api_status(api_port=9600):
+def get_logstash_api_status(api_port=None):
     """
     Query the Logstash node info API at http://localhost:{api_port}/.
 
     Returns:
         dict with keys: accessible, status, version, host, error
     """
-    from .logstash_api import LogstashAPI
+    from .logstash_api import LogstashAPI, resolve_logstash_api_port
+    if api_port is None:
+        api_port = resolve_logstash_api_port()
     base_url = f"http://localhost:{api_port}"
     try:
         api = LogstashAPI(base_url=base_url)
@@ -1951,7 +2727,7 @@ def get_logstash_api_status(api_port=9600):
         }
 
 
-def get_logstash_health_report(api_port=9600):
+def get_logstash_health_report(api_port=None):
     """
     Query the Logstash /_health_report endpoint.
 
@@ -1966,7 +2742,9 @@ def get_logstash_health_report(api_port=9600):
     Returns:
         dict with keys: accessible, status, symptom, indicators, error
     """
-    from .logstash_api import LogstashAPI
+    from .logstash_api import LogstashAPI, resolve_logstash_api_port
+    if api_port is None:
+        api_port = resolve_logstash_api_port()
     base_url = f"http://localhost:{api_port}"
 
     def strip_indicators(indicators_dict):
@@ -2011,7 +2789,7 @@ def get_logstash_health_report(api_port=9600):
         }
 
 
-def get_logstash_node_stats(api_port=9600):
+def get_logstash_node_stats(api_port=None):
     """
     Query the Logstash /_node/stats endpoint and return condensed node-level
     statistics. Pipeline-level detail is intentionally excluded.
@@ -2019,7 +2797,9 @@ def get_logstash_node_stats(api_port=9600):
     Returns:
         dict with keys: accessible, jvm, process, events, pipeline, reloads, error
     """
-    from .logstash_api import LogstashAPI
+    from .logstash_api import LogstashAPI, resolve_logstash_api_port
+    if api_port is None:
+        api_port = resolve_logstash_api_port()
     base_url = f"http://localhost:{api_port}"
     try:
         api = LogstashAPI(base_url=base_url)
@@ -2294,7 +3074,11 @@ def check_in():
         if not all([logstash_ui_url, api_key, connection_id]):
             logger.error("Missing required enrollment data. Please re-enroll the agent.")
             return None
-        
+
+        recover_incomplete_runtime_upgrade()
+        _flush_runtime_downloads_for_checkin()
+        state = agent_state.get_state() or state
+
         # Get paths from state
         settings_path = state.get('settings_path', '')
         logs_path = state.get('logs_path', '')
@@ -2442,9 +3226,10 @@ def check_in():
             'logstash_binary': state.get('logstash_binary') or '',
             'logstash_download_dir': state.get('logstash_download_dir') or '',
             'last_runtime_apply': state.get('last_runtime_apply'),
+            'runtime_download': state.get('runtime_download'),
         }
 
-        api_port = state.get('api_port', 9600)
+        api_port = persist_resolved_logstash_api_port()
         status_blob['logstash_api'] = get_logstash_api_status(api_port)
         status_blob['health_report'] = get_logstash_health_report(api_port)
         status_blob['node_stats'] = get_logstash_node_stats(api_port)
@@ -2526,7 +3311,7 @@ def check_in():
             json=check_in_data,
             headers=headers,
             timeout=30,
-            verify=ssl_verify_argument(),
+            verify=ssl_verify_argument(logstash_ui_url),
         )
         
         # Check for error status codes
@@ -2547,6 +3332,13 @@ def check_in():
         
         if result.get('success'):
             logger.info("Check-in successful")
+            # Snapshot before persisting: the via-UI drift check below compares
+            # what we had against what the server just sent.
+            agent_via_ui = bool(state.get('logstash_via_ui'))
+            server_via_ui = bool(
+                result.get('logstash_via_ui', result.get('via_ui', agent_via_ui))
+            )
+            _maybe_persist_via_ui(result)
 
             try:
                 from logstashagent import tls_server
@@ -2581,12 +3373,16 @@ def check_in():
                     and server_download_dir
                     and server_download_dir != agent_download_dir
                 )
+                # A proxy-checkbox flip on an otherwise unchanged policy does not
+                # move the revision number, so without this the fetch below never
+                # happens and the agent keeps using its old source forever.
+                or (server_source == 'VERSION' and server_via_ui != agent_via_ui)
             )
             if runtime_dirty:
                 logger.info(
-                    "Logstash runtime drift detected (agent %s/%s vs server %s/%s)",
-                    agent_source, agent_version or '-',
-                    server_source, server_version or '-',
+                    "Logstash runtime drift detected (agent %s/%s via_ui=%s vs server %s/%s via_ui=%s)",
+                    agent_source, agent_version or '-', agent_via_ui,
+                    server_source, server_version or '-', server_via_ui,
                 )
 
             # Build ONE merged apply plan so the policy channel and the SNMP
@@ -2713,18 +3509,23 @@ def run_controller():
         )
         _time.sleep(poll_sec)
 
-    # Confirm role for upgraded installs (no re-enroll required for default agents)
-    raw_mode = (state.get('mode') or 'default')
+    # Confirm role for upgraded installs (no re-enroll required for packaged agents)
+    raw_mode = (state.get('mode') or 'packaged')
     mode = str(raw_mode).lower()
-    if mode in ('agent', 'host'):
-        logger.info(f"mode=default (legacy '{mode}' mapped) [state]")
-        mode = 'default'
+    if mode in ('default', 'agent'):
+        logger.info(f"mode=packaged (legacy '{mode}' mapped) [state]")
+        mode = 'packaged'
         try:
-            agent_state.update_state('mode', 'default')
+            agent_state.update_state('mode', 'packaged')
         except Exception:
             pass
-    elif mode in ('default', 'simulate', 'embedded'):
-        logger.info(f"mode={mode} [state]")
+    elif mode == 'host':
+        logger.info("mode=managed (legacy 'host' mapped) [state]")
+        mode = 'managed'
+        try:
+            agent_state.update_state('mode', 'managed')
+        except Exception:
+            pass
     else:
         logger.info(f"mode={mode} [state]")
     
@@ -2737,6 +3538,11 @@ def run_controller():
     if state.get('logstash_unit'):
         logger.info(f"Logstash unit: {state.get('logstash_unit')}")
     logger.info("=" * 60)
+    recover_incomplete_runtime_upgrade()
+    try:
+        heal_stale_logstash_launch(state)
+    except Exception as exc:
+        logger.warning("jvm.options launch self-heal failed: %s", exc)
     logger.info("Starting check-in loop (every 60 seconds)")
     logger.info("Press Ctrl+C to stop")
     logger.info("=" * 60)

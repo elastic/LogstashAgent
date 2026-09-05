@@ -223,6 +223,12 @@ __marimo__/
 /data/
 
 # Local analysis / packaging artifacts (do not ship)
+docs/archive/
+docs/superpowers/
+.superpowers/
+graphify-out/
+scratch/
+IDEA.md
 CODEBASE_ANALYSIS.md
 *.tar.gz
 LogstashAgent.tar.gz

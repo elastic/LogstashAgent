@@ -110,6 +110,110 @@ def test_bootstrap_tofu_without_fingerprint(tmp_path, monkeypatch):
     assert tls_trust.load_persisted_fingerprint() == fp
 
 
+def test_ui_url_is_tls_https_and_http():
+    assert tls_trust.ui_url_is_tls("https://ui.example.com") is True
+    assert tls_trust.ui_url_is_tls("HTTPS://ui.example.com/path") is True
+    assert tls_trust.ui_url_is_tls("http://ui.example.com") is False
+    assert tls_trust.ui_url_is_tls("  https://ui.example.com  ") is True
+
+
+def test_ui_url_is_tls_missing_or_unknown_scheme(monkeypatch):
+    monkeypatch.delenv("LOGSTASH_UI_URL", raising=False)
+    monkeypatch.delenv("LOGSTASHUI_URL", raising=False)
+    assert tls_trust.ui_url_is_tls("") is False
+    assert tls_trust.ui_url_is_tls(None) is False
+    assert tls_trust.ui_url_is_tls("ui.example.com:8443") is False
+    assert tls_trust.ui_url_is_tls("ftp://ui.example.com") is False
+
+
+def test_agent_tls_enabled_defaults_true(monkeypatch):
+    monkeypatch.delenv("LOGSTASH_AGENT_TLS", raising=False)
+    assert tls_trust.agent_tls_enabled() is True
+    monkeypatch.setenv("LOGSTASH_AGENT_TLS", "true")
+    assert tls_trust.agent_tls_enabled() is True
+    monkeypatch.setenv("LOGSTASH_AGENT_TLS", "garbage")
+    assert tls_trust.agent_tls_enabled() is True
+    monkeypatch.setenv("LOGSTASH_AGENT_TLS", "false")
+    assert tls_trust.agent_tls_enabled() is False
+    monkeypatch.setenv("LOGSTASH_AGENT_TLS", "0")
+    assert tls_trust.agent_tls_enabled() is False
+    monkeypatch.setenv("LOGSTASH_AGENT_TLS", "OFF")
+    assert tls_trust.agent_tls_enabled() is False
+
+
+def test_ui_tls_insecure_defaults_false(monkeypatch):
+    monkeypatch.delenv("LOGSTASH_UI_TLS_INSECURE", raising=False)
+    assert tls_trust.ui_tls_insecure() is False
+    monkeypatch.setenv("LOGSTASH_UI_TLS_INSECURE", "true")
+    assert tls_trust.ui_tls_insecure() is True
+    monkeypatch.setenv("LOGSTASH_UI_TLS_INSECURE", "1")
+    assert tls_trust.ui_tls_insecure() is True
+    monkeypatch.setenv("LOGSTASH_UI_TLS_INSECURE", "nope")
+    assert tls_trust.ui_tls_insecure() is False
+
+
+def test_ssl_verify_argument_http_is_false(monkeypatch):
+    monkeypatch.delenv("LOGSTASH_UI_TLS_INSECURE", raising=False)
+    assert tls_trust.ssl_verify_argument("http://ui.example.com") is False
+
+
+def test_ssl_verify_argument_https_insecure_is_false(monkeypatch):
+    monkeypatch.setenv("LOGSTASH_UI_TLS_INSECURE", "true")
+    assert tls_trust.ssl_verify_argument("https://ui.example.com") is False
+
+
+def test_ssl_verify_argument_https_secure_true_without_pin(monkeypatch, tmp_path):
+    monkeypatch.delenv("LOGSTASH_UI_TLS_INSECURE", raising=False)
+    monkeypatch.setattr(tls_trust, "tls_dir", lambda: tmp_path)
+    assert tls_trust.ssl_verify_argument("https://ui.example.com") is True
+
+
+def test_ensure_trust_skips_non_https(monkeypatch):
+    monkeypatch.delenv("LOGSTASH_UI_TLS_INSECURE", raising=False)
+    assert (
+        tls_trust.ensure_trust_from_token_payload(
+            "http://ui.example.com",
+            {"fingerprint": "a" * 64},
+        )
+        is None
+    )
+
+
+def test_ensure_trust_insecure_https_does_not_raise(monkeypatch, tmp_path):
+    monkeypatch.setenv("LOGSTASH_UI_TLS_INSECURE", "true")
+    monkeypatch.setattr(tls_trust, "tls_dir", lambda: tmp_path)
+    with patch.object(
+        tls_trust.requests,
+        "get",
+        side_effect=requests.exceptions.ConnectionError("down"),
+    ):
+        assert (
+            tls_trust.ensure_trust_from_token_payload(
+                "https://ui.example.com",
+                {"fingerprint": "a" * 64},
+            )
+            is None
+        )
+
+
+def test_start_bootstrap_skips_http(monkeypatch):
+    monkeypatch.delenv("LOGSTASH_UI_TLS_INSECURE", raising=False)
+    assert tls_trust.start_ui_ca_bootstrap_loop(ui_url="http://ui.example.com") is False
+
+
+def test_inbound_tls_ok_requires_all_three(monkeypatch, tmp_path):
+    monkeypatch.setenv("LOGSTASH_AGENT_TLS", "true")
+    monkeypatch.setattr(tls_trust, "tls_dir", lambda: tmp_path)
+    assert tls_trust.inbound_tls_ok("https://ui.example.com") is False  # no CA
+    monkeypatch.setenv("LOGSTASH_AGENT_TLS", "false")
+    (tmp_path / tls_trust.CA_FILENAME).write_text("x", encoding="utf-8")
+    (tmp_path / tls_trust.FINGERPRINT_FILENAME).write_text("f" * 64, encoding="utf-8")
+    assert tls_trust.inbound_tls_ok("https://ui.example.com") is False
+    monkeypatch.setenv("LOGSTASH_AGENT_TLS", "true")
+    assert tls_trust.inbound_tls_ok("http://ui.example.com") is False
+    assert tls_trust.inbound_tls_ok("https://ui.example.com") is True
+
+
 def test_bootstrap_loop_retries_then_ok(tmp_path, monkeypatch):
     pem, fp = _make_ca()
     monkeypatch.setattr(tls_trust, "tls_dir", lambda: tmp_path)

@@ -13,17 +13,23 @@ EnvironmentFile=-/opt/logstash-agent/simulate-%i/env
 #   LOGSTASH_PATH_LOGS=/opt/logstash-agent/simulate-%i/logs
 #   LOGSTASH_PATH_DATA=/opt/logstash-agent/simulate-%i/data
 #   LOGSTASH_KEYSTORE_PASS=...
+#   LS_JVM_OPTS=/opt/logstash-agent/simulate-%i/settings/jvm.options
 # Pipeline conf paths are only in settings/pipelines.yml (no --path.config).
+# --path.settings MUST stay two arguments, not --path.settings=<dir>: logstash.lib.sh
+# discovers jvm.options by scanning "$@" for an argv entry equal to "--path.settings"
+# and reading the NEXT one. The equals form never matches, so LS_JVM_OPTS is not
+# exported and Logstash silently uses the stock jvm.options from LOGSTASH_HOME.
 ExecStart=/bin/bash -c 'exec "${LOGSTASH_BINARY}" \
-  --path.settings="${LOGSTASH_PATH_SETTINGS}" \
-  --path.logs="${LOGSTASH_PATH_LOGS}" \
-  --path.data="${LOGSTASH_PATH_DATA}"'
+  --path.settings "${LOGSTASH_PATH_SETTINGS}" \
+  --path.logs "${LOGSTASH_PATH_LOGS}" \
+  --path.data "${LOGSTASH_PATH_DATA}"'
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
-# User=logstash
-# Group=logstash
+# Logstash must not run as root; the installer guarantees this account exists
+User=logstash
+Group=logstash
 
 [Install]
 WantedBy=multi-user.target
