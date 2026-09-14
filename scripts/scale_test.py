@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import base64
 import hashlib
+import html
 import ipaddress
 import json
 import math
@@ -20,8 +21,10 @@ import re
 import ssl
 import sys
 import time
+import traceback
 import uuid
 from collections import Counter, defaultdict
+import itertools
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,8 +46,8 @@ SCALE_PREFIX = "scale-test-"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 ENROLLMENT_CONCURRENCY = 100
 PROGRESS_EVERY = 100
-CHECKIN_INTERVAL_SECONDS = 5.0
-CHECKIN_JITTER_SECONDS = 1.0
+DEFAULT_CHECKIN_INTERVAL_SECONDS = 60.0
+DEFAULT_CHECKIN_JITTER_SECONDS = 5.0
 
 
 def utc_now() -> datetime:
@@ -69,6 +72,49 @@ def format_latency(value: float | None) -> str:
     if value < 1:
         return f"{value * 1000:.0f}ms"
     return f"{value:.2f}s"
+
+
+ERROR_SAMPLE_CHARS = 2000
+_HTML_TITLE = re.compile(r"<title>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+_DJANGO_EXC_VALUE = re.compile(
+    r"Exception Value:\s*</th>\s*<td[^>]*>\s*<pre[^>]*>(.*?)</pre>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _collapse_text(text: str) -> str:
+    return " ".join(html.unescape(text).split())
+
+
+def error_sample(text: str) -> str:
+    """Keep a Counter-friendly snippet; prefer the tail so tracebacks keep the exception."""
+    text = (text or "unknown").strip() or "unknown"
+    if len(text) <= ERROR_SAMPLE_CHARS:
+        return text
+    return "…" + text[-ERROR_SAMPLE_CHARS:]
+
+
+def http_error_text(response: httpx.Response, data: Any | None = None) -> str:
+    """Best-effort server error string that still aggregates across agents."""
+    if isinstance(data, dict):
+        for key in ("error", "message", "detail"):
+            value = data.get(key)
+            if value:
+                return str(value)
+    raw = response.text or ""
+    title = _HTML_TITLE.search(raw)
+    exc_value = _DJANGO_EXC_VALUE.search(raw)
+    parts: list[str] = []
+    if title:
+        parts.append(_collapse_text(title.group(1)))
+    if exc_value:
+        parts.append(_collapse_text(exc_value.group(1)))
+    if parts:
+        return ": ".join(parts)
+    snippet = _collapse_text(raw)
+    if snippet:
+        return snippet[:500]
+    return response.reason_phrase or f"HTTP {response.status_code}"
 
 
 def classify_error(text: str, status_code: int | None = None) -> str:
@@ -129,7 +175,7 @@ class MetricBucket:
             if not result.ok
         )
         error_messages = Counter(
-            (result.error or "unknown")[:300]
+            error_sample(result.error or "unknown")
             for result in self.results
             if not result.ok
         )
@@ -264,7 +310,7 @@ class VirtualAgent:
         uptime_seconds = (
             86_400
             + self.identity.index * 3
-            + int(self.checkin_count * CHECKIN_INTERVAL_SECONDS)
+            + int(self.checkin_count * DEFAULT_CHECKIN_INTERVAL_SECONDS)
         )
         binary_path = self.policy.get("binary_path") or ""
         return {
@@ -461,6 +507,9 @@ class ScaleState:
     checkins_done: asyncio.Event = field(default_factory=asyncio.Event)
     started_at_utc: datetime = field(default_factory=utc_now)
     interrupted: bool = False
+    checkin_semaphore: asyncio.Semaphore = field(
+        default_factory=lambda: asyncio.Semaphore(value=0)  # replaced in run_scale
+    )
 
 
 def decode_enrollment_token(encoded_token: str) -> dict[str, Any]:
@@ -559,15 +608,13 @@ async def post_json(
         try:
             data = response.json()
         except (json.JSONDecodeError, ValueError):
-            error = f"non_json_response: {response.text[:300]}"
+            error = f"non_json_response: {http_error_text(response)}"
         if error is None and not response.is_success:
-            error = str((data or {}).get("error") or response.text[:300] or response.reason_phrase)
+            error = http_error_text(response, data)
         if error is None and isinstance(data, dict) and data.get("success") is False:
             error = str(data.get("error") or data.get("message") or "success=false")
-    except httpx.TimeoutException as exc:
-        error = f"timeout: {exc}"
-    except httpx.HTTPError as exc:
-        error = f"{type(exc).__name__}: {exc}"
+    except (httpx.TimeoutException, httpx.HTTPError):
+        error = traceback.format_exc()
     latency = time.monotonic() - started
     return (
         RequestResult(
@@ -659,13 +706,17 @@ async def check_in(state: ScaleState, agent: VirtualAgent, *, initial: bool) -> 
 
 
 async def agent_loop(state: ScaleState, agent: VirtualAgent) -> None:
-    await check_in(state, agent, initial=True)
+    spread = getattr(state.args, "startup_spread_seconds", 0.0) or 0.0
+    if spread > 0:
+        await asyncio.sleep(agent.rng.uniform(0, spread))
+    async with state.checkin_semaphore:
+        await check_in(state, agent, initial=True)
     for _ in range(1, state.args.num_check_ins):
-        await asyncio.sleep(
-            CHECKIN_INTERVAL_SECONDS
-            + agent.rng.uniform(-CHECKIN_JITTER_SECONDS, CHECKIN_JITTER_SECONDS)
-        )
-        await check_in(state, agent, initial=False)
+        interval = getattr(state.args, "checkin_interval_seconds", DEFAULT_CHECKIN_INTERVAL_SECONDS)
+        jitter = getattr(state.args, "checkin_jitter_seconds", DEFAULT_CHECKIN_JITTER_SECONDS)
+        await asyncio.sleep(interval + agent.rng.uniform(-jitter, jitter))
+        async with state.checkin_semaphore:
+            await check_in(state, agent, initial=False)
 
 
 def duplicate_allocations(agents: list[VirtualAgent]) -> dict[str, dict[str, list[int]]]:
@@ -823,11 +874,9 @@ async def cleanup_scale_connections(
                 elif response.is_success:
                     deleted += 1
                 else:
-                    error = response.text[:300] or response.reason_phrase
-            except httpx.TimeoutException as exc:
-                error = f"timeout: {exc}"
-            except httpx.HTTPError as exc:
-                error = f"{type(exc).__name__}: {exc}"
+                    error = http_error_text(response)
+            except (httpx.TimeoutException, httpx.HTTPError):
+                error = traceback.format_exc()
             bucket.record(
                 RequestResult(
                     ok=error is None,
@@ -867,9 +916,16 @@ def build_report(state: ScaleState) -> dict[str, Any]:
             "logstash_ui_url": state.args.logstash_ui_url,
             "requested_agents": state.args.num_of_agents,
             "num_check_ins_per_agent": state.args.num_check_ins,
-            "enrollment_concurrency": ENROLLMENT_CONCURRENCY,
-            "checkin_interval_seconds": CHECKIN_INTERVAL_SECONDS,
-            "checkin_jitter_seconds": CHECKIN_JITTER_SECONDS,
+            "enrollment_concurrency": state.args.concurrent_enrollment,
+            "checkin_interval_seconds": getattr(state.args, "checkin_interval_seconds", DEFAULT_CHECKIN_INTERVAL_SECONDS),
+            "checkin_jitter_seconds": getattr(state.args, "checkin_jitter_seconds", DEFAULT_CHECKIN_JITTER_SECONDS),
+            "startup_spread_seconds": getattr(state.args, "startup_spread_seconds", 0.0) or 0.0,
+            "checkin_concurrency": getattr(state.args, "checkin_concurrency", 0) or 0,
+            "steady_state_rps": round(
+                state.args.num_of_agents
+                / getattr(state.args, "checkin_interval_seconds", DEFAULT_CHECKIN_INTERVAL_SECONDS),
+                2,
+            ),
             "seed": state.args.seed,
             "connection_reuse": False,
             "agent_name_prefix": SCALE_PREFIX,
@@ -887,6 +943,17 @@ def build_report(state: ScaleState) -> dict[str, Any]:
     }
 
 
+def print_aggregated_errors(messages: dict[str, int]) -> None:
+    if not messages:
+        return
+    print("  aggregated errors:")
+    for message, count in messages.items():
+        lines = message.splitlines() or [message]
+        print(f"    [{count:,}x] {lines[0]}")
+        for line in lines[1:]:
+            print(f"           {line}")
+
+
 def print_final_report(report: dict[str, Any], report_path: Path) -> None:
     metrics = report["metrics"]
     duplicates = report["managed_allocation_duplicates"]
@@ -897,6 +964,11 @@ def print_final_report(report: dict[str, Any], report_path: Path) -> None:
     print(f"Requested agents:    {report['configuration']['requested_agents']:,}")
     print(f"Enrolled agents:     {report['enrolled_agents']:,}")
     print(f"Check-ins per agent: {report['configuration']['num_check_ins_per_agent']:,}")
+    cfg = report['configuration']
+    print(f"Checkin interval:    {cfg['checkin_interval_seconds']:g}s ± {cfg['checkin_jitter_seconds']:g}s")
+    spread = cfg['startup_spread_seconds']
+    print(f"Startup spread:      {f'0–{spread:g}s' if spread else 'none (burst)'}")
+    print(f"Steady-state target: ~{cfg['steady_state_rps']} req/s")
     print(f"Total elapsed:       {report['elapsed_seconds']:.1f}s")
     print(f"Interrupted:         {'yes' if report['interrupted'] else 'no'}")
     for key in (
@@ -920,7 +992,8 @@ def print_final_report(report: dict[str, Any], report_path: Path) -> None:
             f"p99={format_latency(latency['p99'])}"
         )
         if item["errors"]:
-            print(f"  errors: {item['errors']}")
+            print(f"  error classes: {item['errors']}")
+        print_aggregated_errors(item.get("error_messages") or {})
     for field_name, values in duplicates.items():
         duplicate_connections = sum(len(ids) for ids in values.values())
         print(
@@ -1072,7 +1145,7 @@ async def run_enrollment_batch(
     state: ScaleState, identities: list[Identity]
 ) -> list[VirtualAgent]:
     """Enroll a batch of identities concurrently; return only the successful agents."""
-    semaphore = asyncio.Semaphore(ENROLLMENT_CONCURRENCY)
+    semaphore = asyncio.Semaphore(state.args.concurrent_enrollment)
     enrolled: list[VirtualAgent] = []
 
     async def one(identity: Identity) -> None:
@@ -1085,7 +1158,46 @@ async def run_enrollment_batch(
     return enrolled
 
 
-async def run_scale(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
+async def _rps_checkin(
+    client: httpx.AsyncClient,
+    args: argparse.Namespace,
+    agent: VirtualAgent,
+    bucket: MetricBucket,
+) -> None:
+    """Fire one check-in and record the result into bucket (used by RPS mode)."""
+    result, _ = await post_json(
+        client,
+        f"{args.logstash_ui_url}/ConnectionManager/CheckIn/",
+        agent.checkin_payload(),
+        headers={"Authorization": f"ApiKey {agent.api_key}"},
+    )
+    bucket.record(result)
+    if bucket.attempts % PROGRESS_EVERY == 0:
+        print(bucket.progress_line("Checkins"))
+
+
+async def run_rps_mode(args: argparse.Namespace) -> int:
+    """Enroll a small agent pool and fire check-ins at a fixed sustained rate.
+
+    Unlike the agent-simulation mode this does not model per-agent intervals or
+    jitter — it simply fires ``args.checkins_per_second`` requests per second for
+    ``args.rps_duration_seconds`` seconds and reports what the server did with them.
+
+    Args:
+        args: Parsed CLI namespace.  Required fields: ``num_of_agents``,
+            ``checkins_per_second``, ``rps_duration_seconds``,
+            ``enrollment_token``, ``logstash_ui_url``, ``ssl_context``.
+
+    Returns:
+        Exit code: 0 on full success, 1 if any check-in failed.
+
+    Example:
+        >>> # 50 req/s for 60 s using a 10-agent pool
+        >>> # uv run python scripts/scale_test.py \\
+        >>> #   --checkins-per-second 50 --num-of-agents 10 \\
+        >>> #   --rps-duration-seconds 60 --enrollment-token ... \\
+        >>> #   --logstash-ui-url https://... --username admin --password ...
+    """
     limits = httpx.Limits(max_connections=None, max_keepalive_connections=0)
     async with httpx.AsyncClient(
         verify=args.ssl_context,
@@ -1095,7 +1207,149 @@ async def run_scale(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         http2=False,
         follow_redirects=False,
     ) as client:
-        state = ScaleState(args=args, run_id=args.run_id, client=client)
+        state = ScaleState(
+            args=args,
+            run_id=args.run_id,
+            client=client,
+            checkin_semaphore=asyncio.Semaphore(999_999),
+        )
+
+        # --- enroll pool ---
+        pool_size = args.num_of_agents
+        print(
+            f"RPS mode: enrolling pool of {pool_size:,} agents "
+            f"(target {args.checkins_per_second:.1f} req/s "
+            f"for {args.rps_duration_seconds}s)..."
+        )
+        identities = await generate_identities(pool_size, args.run_id)
+        batch = await run_enrollment_batch(state, identities)
+        state.agents.extend(batch)
+        print(state.enrollment.progress_line("Enrollment", pool_size))
+
+        if not state.agents:
+            print("No agents enrolled successfully; aborting RPS test.")
+            await cleanup_scale_connections(args, state.cleanup)
+            return 1
+
+        # --- rate pacer ---
+        target_rps: float = args.checkins_per_second
+        duration: float = args.rps_duration_seconds
+        checkin_bucket = MetricBucket("checkins")
+        agent_cycle = itertools.cycle(state.agents)
+        interval = 1.0 / target_rps
+        start = time.monotonic()
+        fires = 0
+        pending: set[asyncio.Task[None]] = set()
+
+        print(
+            f"Firing at {target_rps:.1f} req/s for {duration:g}s "
+            f"using {len(state.agents):,} pooled agents..."
+        )
+
+        while time.monotonic() - start < duration:
+            scheduled = start + fires * interval
+            sleep_for = scheduled - time.monotonic()
+            if sleep_for > 0:
+                await asyncio.sleep(sleep_for)
+            if time.monotonic() - start >= duration:
+                break
+            agent = next(agent_cycle)
+            task = asyncio.create_task(
+                _rps_checkin(client, args, agent, checkin_bucket)
+            )
+            pending.add(task)
+            task.add_done_callback(pending.discard)
+            fires += 1
+
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        state.checkins_done.set()
+
+        # --- cleanup ---
+        try:
+            await cleanup_scale_connections(args, state.cleanup)
+        except Exception as exc:
+            print(f"Cleanup failed: {exc}")
+
+        # --- report ---
+        summary = checkin_bucket.summary()
+        lat = summary["latency_seconds"]
+        print("\n" + "=" * 78)
+        print("RPS THROUGHPUT TEST RESULT")
+        print("=" * 78)
+        print(f"Pool size:       {len(state.agents):,} agents")
+        print(f"Target rate:     {target_rps:.1f} req/s")
+        print(f"Duration:        {duration:g}s")
+        print(f"Attempts:        {summary['attempts']:,}")
+        print(f"Successes:       {summary['successes']:,}")
+        print(f"Failures:        {summary['failures']:,}")
+        print(f"Actual rate:     {summary['requests_per_second']:.1f} req/s")
+        print(f"Success rate:    {summary['success_rate_percent']:.2f}%")
+        print(f"Latency avg:     {format_latency(lat['average'])}")
+        print(f"Latency p50:     {format_latency(lat['p50'])}")
+        print(f"Latency p95:     {format_latency(lat['p95'])}")
+        print(f"Latency p99:     {format_latency(lat['p99'])}")
+        print(f"Latency max:     {format_latency(lat['max'])}")
+        if summary["error_messages"]:
+            print_aggregated_errors(summary["error_messages"])
+        actual_rps = summary["requests_per_second"]
+        if actual_rps > 0:
+            ci_interval = getattr(args, "checkin_interval_seconds", DEFAULT_CHECKIN_INTERVAL_SECONDS)
+            ci_jitter = getattr(args, "checkin_jitter_seconds", DEFAULT_CHECKIN_JITTER_SECONDS)
+            nominal = actual_rps * ci_interval
+            conservative = actual_rps * (ci_interval - ci_jitter)
+            print(
+                f"\nAt {ci_interval:g}s interval (±{ci_jitter:g}s jitter) this rate supports:"
+                f"\n  Nominal:      ~{nominal:,.0f} agents  ({actual_rps:.1f} × {ci_interval:g})"
+                f"\n  Conservative: ~{conservative:,.0f} agents  ({actual_rps:.1f} × ({ci_interval:g}−{ci_jitter:g}))"
+            )
+        output_dir = Path(args.output_dir).resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        report_path = output_dir / f"scale-test-rps-{state.run_id}.json"
+        report = {
+            "run_id": state.run_id,
+            "mode": "rps",
+            "started_at": state.started_at_utc.isoformat(),
+            "finished_at": utc_now().isoformat(),
+            "configuration": {
+                "logstash_ui_url": args.logstash_ui_url,
+                "pool_size": len(state.agents),
+                "target_rps": target_rps,
+                "rps_duration_seconds": duration,
+                "enrollment_concurrency": args.concurrent_enrollment,
+            },
+            "metrics": {
+                "enrollment": state.enrollment.summary(),
+                "checkins": summary,
+                "cleanup": state.cleanup.summary(),
+            },
+        }
+        report_path.write_text(
+            json.dumps(report, indent=2, sort_keys=True), encoding="utf-8"
+        )
+        print(f"JSON report:     {report_path}")
+        print("=" * 78)
+
+        return 1 if checkin_bucket.failures else 0
+
+
+async def run_scale(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
+    limits = httpx.Limits(max_connections=None, max_keepalive_connections=0)
+    checkin_concurrency = getattr(args, "checkin_concurrency", None) or 0
+    checkin_semaphore = (
+        asyncio.Semaphore(checkin_concurrency) if checkin_concurrency > 0
+        else asyncio.Semaphore(999_999)  # effectively unlimited
+    )
+    async with httpx.AsyncClient(
+        verify=args.ssl_context,
+        timeout=httpx.Timeout(DEFAULT_TIMEOUT_SECONDS),
+        limits=limits,
+        http1=True,
+        http2=False,
+        follow_redirects=False,
+    ) as client:
+        state = ScaleState(args=args, run_id=args.run_id, client=client, checkin_semaphore=checkin_semaphore)
         return_code: int | None = None
         _report: dict[str, Any] = {}
 
@@ -1103,7 +1357,7 @@ async def run_scale(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             # --- Phase 1: enrollment with retries ---
             print(
                 f"Starting enrollment blast: {args.num_of_agents:,} agents, "
-                f"{ENROLLMENT_CONCURRENCY} concurrent requests, fresh connections"
+                f"{args.concurrent_enrollment} concurrent requests, fresh connections"
             )
             identities = await generate_identities(args.num_of_agents, args.run_id)
             batch = await run_enrollment_batch(state, identities)
@@ -1153,9 +1407,18 @@ async def run_scale(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                     print(
                         f"Enrollment complete: all {len(state.agents):,} agents enrolled."
                     )
+                spread = getattr(args, "startup_spread_seconds", 0.0) or 0.0
+                checkin_conc = getattr(args, "checkin_concurrency", 0) or 0
+                interval = getattr(args, "checkin_interval_seconds", DEFAULT_CHECKIN_INTERVAL_SECONDS)
+                jitter = getattr(args, "checkin_jitter_seconds", DEFAULT_CHECKIN_JITTER_SECONDS)
+                spread_note = f", startup spread 0–{spread:g}s" if spread > 0 else ", no startup spread (burst)"
+                conc_note = f", max {checkin_conc} concurrent" if checkin_conc > 0 else ""
+                steady_rps = len(state.agents) / interval
                 print(
                     f"Starting {args.num_check_ins:,} check-ins per agent, "
-                    f"every {CHECKIN_INTERVAL_SECONDS:g} ± {CHECKIN_JITTER_SECONDS:g} seconds."
+                    f"every {interval:g} ± {jitter:g} seconds"
+                    f"{spread_note}{conc_note}. "
+                    f"Steady-state target: ~{steady_rps:.1f} req/s"
                 )
                 for agent in state.agents:
                     state.agent_tasks.append(asyncio.create_task(agent_loop(state, agent)))
@@ -1221,7 +1484,17 @@ async def run_scale(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         return (1 if has_failures or has_duplicates else 0), _report
 
 
-def build_ssl_context(token_payload: dict[str, Any], ui_url: str) -> ssl.SSLContext:
+def build_ssl_context(
+    token_payload: dict[str, Any], ui_url: str, verify_tls: bool = False
+) -> ssl.SSLContext:
+    if not verify_tls:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        return context
+    if not token_payload:
+        return ssl.create_default_context()
+
     from logstashagent.tls_trust import build_ssl_context as agent_ssl_context
     from logstashagent.tls_trust import ensure_trust_from_token_payload
 
@@ -1267,17 +1540,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Total check-ins per enrolled agent, including the immediate first check-in",
     )
     parser.add_argument("--enrollment-token", help="Base64-encoded enrollment token")
+    parser.add_argument(
+        "--concurrent-enrollment",
+        type=int,
+        default=ENROLLMENT_CONCURRENCY,
+        help="Maximum concurrent enrollment requests, including retries (default: 100)",
+    )
     parser.add_argument("--logstash-ui-url", required=True, help="LogstashUI base URL")
     parser.add_argument("--username", required=True, help="LogstashUI administrator username")
     parser.add_argument("--password", required=True, help="LogstashUI administrator password")
+    parser.add_argument(
+        "--verify-tls",
+        action="store_true",
+        help="Verify server certificates using enrollment-token trust (default: verification disabled)",
+    )
     parser.add_argument(
         "--cleanup",
         action="store_true",
         help="Delete all LogstashUI agent connections whose names start with scale-test-",
     )
     parser.add_argument(
-        "--yes", action="store_true", help="Skip the cleanup confirmation prompt"
+        "--yes", "-y", action="store_true", default=True,
+        help="Skip the cleanup confirmation prompt (default: true; use --no-yes to require confirmation)",
     )
+    parser.add_argument("--no-yes", dest="yes", action="store_false", help=argparse.SUPPRESS)
     parser.add_argument("--seed", type=int, default=20260825, help="Deterministic workload seed")
     parser.add_argument(
         "--enrollment-retries",
@@ -1289,17 +1575,109 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--checkin-interval-seconds",
+        type=float,
+        default=DEFAULT_CHECKIN_INTERVAL_SECONDS,
+        metavar="SECONDS",
+        help=(
+            f"How often each agent checks in, in seconds (default: {DEFAULT_CHECKIN_INTERVAL_SECONDS:g}). "
+            "Real agents check in every 60 seconds; lower values produce more load per agent."
+        ),
+    )
+    parser.add_argument(
+        "--checkin-jitter-seconds",
+        type=float,
+        default=DEFAULT_CHECKIN_JITTER_SECONDS,
+        metavar="SECONDS",
+        help=(
+            f"Maximum random jitter added to each check-in sleep, in seconds "
+            f"(default: {DEFAULT_CHECKIN_JITTER_SECONDS:g}). The actual sleep is interval ± jitter."
+        ),
+    )
+    parser.add_argument(
+        "--startup-spread-seconds",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help=(
+            "Randomly delay each agent's first check-in by 0–SECONDS before firing it, "
+            "spreading the initial burst over a time window. "
+            "Simulates agents that enrolled at different times (default: 0, all fire at once). "
+            f"For a realistic test, set this equal to --checkin-interval-seconds "
+            f"(default: {DEFAULT_CHECKIN_INTERVAL_SECONDS:g}s) so agents are naturally staggered "
+            "across the full interval."
+        ),
+    )
+    parser.add_argument(
+        "--checkin-concurrency",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Maximum number of simultaneous check-in requests (0 = unlimited). "
+            "Use this to cap burst concurrency and simulate realistic steady-state load "
+            "rather than a pure thundering-herd scenario (default: 0)."
+        ),
+    )
+    parser.add_argument(
+        "--checkins-per-second",
+        type=float,
+        default=None,
+        metavar="RPS",
+        help=(
+            "Enable RPS throughput mode: enroll --num-of-agents agents as a pool and "
+            "fire check-ins at exactly RPS requests per second for "
+            "--rps-duration-seconds seconds. "
+            "Mutually exclusive with --increment-agents. "
+            "--num-check-ins is not used in this mode."
+        ),
+    )
+    parser.add_argument(
+        "--rps-duration-seconds",
+        type=float,
+        default=60.0,
+        metavar="SECONDS",
+        help="How long to sustain the target rate in RPS mode (default: 60).",
+    )
+    parser.add_argument(
         "--output-dir",
         default=str(PROJECT_ROOT / "scale-test-results"),
         help="Directory for JSON reports",
     )
     args = parser.parse_args(argv)
+    if args.concurrent_enrollment <= 0:
+        parser.error("--concurrent-enrollment must be greater than zero")
     args.logstash_ui_url = args.logstash_ui_url.rstrip("/")
     args.run_id = utc_now().strftime("%Y%m%dT%H%M%SZ") + f"-{uuid.uuid4().hex[:6]}"
 
     if args.cleanup:
         return args
 
+    # --- RPS throughput mode ---
+    if args.checkins_per_second is not None:
+        if args.increment_agents:
+            parser.error("--checkins-per-second cannot be combined with --increment-agents")
+        if args.checkins_per_second <= 0:
+            parser.error("--checkins-per-second must be greater than zero")
+        if args.rps_duration_seconds <= 0:
+            parser.error("--rps-duration-seconds must be greater than zero")
+        missing = [
+            opt
+            for opt, val in (
+                ("--num-of-agents", args.num_of_agents),
+                ("--enrollment-token", args.enrollment_token),
+            )
+            if val is None
+        ]
+        if missing:
+            parser.error(
+                f"the following arguments are required for RPS mode: {', '.join(missing)}"
+            )
+        if args.num_of_agents <= 0:
+            parser.error("--num-of-agents must be greater than zero")
+        return args
+
+    # --- agent-simulation mode ---
     if args.increment_agents:
         args.agent_counts = _parse_increment_agents(args.increment_agents, parser)
         args.num_of_agents = args.agent_counts[0]
@@ -1325,24 +1703,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 async def async_main(args: argparse.Namespace) -> int:
+    token_payload = (
+        decode_enrollment_token(args.enrollment_token) if args.enrollment_token else {}
+    )
+    args.ssl_context = await asyncio.to_thread(
+        build_ssl_context, token_payload, args.logstash_ui_url, args.verify_tls
+    )
     if args.cleanup:
         # Cleanup uses ordinary session pooling; it is outside the measured workload.
-        if args.enrollment_token:
-            token_payload = decode_enrollment_token(args.enrollment_token)
-            args.ssl_context = await asyncio.to_thread(
-                build_ssl_context, token_payload, args.logstash_ui_url
-            )
-        else:
-            args.ssl_context = ssl.create_default_context()
         deleted, failed, completed = await cleanup_scale_connections(args)
         if not completed:
             return 2
         return 1 if failed else 0
 
-    token_payload = decode_enrollment_token(args.enrollment_token)
-    args.ssl_context = await asyncio.to_thread(
-        build_ssl_context, token_payload, args.logstash_ui_url
-    )
+    if args.checkins_per_second is not None:
+        return await run_rps_mode(args)
 
     output_dir = Path(args.output_dir).resolve()
     sequence_id = utc_now().strftime("%Y%m%dT%H%M%SZ") + f"-{uuid.uuid4().hex[:6]}"
