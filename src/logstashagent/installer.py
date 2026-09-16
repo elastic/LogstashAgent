@@ -1223,6 +1223,13 @@ def install_multi_instance_unit_templates() -> None:
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         logger.warning(f"daemon-reload failed (non-fatal): {e}")
 
+    # Upgrade hook: enable canonical units for any registered instances that
+    # still have stale legacy unit names in the registry.
+    try:
+        migrate_legacy_systemd_units()
+    except Exception as e:
+        logger.warning("migrate_legacy_systemd_units failed (non-fatal): %s", e)
+
 
 def install_simulate_unit_templates() -> None:
     """Backward-compatible alias for install_multi_instance_unit_templates()."""
@@ -1256,16 +1263,20 @@ def _canonical_for_old_instance(unit: str) -> str | None:
 def migrate_legacy_systemd_units(
     *,
     systemd_dir: str | None = None,
+    state_dir: str | None = None,
 ) -> None:
-    """Print a rename notice for every old systemd instance that is found or enabled.
+    """Print a rename notice and enable canonical units for old systemd instances.
 
     For each old template file that still exists, or each old instance unit that
     systemctl reports as enabled, prints a line containing ``renamed`` plus both
-    the old and the canonical instance name so the operator knows which units
-    changed. No live systemd is required when systemctl is mocked.
+    the old and the canonical instance name. Also issues ``systemctl enable --now``
+    for the canonical agent and Logstash units of any registered instance whose
+    stored unit names are still the old style. No live systemd is required when
+    systemctl is mocked.
 
     Args:
         systemd_dir: Override the systemd unit directory (for testing).
+        state_dir: Override the registry state directory (for testing).
     """
     import shutil as _shutil
 
@@ -1308,6 +1319,30 @@ def migrate_legacy_systemd_units(
                     )
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             pass
+
+    # Enable canonical units for registered instances whose stored names are stale.
+    try:
+        from logstashagent import install_registry as _reg
+        instances = _reg.list_instances(state_dir, include_discovered=False)
+    except Exception:
+        instances = []
+
+    for entry in instances:
+        agent_unit = entry.get('agent_unit') or ''
+        logstash_unit = entry.get('logstash_unit') or ''
+        # list_instances() already rewrote legacy names to canonical; enable them.
+        # Guard: only template instances (with @<digits>) — never bare logstash-agent.
+        import re as _re
+        _CANONICAL_INSTANCE_RE = _re.compile(
+            r'^(simulate-agent|simulate-logstash|managed-agent|managed-logstash)@\d+$'
+        )
+        for unit in (agent_unit, logstash_unit):
+            if unit and _CANONICAL_INSTANCE_RE.match(unit):
+                ok, detail = _systemctl_ok('enable', '--now', unit)
+                if ok:
+                    logger.info('✓ Enabled canonical unit %s', unit)
+                else:
+                    logger.warning('Could not enable %s: %s', unit, detail)
 
 
 def _materialize_instance_logstash_yml(

@@ -283,6 +283,12 @@ def list_instances(
     if dirty:
         reg["instances"] = raw_instances
         save_registry(reg, state_dir)
+        # Upgrade hook A4b: enable canonical units for the just-rewritten instances.
+        try:
+            from logstashagent.installer import migrate_legacy_systemd_units
+            migrate_legacy_systemd_units(state_dir=state_dir)
+        except Exception:
+            pass
 
     instances = dict(raw_instances)
     if include_discovered:

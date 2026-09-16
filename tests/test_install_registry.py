@@ -305,3 +305,110 @@ def test_migrate_canonical_registry_noop(tmp_path):
     with patch("logstashagent.install_registry.discover_instances_from_disk", return_value=[]):
         packed = reg.list_instances(str(state_dir), include_discovered=False)
     assert packed[0]["agent_unit"] == "logstash-agent", "bare packaged unit was rewritten"
+
+
+# ---------- S2 upgrade tests ----------
+
+def _legacy_reg_json(state_dir: Path, instance_id: int = 2) -> None:
+    """Write a registry with old-style unit names for the given instance_id."""
+    import json
+    reg_file = state_dir / "install-registry.json"
+    reg_file.write_text(json.dumps({
+        "package": {},
+        "instances": {
+            f"managed-{instance_id}": {
+                "id": f"managed-{instance_id}",
+                "role": "managed",
+                "instance_id": instance_id,
+                "agent_unit": f"logstash-agent@{instance_id}",
+                "logstash_unit": f"logstash-managed@{instance_id}",
+            },
+        },
+    }))
+
+
+def test_migrate_enables_canonical_units(tmp_path, monkeypatch):
+    """acceptance A3: migrate_legacy_systemd_units enables canonical units with systemctl."""
+    from logstashagent import installer
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    _legacy_reg_json(state_dir, instance_id=2)
+
+    # Track systemctl calls.
+    systemctl_calls = []
+
+    def fake_systemctl_cmd(*args, check=False):
+        systemctl_calls.append(list(args))
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr(installer, "_systemctl_cmd", fake_systemctl_cmd)
+    monkeypatch.setattr(installer, "_systemctl_bin", lambda: "/usr/bin/systemctl")
+
+    # Suppress the print-path systemctl list-units (subprocess.run) and redirect to fake.
+    monkeypatch.setattr(installer.subprocess, "run", lambda *a, **k: type("R", (), {"returncode": 0, "stdout": ""})())
+
+    with patch("logstashagent.install_registry.discover_instances_from_disk", return_value=[]):
+        installer.migrate_legacy_systemd_units(state_dir=str(state_dir))
+
+    # Must have called enable --now for managed-agent@2 AND managed-logstash@2.
+    enable_units = [args[-1] for args in systemctl_calls if args and args[0] == "enable"]
+    assert "managed-agent@2" in enable_units, f"enable calls: {systemctl_calls}"
+    assert "managed-logstash@2" in enable_units, f"enable calls: {systemctl_calls}"
+
+    # Must NOT enable bare packaged unit.
+    assert "logstash-agent" not in enable_units
+    assert "logstash" not in enable_units
+
+
+def test_install_templates_invokes_unit_migrate(tmp_path, monkeypatch):
+    """acceptance A4a: install_multi_instance_unit_templates calls migrate_legacy_systemd_units."""
+    from logstashagent import installer
+
+    # Stub template install mechanics so we don't need actual service files.
+    monkeypatch.setattr(installer, "_read_unit_template", lambda n: f"[Unit]\nDescription={n}\n")
+
+    dests = {
+        "lsagent_simulate_unit": str(tmp_path / "simulate-agent@.service"),
+        "ls_simulate_unit": str(tmp_path / "simulate-logstash@.service"),
+        "logstash_agent_template_unit": str(tmp_path / "managed-agent@.service"),
+        "logstash_managed_unit": str(tmp_path / "managed-logstash@.service"),
+    }
+    for k, v in dests.items():
+        monkeypatch.setitem(installer.INSTALL_PATHS, k, v)
+
+    migrate_calls = []
+    monkeypatch.setattr(installer, "migrate_legacy_systemd_units", lambda **kw: migrate_calls.append(kw))
+
+    with patch.object(installer.subprocess, "run", return_value=type("R", (), {"returncode": 0})()) as _run:
+        installer.install_multi_instance_unit_templates()
+
+    assert migrate_calls, "install_multi_instance_unit_templates did not call migrate_legacy_systemd_units"
+
+
+def test_list_instances_invokes_unit_migrate(tmp_path, monkeypatch):
+    """acceptance A4b: list_instances invokes migrate when it rewrites stale unit names."""
+    from logstashagent import installer
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    _legacy_reg_json(state_dir, instance_id=5)
+
+    migrate_calls = []
+    monkeypatch.setattr(installer, "migrate_legacy_systemd_units", lambda **kw: migrate_calls.append(kw))
+
+    with patch("logstashagent.install_registry.discover_instances_from_disk", return_value=[]):
+        reg.list_instances(str(state_dir), include_discovered=False)
+
+    assert migrate_calls, "list_instances did not invoke migrate_legacy_systemd_units after rewriting stale units"
+
+    # Second call (already canonical): migrate must NOT be called again.
+    migrate_calls.clear()
+    with patch("logstashagent.install_registry.discover_instances_from_disk", return_value=[]):
+        reg.list_instances(str(state_dir), include_discovered=False)
+
+    assert not migrate_calls, "list_instances called migrate unnecessarily on already-canonical entries"
