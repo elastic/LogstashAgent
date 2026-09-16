@@ -374,8 +374,109 @@ def test_resolve_multi_instance_units_packaged_passthrough():
     assert ls == "logstash"
 
 
+def test_migrate_template_file_notice_mapping(tmp_path, monkeypatch, capsys):
+    """acceptance A1: template-file path produces exact per-mapping notices."""
+    sysdir = tmp_path / "systemd"
+    sysdir.mkdir()
+
+    # Plant exactly two old templates; no systemctl hits (stub returns nothing).
+    (sysdir / "ls-simulate@.service").write_text("[Unit]\n")
+    (sysdir / "logstash-agent@.service").write_text("[Unit]\n")
+
+    def fake_run(cmd, **kwargs):
+        r = MagicMock()
+        r.returncode = 0
+        r.stdout = ""  # no enabled instances
+        return r
+
+    monkeypatch.setattr(installer.subprocess, "run", fake_run)
+    monkeypatch.setattr(installer, "_systemctl_bin", lambda: "/usr/bin/systemctl")
+
+    installer.migrate_legacy_systemd_units(systemd_dir=str(sysdir))
+
+    out = capsys.readouterr().out
+    # Parse notices into {old_stem: canonical_stem} pairs from the template-file lines.
+    # Expected format: "renamed: {stem} → {canonical_stem}  (old template found at {path})"
+    mapping: dict[str, str] = {}
+    for line in out.splitlines():
+        if "old template found" in line and line.startswith("renamed:"):
+            # "renamed: ls-simulate@ → simulate-logstash@  (old template found at ...)"
+            parts = line.split("→")
+            if len(parts) >= 2:
+                old = parts[0].replace("renamed:", "").strip()
+                new = parts[1].split("(")[0].strip()
+                mapping[old] = new
+
+    assert "ls-simulate@" in mapping, f"ls-simulate@ not in template-file notices: {out!r}"
+    assert mapping["ls-simulate@"] == "simulate-logstash@", (
+        f"ls-simulate@ mapped to {mapping.get('ls-simulate@')!r}, expected simulate-logstash@"
+    )
+    assert "logstash-agent@" in mapping, f"logstash-agent@ not in template-file notices: {out!r}"
+    assert mapping["logstash-agent@"] == "managed-agent@", (
+        f"logstash-agent@ mapped to {mapping.get('logstash-agent@')!r}, expected managed-agent@"
+    )
+    # Full line format check (not just substrings)
+    assert any("renamed: ls-simulate@ →" in ln and "simulate-logstash@" in ln
+               and "old template found" in ln for ln in out.splitlines())
+    assert any("renamed: logstash-agent@ →" in ln and "managed-agent@" in ln
+               and "old template found" in ln for ln in out.splitlines())
+
+
+def test_migrate_enabled_instance_notice_mapping(tmp_path, monkeypatch, capsys):
+    """acceptance A2: enabled-instance path produces exact per-mapping notices."""
+    sysdir = tmp_path / "systemd"
+    sysdir.mkdir()
+    # No planted old template files — only systemctl hits.
+
+    def fake_run(cmd, **kwargs):
+        r = MagicMock()
+        r.returncode = 0
+        unit_filter = next((a for a in cmd if "@" in a), "")
+        if "lsagent-simulate@" in unit_filter:
+            r.stdout = "lsagent-simulate@3.service loaded active running ...\n"
+        elif "logstash-managed@" in unit_filter:
+            r.stdout = "logstash-managed@1.service loaded active running ...\n"
+        else:
+            r.stdout = ""
+        return r
+
+    monkeypatch.setattr(installer.subprocess, "run", fake_run)
+    monkeypatch.setattr(installer, "_systemctl_bin", lambda: "/usr/bin/systemctl")
+
+    installer.migrate_legacy_systemd_units(systemd_dir=str(sysdir))
+
+    out = capsys.readouterr().out
+    # Parse instance notices: "renamed: {unit} → {canonical}"
+    mapping: dict[str, str] = {}
+    for line in out.splitlines():
+        if "old template found" in line:
+            continue  # template-file path; not tested here
+        if line.startswith("renamed:") and "→" in line:
+            parts = line.split("→")
+            if len(parts) >= 2:
+                old = parts[0].replace("renamed:", "").strip()
+                new = parts[1].strip()
+                mapping[old] = new
+
+    assert "lsagent-simulate@3" in mapping, (
+        f"lsagent-simulate@3 not in instance notices: {out!r}"
+    )
+    assert mapping["lsagent-simulate@3"] == "simulate-agent@3", (
+        f"lsagent-simulate@3 mapped to {mapping.get('lsagent-simulate@3')!r}"
+    )
+    assert "logstash-managed@1" in mapping, (
+        f"logstash-managed@1 not in instance notices: {out!r}"
+    )
+    assert mapping["logstash-managed@1"] == "managed-logstash@1", (
+        f"logstash-managed@1 mapped to {mapping.get('logstash-managed@1')!r}"
+    )
+    # Full line format check
+    assert any(ln == "renamed: lsagent-simulate@3 → simulate-agent@3" for ln in out.splitlines())
+    assert any(ln == "renamed: logstash-managed@1 → managed-logstash@1" for ln in out.splitlines())
+
+
 def test_migrate_legacy_systemd_units_prints_rename(tmp_path, monkeypatch, capsys):
-    """acceptance A7: old template file or enabled old instance -> 'renamed' notice."""
+    """acceptance A7 parent contract: both detection paths covered together."""
     sysdir = tmp_path / "systemd"
     sysdir.mkdir()
 
@@ -402,10 +503,11 @@ def test_migrate_legacy_systemd_units_prints_rename(tmp_path, monkeypatch, capsy
     installer.migrate_legacy_systemd_units(systemd_dir=str(sysdir))
 
     out = capsys.readouterr().out
-    # Template file notices
-    assert "renamed" in out
-    assert "ls-simulate@" in out and "simulate-logstash@" in out
-    assert "logstash-agent@" in out and "managed-agent@" in out
-    # Enabled-instance notices from mocked systemctl
-    assert "lsagent-simulate@3" in out and "simulate-agent@3" in out
-    assert "logstash-managed@1" in out and "managed-logstash@1" in out
+    # Template-file path: full line with correct mapping
+    assert any("renamed: ls-simulate@ →" in ln and "simulate-logstash@" in ln
+               and "old template found" in ln for ln in out.splitlines())
+    assert any("renamed: logstash-agent@ →" in ln and "managed-agent@" in ln
+               and "old template found" in ln for ln in out.splitlines())
+    # Enabled-instance path: full canonical line
+    assert any(ln == "renamed: lsagent-simulate@3 → simulate-agent@3" for ln in out.splitlines())
+    assert any(ln == "renamed: logstash-managed@1 → managed-logstash@1" for ln in out.splitlines())
