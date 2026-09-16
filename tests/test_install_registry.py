@@ -45,8 +45,8 @@ def test_register_package_and_instance(reg_dir):
         reg.register_instance(
             role="managed",
             instance_id=1,
-            agent_unit="logstash-agent@1",
-            logstash_unit="logstash-managed@1",
+            agent_unit="managed-agent@1",
+            logstash_unit="managed-logstash@1",
             path_root="/opt/logstash-agent/managed-1",
             agent_api_port=9601,
             logstash_api_port=9701,
@@ -59,7 +59,7 @@ def test_register_package_and_instance(reg_dir):
     data = json.loads(path.read_text())
     assert data["package"]["agent_version"] == "0.5.1"
     assert "managed-1" in data["instances"]
-    assert data["instances"]["managed-1"]["agent_unit"] == "logstash-agent@1"
+    assert data["instances"]["managed-1"]["agent_unit"] == "managed-agent@1"
 
     instances = reg.list_instances(str(reg_dir), include_discovered=False)
     assert any(i["id"] == "managed-1" for i in instances)
@@ -70,8 +70,8 @@ def test_unregister_instance(reg_dir):
         reg.register_instance(
             role="simulate",
             instance_id=2,
-            agent_unit="lsagent-simulate@2",
-            logstash_unit="ls-simulate@2",
+            agent_unit="simulate-agent@2",
+            logstash_unit="simulate-logstash@2",
             path_root="/opt/logstash-agent/simulate-2",
             state_dir=str(reg_dir),
         )
@@ -123,21 +123,21 @@ def test_teardown_instance_stops_units(reg_dir, monkeypatch):
     entry = {
         "id": "managed-1",
         "role": "managed",
-        "agent_unit": "logstash-agent@1",
-        "logstash_unit": "logstash-managed@1",
+        "agent_unit": "managed-agent@1",
+        "logstash_unit": "managed-logstash@1",
         "path_root": None,
     }
     with patch("logstashagent.installer.get_logstash_uid_gid", side_effect=Exception("x")):
         reg.register_instance(
             role="managed",
             instance_id=1,
-            agent_unit="logstash-agent@1",
-            logstash_unit="logstash-managed@1",
+            agent_unit="managed-agent@1",
+            logstash_unit="managed-logstash@1",
             state_dir=str(reg_dir),
         )
         reg.teardown_instance(entry, purge_paths=False, state_dir=str(reg_dir), unregister=True)
-    assert "logstash-agent@1" in calls
-    assert "logstash-managed@1" in calls
+    assert "managed-agent@1" in calls
+    assert "managed-logstash@1" in calls
     assert "managed-1" not in reg.load_registry(str(reg_dir))["instances"]
 
 
@@ -153,8 +153,8 @@ def test_perform_uninstall_instance_only(reg_dir, monkeypatch, tmp_path):
         reg.register_instance(
             role="managed",
             instance_id=1,
-            agent_unit="logstash-agent@1",
-            logstash_unit="logstash-managed@1",
+            agent_unit="managed-agent@1",
+            logstash_unit="managed-logstash@1",
             path_root=str(tree),
             state_dir=str(reg_dir),
         )
@@ -167,7 +167,7 @@ def test_perform_uninstall_instance_only(reg_dir, monkeypatch, tmp_path):
         # Default instance uninstall deletes the path tree
         installer.perform_uninstallation(purge=False, instance="managed-1")
 
-    assert "logstash-agent@1" in stopped
+    assert "managed-agent@1" in stopped
     assert "managed-1" not in reg.load_registry(str(reg_dir))["instances"]
     assert not tree.exists()
 
@@ -183,8 +183,8 @@ def test_perform_uninstall_instance_keep_data(reg_dir, monkeypatch, tmp_path):
         reg.register_instance(
             role="simulate",
             instance_id=3,
-            agent_unit="lsagent-simulate@3",
-            logstash_unit="ls-simulate@3",
+            agent_unit="simulate-agent@3",
+            logstash_unit="simulate-logstash@3",
             path_root=str(tree),
             state_dir=str(reg_dir),
         )
@@ -198,6 +198,6 @@ def test_perform_uninstall_instance_keep_data(reg_dir, monkeypatch, tmp_path):
             purge=False, instance="simulate-3", keep_data=True
         )
 
-    assert "lsagent-simulate@3" in stopped
+    assert "simulate-agent@3" in stopped
     assert "simulate-3" not in reg.load_registry(str(reg_dir))["instances"]
     assert tree.exists()

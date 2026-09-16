@@ -156,7 +156,7 @@ class TestHealStaleLogstashLaunch:
             "mode": mode,
             "settings_path": str(settings),
             "keystore_env_file": str(tmp_path / "env"),
-            "logstash_unit": "logstash-managed@1",
+            "logstash_unit": "managed-logstash@1",
         }
         state.update(extra)
         return state
@@ -168,7 +168,7 @@ class TestHealStaleLogstashLaunch:
 
     def test_adds_ls_jvm_opts_without_touching_units(self, tmp_path):
         state = self._state(tmp_path)
-        unit = tmp_path / "logstash-managed@.service"
+        unit = tmp_path / "managed-logstash@.service"
         unit.write_text('ExecStart=/bin/bash -c \'exec "${LOGSTASH_BINARY}" --path.settings "${LOGSTASH_PATH_SETTINGS}"\'\n')
 
         with patch.dict(
@@ -184,7 +184,7 @@ class TestHealStaleLogstashLaunch:
 
     def test_stale_unit_triggers_template_reinstall_as_root(self, tmp_path):
         state = self._state(tmp_path)
-        unit = tmp_path / "logstash-managed@.service"
+        unit = tmp_path / "managed-logstash@.service"
         unit.write_text('ExecStart=/bin/bash -c \'exec "${LOGSTASH_BINARY}" --path.settings="${LOGSTASH_PATH_SETTINGS}"\'\n')
 
         with patch.dict(
@@ -199,7 +199,7 @@ class TestHealStaleLogstashLaunch:
 
     def test_stale_unit_escalates_via_sudo_when_not_root(self, tmp_path):
         state = self._state(tmp_path)
-        unit = tmp_path / "logstash-managed@.service"
+        unit = tmp_path / "managed-logstash@.service"
         unit.write_text('ExecStart=/bin/bash -c \'exec "${LOGSTASH_BINARY}" --path.settings="${LOGSTASH_PATH_SETTINGS}"\'\n')
 
         inst = controller_installer()
@@ -216,7 +216,7 @@ class TestHealStaleLogstashLaunch:
 
     def test_failed_escalation_still_leaves_env_fix(self, tmp_path):
         state = self._state(tmp_path)
-        unit = tmp_path / "logstash-managed@.service"
+        unit = tmp_path / "managed-logstash@.service"
         unit.write_text('ExecStart=/bin/bash -c \'exec "${LOGSTASH_BINARY}" --path.settings="${LOGSTASH_PATH_SETTINGS}"\'\n')
 
         inst = controller_installer()
@@ -391,9 +391,9 @@ class TestLogstashUnitName:
         with patch.object(
             controller.agent_state,
             "get_state",
-            return_value={"logstash_unit": "ls-simulate@9", "mode": "host", "instance_id": 1},
+            return_value={"logstash_unit": "simulate-logstash@9", "mode": "host", "instance_id": 1},
         ):
-            assert controller._logstash_unit_name() == "ls-simulate@9"
+            assert controller._logstash_unit_name() == "simulate-logstash@9"
 
     def test_host_alias_maps_to_managed_unit(self):
         with patch.object(
@@ -401,7 +401,7 @@ class TestLogstashUnitName:
             "get_state",
             return_value={"mode": "host", "instance_id": 3},
         ):
-            assert controller._logstash_unit_name() == "logstash-managed@3"
+            assert controller._logstash_unit_name() == "managed-logstash@3"
 
     def test_default_and_agent_aliases_use_packaged_unit(self):
         for mode in ("default", "agent", "packaged", None):

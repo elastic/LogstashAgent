@@ -29,7 +29,7 @@ def test_keystore_sync_writes_when_different(client, temp_dir, mock_dirs):
         "keystore_env_file": env_file,
         "mode": "simulate",
         "instance_id": 1,
-        "logstash_unit": "ls-simulate@1",
+        "logstash_unit": "simulate-logstash@1",
     }), patch.object(agent_state, "update_state"), patch(
         "logstashagent.controller.restart_logstash", return_value=True
     ) as restart, patch(
@@ -66,7 +66,7 @@ def test_keystore_sync_skips_when_unchanged(client, temp_dir, mock_dirs):
         "settings_path": settings,
         "keystore_password": password,
         "mode": "simulate",
-        "logstash_unit": "ls-simulate@1",
+        "logstash_unit": "simulate-logstash@1",
     }), patch.object(agent_state, "update_state"), patch(
         "logstashagent.controller.restart_logstash", return_value=True
     ) as restart:

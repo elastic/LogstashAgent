@@ -216,12 +216,12 @@ def test_smoke_state_relocate_preserves_packaged(host_tree):
 def test_smoke_unit_templates_shipped():
     d = installer._systemd_template_dir()
     for name in (
-        "logstash-agent@.service",
-        "logstash-managed@.service",
-        "lsagent-simulate@.service",
-        "ls-simulate@.service",
+        "simulate-agent@.service",
+        "simulate-logstash@.service",
+        "managed-agent@.service",
+        "managed-logstash@.service",
     ):
         assert (d / name).is_file(), name
-    agent_unit = (d / "logstash-agent@.service").read_text()
+    agent_unit = (d / "managed-agent@.service").read_text()
     assert "LOGSTASH_AGENT_STATE_DIR" in agent_unit or "managed-%i" in agent_unit
     assert "--mode managed" in agent_unit

@@ -115,8 +115,8 @@ def test_materialize_managed_tree(tmp_path, monkeypatch):
         "logstash_yml": "api.http.port: 9701\n",
         "jvm_options": "-Xms1g\n",
         "log4j2_properties": "status=error\n",
-        "agent_unit": "logstash-agent@1",
-        "logstash_unit": "logstash-managed@1",
+        "agent_unit": "managed-agent@1",
+        "logstash_unit": "managed-logstash@1",
     }
 
     with patch.object(installer, "get_logstash_uid_gid", return_value=(0, 0)), patch.object(
@@ -127,14 +127,14 @@ def test_materialize_managed_tree(tmp_path, monkeypatch):
     ):
         result = installer.materialize_simulate_instance(policy)
 
-    assert result["agent_unit"] == "logstash-agent@1"
-    assert result["logstash_unit"] == "logstash-managed@1"
+    assert result["agent_unit"] == "managed-agent@1"
+    assert result["logstash_unit"] == "managed-logstash@1"
     assert result["mode"] == "managed"
     assert (root / "settings" / "logstash.yml").is_file()
     assert (root / "env").is_file()
     agent_env = (root / "agent.env").read_text()
     assert "AGENT_MODE=managed" in agent_env
-    assert "AGENT_UNIT=logstash-agent@1" in agent_env
+    assert "AGENT_UNIT=managed-agent@1" in agent_env
     # No simulate harness confs for managed
     assert not (root / "settings" / "conf.d" / "simulate-start.conf").exists()
     pipelines = (root / "settings" / "pipelines.yml").read_text()
@@ -221,26 +221,74 @@ def test_materialize_makes_jvm_options_readable(tmp_path, monkeypatch):
 def test_unit_templates_exist_on_disk():
     d = installer._systemd_template_dir()
     for name in (
+        "simulate-agent@.service",
+        "simulate-logstash@.service",
+        "managed-agent@.service",
+        "managed-logstash@.service",
+    ):
+        p = d / name
+        assert p.is_file(), f"missing template {p}"
+    managed_agent = (d / "managed-agent@.service").read_text()
+    assert "--mode managed" in managed_agent
+    assert "managed-%i" in managed_agent
+    managed_ls = (d / "managed-logstash@.service").read_text()
+    assert "managed-%i" in managed_ls
+
+
+def test_new_templates_exist_and_alias_old_names():
+    """acceptance A3: new templates exist with correct Alias= entries."""
+    d = installer._systemd_template_dir()
+    aliases = {
+        "simulate-agent@.service": "lsagent-simulate@%i",
+        "simulate-logstash@.service": "ls-simulate@%i",
+        "managed-agent@.service": "logstash-agent@%i",
+        "managed-logstash@.service": "logstash-managed@%i",
+    }
+    for name, expected_alias in aliases.items():
+        p = d / name
+        assert p.is_file(), f"missing new template {p}"
+        text = p.read_text()
+        assert "\nUser=logstash" in text, f"{name} missing User=logstash"
+        assert "\nGroup=logstash" in text, f"{name} missing Group=logstash"
+        assert f"Alias={expected_alias}.service" in text, (
+            f"{name} missing Alias={expected_alias}.service"
+        )
+
+
+def test_old_template_filenames_removed():
+    """acceptance A4: old template files must not exist (Alias= collision guard)."""
+    d = installer._systemd_template_dir()
+    for name in (
         "lsagent-simulate@.service",
         "ls-simulate@.service",
         "logstash-agent@.service",
         "logstash-managed@.service",
     ):
-        p = d / name
-        assert p.is_file(), f"missing template {p}"
-    managed_agent = (d / "logstash-agent@.service").read_text()
-    assert "--mode managed" in managed_agent
-    assert "managed-%i" in managed_agent
-    managed_ls = (d / "logstash-managed@.service").read_text()
-    assert "managed-%i" in managed_ls
+        assert not (d / name).exists(), f"old template still present: {name}"
+
+
+def test_spec_bundles_new_units():
+    """acceptance A3/A5: logstash-agent.spec bundles new names, not old."""
+    import ast
+    spec_path = installer._systemd_template_dir().parents[2] / "logstash-agent.spec"
+    if not spec_path.is_file():
+        import pytest
+        pytest.skip("spec file not available in test environment")
+    text = spec_path.read_text()
+    for new_name in ("simulate-agent@.service", "simulate-logstash@.service",
+                     "managed-agent@.service", "managed-logstash@.service"):
+        assert new_name in text, f"spec does not bundle {new_name}"
+    for old_name in ("lsagent-simulate@.service", "ls-simulate@.service",
+                     "logstash-agent@.service", "logstash-managed@.service"):
+        assert old_name not in text, f"spec still bundles old name {old_name}"
 
 
 def test_install_multi_instance_templates(tmp_path, monkeypatch):
     dests = {
-        "lsagent_simulate_unit": str(tmp_path / "lsagent-simulate@.service"),
-        "ls_simulate_unit": str(tmp_path / "ls-simulate@.service"),
-        "logstash_agent_template_unit": str(tmp_path / "logstash-agent@.service"),
-        "logstash_managed_unit": str(tmp_path / "logstash-managed@.service"),
+        "lsagent_simulate_unit": str(tmp_path / "simulate-agent@.service"),
+        "ls_simulate_unit": str(tmp_path / "simulate-logstash@.service"),
+        "logstash_agent_template_unit": str(tmp_path / "managed-agent@.service"),
+        "logstash_managed_unit": str(tmp_path / "managed-logstash@.service"),
     }
     for k, v in dests.items():
         monkeypatch.setitem(installer.INSTALL_PATHS, k, v)
@@ -277,7 +325,7 @@ def test_no_template_uses_equals_form_path_settings():
 
 def test_logstash_templates_pass_path_settings_as_two_args():
     d = installer._systemd_template_dir()
-    for name in ("ls-simulate@.service", "logstash-managed@.service"):
+    for name in ("simulate-logstash@.service", "managed-logstash@.service"):
         text = (d / name).read_text()
         assert '--path.settings "${LOGSTASH_PATH_SETTINGS}"' in text, name
 
@@ -290,10 +338,10 @@ def test_installed_templates_always_run_as_logstash(tmp_path, monkeypatch):
     Logstash as root.
     """
     dests = {
-        "lsagent_simulate_unit": str(tmp_path / "lsagent-simulate@.service"),
-        "ls_simulate_unit": str(tmp_path / "ls-simulate@.service"),
-        "logstash_agent_template_unit": str(tmp_path / "logstash-agent@.service"),
-        "logstash_managed_unit": str(tmp_path / "logstash-managed@.service"),
+        "lsagent_simulate_unit": str(tmp_path / "simulate-agent@.service"),
+        "ls_simulate_unit": str(tmp_path / "simulate-logstash@.service"),
+        "logstash_agent_template_unit": str(tmp_path / "managed-agent@.service"),
+        "logstash_managed_unit": str(tmp_path / "managed-logstash@.service"),
     }
     for k, v in dests.items():
         monkeypatch.setitem(installer.INSTALL_PATHS, k, v)

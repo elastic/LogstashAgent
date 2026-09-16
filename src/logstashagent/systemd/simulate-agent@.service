@@ -21,3 +21,4 @@ Group=logstash
 
 [Install]
 WantedBy=multi-user.target
+Alias=lsagent-simulate@%i.service

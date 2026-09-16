@@ -133,13 +133,13 @@ def test_restart_running_agent_units_restarts_active_agent_not_logstash(monkeypa
             },
             {
                 "id": "managed-1",
-                "agent_unit": "logstash-agent@1",
-                "logstash_unit": "logstash-managed@1",
+                "agent_unit": "managed-agent@1",
+                "logstash_unit": "managed-logstash@1",
             },
             {
                 "id": "simulate-2",
-                "agent_unit": "lsagent-simulate@2",
-                "logstash_unit": "ls-simulate@2",
+                "agent_unit": "simulate-agent@2",
+                "logstash_unit": "simulate-logstash@2",
             },
         ],
     )
@@ -149,7 +149,7 @@ def test_restart_running_agent_units_restarts_active_agent_not_logstash(monkeypa
         calls.append((action, unit))
         r = MagicMock(returncode=0, stdout="active\n", stderr="")
         if action == "is-active":
-            if unit in ("logstash-agent", "logstash-agent@1"):
+            if unit in ("logstash-agent", "managed-agent@1"):
                 r.returncode = 0
                 r.stdout = "active\n"
             else:
@@ -163,11 +163,11 @@ def test_restart_running_agent_units_restarts_active_agent_not_logstash(monkeypa
     checked = [u for a, u in calls if a == "is-active"]
     restarted = [u for a, u in calls if a == "restart"]
     assert "logstash-agent" in checked
-    assert "logstash-agent@1" in checked
-    assert "lsagent-simulate@2" in checked
+    assert "managed-agent@1" in checked
+    assert "simulate-agent@2" in checked
     assert checked.count("logstash-agent") == 1
     assert "logstash" not in checked
-    assert "logstash-managed@1" not in checked
-    assert "ls-simulate@2" not in checked
-    assert restarted == ["logstash-agent", "logstash-agent@1"]
-    assert "lsagent-simulate@2" not in restarted
+    assert "managed-logstash@1" not in checked
+    assert "simulate-logstash@2" not in checked
+    assert restarted == ["logstash-agent", "managed-agent@1"]
+    assert "simulate-agent@2" not in restarted

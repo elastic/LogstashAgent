@@ -404,7 +404,8 @@ def is_systemctl_managed_simulate() -> bool:
     """
     state = agent_state.get_state() or {}
     unit = (state.get('logstash_unit') or '') or ''
-    if str(unit).startswith('ls-simulate@') or str(unit).startswith('logstash-managed@'):
+    if (str(unit).startswith('ls-simulate@') or str(unit).startswith('logstash-managed@')
+            or str(unit).startswith('simulate-logstash@') or str(unit).startswith('managed-logstash@')):
         return True
 
     mode = (state.get('mode') or (AGENT_CONFIG or {}).get('mode') or '').lower()

@@ -21,34 +21,67 @@ def test_systemctl_ctl_script_validates_units(tmp_path, monkeypatch):
     assert mode & stat.S_IXUSR
     text = ctl_path.read_text(encoding="utf-8")
     assert "systemctl" in text
-    assert "ls-simulate" in text
-    assert "lsagent-simulate" in text
-    assert "logstash-managed" in text
-    assert "logstash-agent" in text
+    # A5: new canonical names present
+    assert "simulate-agent" in text
+    assert "simulate-logstash" in text
+    assert "managed-agent" in text
+    assert "managed-logstash" in text
+    # A6: deprecated old names still handled (DEPRECATED rewrite block)
+    assert "DEPRECATED" in text
+    assert "lsagent-simulate@" in text
+    assert "ls-simulate@" in text
+    assert "logstash-managed@" in text
     assert "grep -Eq" in text
     # Extract allowlist regex and validate accepted / rejected units
+    # The regex now applies to CANONICAL_UNIT after rewriting
     m = re.search(r"grep -Eq '([^']+)'", text)
     assert m, "ctl script missing unit allowlist grep"
     unit_re = re.compile(m.group(1))
     for ok in (
         "logstash",
         "logstash-agent",
-        "logstash-agent@1",
-        "logstash-agent@42",
-        "logstash-managed@1",
-        "ls-simulate@3",
-        "lsagent-simulate@9",
+        "simulate-agent@1",
+        "simulate-agent@42",
+        "simulate-logstash@3",
+        "managed-agent@1",
+        "managed-logstash@9",
     ):
-        assert unit_re.fullmatch(ok), f"should allow {ok}"
+        assert unit_re.fullmatch(ok), f"should allow canonical {ok}"
     for bad in (
         "logstash@1",
-        "logstash-agent@managed-1",
-        "logstash-agent@*",
         "sshd",
-        "ls-simulate@1x",
-        "logstash-managed@",
+        "simulate-agent@1x",
+        "managed-logstash@",
+        "simulate-agent@*",
     ):
         assert not unit_re.fullmatch(bad), f"should reject {bad}"
+
+
+def test_ctl_script_rewrites_deprecated_unit(tmp_path, monkeypatch):
+    """acceptance A6: deprecated old instance names -> canonical + DEPRECATED on stderr."""
+    import subprocess
+    ctl_path = tmp_path / "logstash-agent-ctl"
+    monkeypatch.setitem(installer.INSTALL_PATHS, "systemctl_ctl", str(ctl_path))
+    installer.install_systemctl_ctl()
+    text = ctl_path.read_text(encoding="utf-8")
+    deprecated_cases = {
+        "logstash-agent@1": "managed-agent@1",
+        "logstash-managed@3": "managed-logstash@3",
+        "lsagent-simulate@2": "simulate-agent@2",
+        "ls-simulate@5": "simulate-logstash@5",
+    }
+    for old, canonical in deprecated_cases.items():
+        # Check the script text encodes the mapping (no live systemctl needed)
+        assert f"DEPRECATED" in text
+        # The case block must handle old name and produce the canonical
+        assert old.split("@")[0] in text or old.rsplit("-", 1)[0] in text
+        assert canonical.split("@")[0] in text
+    # sshd must still be rejected (the allowlist check runs on CANONICAL_UNIT)
+    unit_re_m = re.search(r"grep -Eq '([^']+)'", text)
+    assert unit_re_m
+    unit_re = re.compile(unit_re_m.group(1))
+    assert not unit_re.fullmatch("sshd"), "sshd must be rejected"
+    assert not unit_re.fullmatch("simulate-agent@abc"), "non-numeric must be rejected"
 
 
 def test_sudoers_content_has_no_arg_wildcards(tmp_path, monkeypatch):

@@ -41,11 +41,11 @@ INSTALL_PATHS = {
     'cache_dir': f'{OPT_ROOT}/cache',
     'simulate_root': OPT_ROOT,
     'systemd_service': '/etc/systemd/system/logstash-agent.service',
-    'lsagent_simulate_unit': '/etc/systemd/system/lsagent-simulate@.service',
-    'ls_simulate_unit': '/etc/systemd/system/ls-simulate@.service',
+    'lsagent_simulate_unit': '/etc/systemd/system/simulate-agent@.service',
+    'ls_simulate_unit': '/etc/systemd/system/simulate-logstash@.service',
     # Managed multi-instance (agent-owned Logstash trees)
-    'logstash_agent_template_unit': '/etc/systemd/system/logstash-agent@.service',
-    'logstash_managed_unit': '/etc/systemd/system/logstash-managed@.service',
+    'logstash_agent_template_unit': '/etc/systemd/system/managed-agent@.service',
+    'logstash_managed_unit': '/etc/systemd/system/managed-logstash@.service',
 }
 
 # Pre-consolidation FHS paths — read/migrate, never write for new installs
@@ -91,11 +91,40 @@ case "$ACTION" in
     exit 2
     ;;
 esac
+# Rewrite deprecated old instance names to canonical names and warn.
+# Old -> canonical mappings (numeric N preserved via sed):
+#   logstash-agent@N   -> managed-agent@N
+#   logstash-managed@N -> managed-logstash@N
+#   lsagent-simulate@N -> simulate-agent@N
+#   ls-simulate@N      -> simulate-logstash@N
+CANONICAL_UNIT="$UNIT"
+case "$UNIT" in
+  logstash-agent@*)
+    N="${UNIT#logstash-agent@}"
+    CANONICAL_UNIT="managed-agent@${N}"
+    echo "DEPRECATED: logstash-agent-ctl: '${UNIT}' is deprecated; use '${CANONICAL_UNIT}'" >&2
+    ;;
+  logstash-managed@*)
+    N="${UNIT#logstash-managed@}"
+    CANONICAL_UNIT="managed-logstash@${N}"
+    echo "DEPRECATED: logstash-agent-ctl: '${UNIT}' is deprecated; use '${CANONICAL_UNIT}'" >&2
+    ;;
+  lsagent-simulate@*)
+    N="${UNIT#lsagent-simulate@}"
+    CANONICAL_UNIT="simulate-agent@${N}"
+    echo "DEPRECATED: logstash-agent-ctl: '${UNIT}' is deprecated; use '${CANONICAL_UNIT}'" >&2
+    ;;
+  ls-simulate@*)
+    N="${UNIT#ls-simulate@}"
+    CANONICAL_UNIT="simulate-logstash@${N}"
+    echo "DEPRECATED: logstash-agent-ctl: '${UNIT}' is deprecated; use '${CANONICAL_UNIT}'" >&2
+    ;;
+esac
 # Allow fixed units and template instances with numeric instance ids only.
 # Packaged: logstash, logstash-agent
-# Simulate: ls-simulate@N, lsagent-simulate@N
-# Managed:  logstash-managed@N, logstash-agent@N
-if ! echo "$UNIT" | grep -Eq '^(logstash|logstash-agent|((ls-simulate|lsagent-simulate|logstash-agent|logstash-managed)@[0-9]+))$'; then
+# New canonical: simulate-agent@N, simulate-logstash@N, managed-agent@N, managed-logstash@N
+# Deprecated (already rewritten above, but validate the canonical result):
+if ! echo "$CANONICAL_UNIT" | grep -Eq '^(logstash|logstash-agent|((simulate-agent|simulate-logstash|managed-agent|managed-logstash)@[0-9]+))$'; then
   echo "logstash-agent-ctl: disallowed unit: $UNIT" >&2
   exit 2
 fi
@@ -122,7 +151,7 @@ if [ -z "$SYSTEMCTL" ]; then
   echo "logstash-agent-ctl: systemctl not found" >&2
   exit 127
 fi
-exec "$SYSTEMCTL" "$ACTION" "$UNIT"
+exec "$SYSTEMCTL" "$ACTION" "$CANONICAL_UNIT"
 '''
 
 
@@ -1159,11 +1188,11 @@ def _read_unit_template(name: str) -> str:
 # (template filename, INSTALL_PATHS dest key)
 _MULTI_INSTANCE_UNIT_TEMPLATES = (
     # Simulate
-    ('lsagent-simulate@.service', 'lsagent_simulate_unit'),
-    ('ls-simulate@.service', 'ls_simulate_unit'),
+    ('simulate-agent@.service', 'lsagent_simulate_unit'),
+    ('simulate-logstash@.service', 'ls_simulate_unit'),
     # Managed
-    ('logstash-agent@.service', 'logstash_agent_template_unit'),
-    ('logstash-managed@.service', 'logstash_managed_unit'),
+    ('managed-agent@.service', 'logstash_agent_template_unit'),
+    ('managed-logstash@.service', 'logstash_managed_unit'),
 )
 
 

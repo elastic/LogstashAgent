@@ -1997,9 +1997,9 @@ def _logstash_unit_name() -> str:
     mode = _mode_aliases.get(mode, mode)
     instance_id = state.get('instance_id')
     if mode == 'managed' and instance_id is not None:
-        return f'logstash-managed@{instance_id}'
+        return f'managed-logstash@{instance_id}'
     if mode == 'simulate' and instance_id is not None:
-        return f'ls-simulate@{instance_id}'
+        return f'simulate-logstash@{instance_id}'
     return 'logstash'
 
 

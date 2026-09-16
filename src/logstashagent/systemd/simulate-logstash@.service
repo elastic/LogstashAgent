@@ -33,3 +33,4 @@ Group=logstash
 
 [Install]
 WantedBy=multi-user.target
+Alias=ls-simulate@%i.service
