@@ -1229,6 +1229,87 @@ def install_simulate_unit_templates() -> None:
     install_multi_instance_unit_templates()
 
 
+# Mapping of old instance-name prefixes to canonical equivalents (A7 migration).
+_OLD_TO_CANONICAL_PREFIXES: tuple[tuple[str, str], ...] = (
+    ('lsagent-simulate@', 'simulate-agent@'),
+    ('ls-simulate@', 'simulate-logstash@'),
+    ('logstash-agent@', 'managed-agent@'),
+    ('logstash-managed@', 'managed-logstash@'),
+)
+
+_OLD_TEMPLATE_FILENAMES: tuple[str, ...] = (
+    'lsagent-simulate@.service',
+    'ls-simulate@.service',
+    'logstash-agent@.service',
+    'logstash-managed@.service',
+)
+
+
+def _canonical_for_old_instance(unit: str) -> str | None:
+    """Return the canonical name for an old instance unit, or None if not deprecated."""
+    for old_prefix, new_prefix in _OLD_TO_CANONICAL_PREFIXES:
+        if unit.startswith(old_prefix):
+            return new_prefix + unit[len(old_prefix):]
+    return None
+
+
+def migrate_legacy_systemd_units(
+    *,
+    systemd_dir: str | None = None,
+) -> None:
+    """Print a rename notice for every old systemd instance that is found or enabled.
+
+    For each old template file that still exists, or each old instance unit that
+    systemctl reports as enabled, prints a line containing ``renamed`` plus both
+    the old and the canonical instance name so the operator knows which units
+    changed. No live systemd is required when systemctl is mocked.
+
+    Args:
+        systemd_dir: Override the systemd unit directory (for testing).
+    """
+    import shutil as _shutil
+
+    sysdir = systemd_dir or '/etc/systemd/system'
+
+    # Check for old template files still on disk.
+    for old_filename in _OLD_TEMPLATE_FILENAMES:
+        old_path = os.path.join(sysdir, old_filename)
+        if os.path.isfile(old_path):
+            stem = old_filename.replace('.service', '')  # e.g. logstash-agent@
+            canonical = _canonical_for_old_instance(f'{stem}N') or stem
+            canonical_stem = canonical.replace('N', '')
+            print(
+                f'renamed: {stem} → {canonical_stem}  '
+                f'(old template found at {old_path})',
+                flush=True,
+            )
+
+    # Check for enabled old instance units via systemctl.
+    systemctl = _systemctl_bin()
+    for old_prefix, new_prefix in _OLD_TO_CANONICAL_PREFIXES:
+        try:
+            result = subprocess.run(
+                [systemctl, 'list-units', '--all', '--no-pager',
+                 '--no-legend', f'{old_prefix}*'],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            for line in result.stdout.splitlines():
+                parts = line.split()
+                if not parts:
+                    continue
+                unit = parts[0].removesuffix('.service') if hasattr(parts[0], 'removesuffix') else parts[0].replace('.service', '')
+                canonical = _canonical_for_old_instance(unit)
+                if canonical:
+                    print(
+                        f'renamed: {unit} → {canonical}',
+                        flush=True,
+                    )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            pass
+
+
 def _materialize_instance_logstash_yml(
     template: str,
     logstash_api_port: int,

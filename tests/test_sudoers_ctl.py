@@ -84,6 +84,54 @@ def test_ctl_script_rewrites_deprecated_unit(tmp_path, monkeypatch):
     assert not unit_re.fullmatch("simulate-agent@abc"), "non-numeric must be rejected"
 
 
+def test_ctl_script_runs_canonical_unit(tmp_path, monkeypatch):
+    """acceptance S2 gap: ctl script EXECUTES systemctl with the canonical name, not the old name.
+
+    Runs the actual installed shell script against a stub systemctl that records
+    its arguments. Asserts the argument is the canonical unit, not the deprecated one.
+    """
+    import subprocess as _subprocess
+
+    # Install the ctl script.
+    ctl_path = tmp_path / "logstash-agent-ctl"
+    monkeypatch.setitem(installer.INSTALL_PATHS, "systemctl_ctl", str(ctl_path))
+    installer.install_systemctl_ctl()
+
+    # Build a stub systemctl that records $2 (the unit argument) to a file.
+    stub_systemctl = tmp_path / "systemctl"
+    recorded = tmp_path / "recorded_unit.txt"
+    stub_systemctl.write_text(
+        f"#!/bin/sh\necho \"$2\" > {recorded}\nexit 0\n"
+    )
+    stub_systemctl.chmod(0o755)
+
+    # Point PATH at the stub so the script finds our systemctl first.
+    env = {
+        "PATH": f"{tmp_path}:{__import__('os').environ.get('PATH', '/usr/bin:/bin')}",
+    }
+
+    for old_unit, expected_canonical in (
+        ("ls-simulate@5", "simulate-logstash@5"),
+        ("lsagent-simulate@2", "simulate-agent@2"),
+        ("logstash-managed@3", "managed-logstash@3"),
+        ("logstash-agent@1", "managed-agent@1"),
+    ):
+        recorded.unlink(missing_ok=True)
+        result = _subprocess.run(
+            ["sh", str(ctl_path), "restart", old_unit],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert "DEPRECATED" in result.stderr, f"{old_unit}: expected DEPRECATED in stderr"
+        assert recorded.is_file(), f"{old_unit}: stub systemctl was not called"
+        called_with = recorded.read_text().strip()
+        assert called_with == expected_canonical, (
+            f"{old_unit}: expected systemctl called with {expected_canonical!r}, "
+            f"got {called_with!r}"
+        )
+
+
 def test_sudoers_content_has_no_arg_wildcards(tmp_path, monkeypatch):
     """Simulate configure_logstash sudoers body rules without writing /etc."""
     ctl = "/opt/logstash-agent/bin/logstash-agent-ctl"

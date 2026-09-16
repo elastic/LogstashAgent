@@ -362,3 +362,50 @@ def test_installed_templates_always_run_as_logstash(tmp_path, monkeypatch):
         assert "\nUser=logstash" in text, f"{name} missing User=logstash"
         assert "\nGroup=logstash" in text, f"{name} missing Group=logstash"
         assert "# User=logstash" not in text, f"{name} still has User= commented out"
+
+
+def test_resolve_multi_instance_units_packaged_passthrough():
+    """acceptance S1 gap: bare packaged logstash-agent is NEVER rewritten to managed-agent."""
+    # Explicit agent_unit passes through regardless of policy_type.
+    agent, ls = installer.resolve_multi_instance_units(
+        1, "MANAGED", agent_unit="logstash-agent", logstash_unit="logstash"
+    )
+    assert agent == "logstash-agent", f"expected logstash-agent, got {agent}"
+    assert ls == "logstash"
+
+
+def test_migrate_legacy_systemd_units_prints_rename(tmp_path, monkeypatch, capsys):
+    """acceptance A7: old template file or enabled old instance -> 'renamed' notice."""
+    sysdir = tmp_path / "systemd"
+    sysdir.mkdir()
+
+    # Plant an old template file to simulate a not-yet-upgraded host.
+    (sysdir / "ls-simulate@.service").write_text("[Unit]\n")
+    (sysdir / "logstash-agent@.service").write_text("[Unit]\n")
+
+    # Mock systemctl so list-units returns an enabled old instance.
+    def fake_run(cmd, **kwargs):
+        r = MagicMock()
+        r.returncode = 0
+        unit_filter = next((a for a in cmd if "@" in a), "")
+        if "lsagent-simulate@" in unit_filter:
+            r.stdout = "lsagent-simulate@3.service loaded active running ...\n"
+        elif "logstash-managed@" in unit_filter:
+            r.stdout = "logstash-managed@1.service loaded active running ...\n"
+        else:
+            r.stdout = ""
+        return r
+
+    monkeypatch.setattr(installer.subprocess, "run", fake_run)
+    monkeypatch.setattr(installer, "_systemctl_bin", lambda: "/usr/bin/systemctl")
+
+    installer.migrate_legacy_systemd_units(systemd_dir=str(sysdir))
+
+    out = capsys.readouterr().out
+    # Template file notices
+    assert "renamed" in out
+    assert "ls-simulate@" in out and "simulate-logstash@" in out
+    assert "logstash-agent@" in out and "managed-agent@" in out
+    # Enabled-instance notices from mocked systemctl
+    assert "lsagent-simulate@3" in out and "simulate-agent@3" in out
+    assert "logstash-managed@1" in out and "managed-logstash@1" in out
