@@ -90,8 +90,9 @@ def test_discover_instances_from_disk(tmp_path):
     ids = {f["id"] for f in found}
     assert ids == {"managed-1", "simulate-2"}
     m = next(f for f in found if f["id"] == "managed-1")
-    assert m["agent_unit"] == "logstash-agent@1"
-    assert m["logstash_unit"] == "logstash-managed@1"
+    # acceptance A2: discovery returns canonical names
+    assert m["agent_unit"] == "managed-agent@1"
+    assert m["logstash_unit"] == "managed-logstash@1"
 
 
 def test_remove_path_tree_safety(tmp_path):

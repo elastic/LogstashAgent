@@ -10,19 +10,78 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from logstashagent import installer
+from logstashagent import install_registry, installer
 
 
-def test_resolve_multi_instance_units_managed():
-    agent, ls = installer.resolve_multi_instance_units(2, 'MANAGED')
-    assert agent == 'logstash-agent@2'
-    assert ls == 'logstash-managed@2'
+def test_canonical_managed_and_simulate():
+    """acceptance A1: <nodetype>-<instance>@N for both multi-instance roles."""
+    assert installer.resolve_multi_instance_units(2, 'MANAGED') == (
+        'managed-agent@2',
+        'managed-logstash@2',
+    )
+    assert installer.resolve_multi_instance_units(3, 'SIMULATE') == (
+        'simulate-agent@3',
+        'simulate-logstash@3',
+    )
 
 
-def test_resolve_multi_instance_units_simulate():
-    agent, ls = installer.resolve_multi_instance_units(3, 'SIMULATE')
-    assert agent == 'lsagent-simulate@3'
-    assert ls == 'ls-simulate@3'
+def test_packaged_not_templated():
+    """acceptance A1: packaged units stay logstash-agent / logstash, never @-templated."""
+    assert installer.INSTALL_PATHS['systemd_service'].endswith('/logstash-agent.service')
+    assert '@' not in installer.INSTALL_PATHS['systemd_service']
+    # Bare logstash-agent (no @) is never rewritten to managed-agent.
+    agent, ls = installer.resolve_multi_instance_units(
+        1, 'MANAGED', agent_unit='logstash-agent', logstash_unit='logstash'
+    )
+    assert (agent, ls) == ('logstash-agent', 'logstash')
+    assert installer._is_logstash_unit('logstash')
+    assert not installer._is_logstash_unit('logstash-agent')
+
+
+def test_resolve_multi_instance_units_uses_new_names(tmp_path):
+    """acceptance A2: resolver and registry discovery agree on canonical names."""
+    for pt in ('MANAGED', 'SIMULATE'):
+        agent, ls = installer.resolve_multi_instance_units(4, pt)
+        for old in ('lsagent-simulate@', 'ls-simulate@', 'logstash-agent@', 'logstash-managed@'):
+            assert not agent.startswith(old), agent
+            assert not ls.startswith(old), ls
+    (tmp_path / 'managed-1').mkdir()
+    (tmp_path / 'simulate-2').mkdir()
+    found = {d['id']: d for d in install_registry.discover_instances_from_disk(str(tmp_path))}
+    assert (found['managed-1']['agent_unit'], found['managed-1']['logstash_unit']) == (
+        'managed-agent@1',
+        'managed-logstash@1',
+    )
+    assert (found['simulate-2']['agent_unit'], found['simulate-2']['logstash_unit']) == (
+        'simulate-agent@2',
+        'simulate-logstash@2',
+    )
+    assert found['managed-1']['agent_unit'] == installer.resolve_multi_instance_units(1, 'MANAGED')[0]
+    assert found['simulate-2']['agent_unit'] == installer.resolve_multi_instance_units(2, 'SIMULATE')[0]
+
+
+@pytest.mark.parametrize(
+    'unit,expected',
+    [
+        ('logstash', True),
+        ('logstash.service', True),
+        ('simulate-logstash@3', True),
+        ('managed-logstash@1', True),
+        ('managed-logstash@1.service', True),
+        ('ls-simulate@3', True),
+        ('logstash-managed@1', True),
+        ('logstash-agent', False),
+        ('logstash-agent.service', False),
+        ('simulate-agent@3', False),
+        ('managed-agent@1', False),
+        ('logstash-agent@1', False),
+        ('lsagent-simulate@3', False),
+        ('', False),
+    ],
+)
+def test_is_logstash_unit_prefixes(unit, expected):
+    """acceptance A8: Logstash units vs agent units, new and old names."""
+    assert installer._is_logstash_unit(unit) is expected
 
 
 def test_resolve_multi_instance_units_honors_explicit():

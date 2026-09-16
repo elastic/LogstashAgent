@@ -46,7 +46,7 @@ def _systemctl_side_effect(cmd, **kwargs):
         r.stdout = "enabled\n"
     elif action == "is-active":
         # Logstash unit is enable-only (not started)
-        if unit.startswith("ls-simulate") or unit.startswith("logstash-managed"):
+        if installer._is_logstash_unit(unit):
             r.returncode = 3
             r.stdout = "inactive\n"
         else:
@@ -58,12 +58,13 @@ def test_enable_simulate_services_starts_agent_not_logstash():
     with patch.object(installer.subprocess, "run", side_effect=_systemctl_side_effect) as run:
         status = installer.enable_simulate_services(3)
     args_list = [tuple(c.args[0]) for c in run.call_args_list]
-    assert ("systemctl", "enable", "ls-simulate@3") in args_list
+    # acceptance A2: install path uses canonical simulate-* names
+    assert ("systemctl", "enable", "simulate-logstash@3") in args_list
     joined = [" ".join(a) for a in args_list]
-    assert any("lsagent-simulate@3" in j and ("--now" in j or "start" in j) for j in joined)
-    # Must not start ls-simulate@3 at install
-    assert ("systemctl", "start", "ls-simulate@3") not in args_list
-    assert not any(j == "systemctl enable --now ls-simulate@3" for j in joined)
+    assert any("simulate-agent@3" in j and ("--now" in j or "start" in j) for j in joined)
+    # Must not start simulate-logstash@3 at install
+    assert ("systemctl", "start", "simulate-logstash@3") not in args_list
+    assert not any(j == "systemctl enable --now simulate-logstash@3" for j in joined)
     assert status["agent_enabled"] is True
     assert status["agent_active"] is True
     assert status["ls_enabled"] is True

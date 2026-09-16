@@ -850,7 +850,9 @@ def _is_logstash_unit(unit: str) -> bool:
         name = name[: -len('.service')]
     if name == 'logstash':
         return True
-    return name.startswith('ls-simulate@') or name.startswith('logstash-managed@')
+    return name.startswith(
+        ('simulate-logstash@', 'managed-logstash@', 'ls-simulate@', 'logstash-managed@')
+    )
 
 
 def _restart_running_agent_units() -> None:
@@ -1405,16 +1407,18 @@ def materialize_simulate_instance(policy_config: dict) -> dict:
         agent_port = policy_config.get('agent_api_port', 9600 + instance_id)
         ls_port = policy_config.get('logstash_api_port', 9700 + instance_id)
         agent_mode = 'managed'
-        agent_unit = policy_config.get('agent_unit') or f'logstash-agent@{instance_id}'
-        logstash_unit = policy_config.get('logstash_unit') or f'logstash-managed@{instance_id}'
     else:
         agent_port = policy_config.get('agent_api_port', 9500 + instance_id)
         ls_port = policy_config.get('logstash_api_port', 9560 + instance_id)
         agent_mode = 'simulate'
-        agent_unit = policy_config.get('agent_unit') or f'lsagent-simulate@{instance_id}'
-        logstash_unit = policy_config.get('logstash_unit') or f'ls-simulate@{instance_id}'
+    agent_unit, logstash_unit = resolve_multi_instance_units(
+        instance_id,
+        pt,
+        agent_unit=policy_config.get('agent_unit'),
+        logstash_unit=policy_config.get('logstash_unit'),
+    )
 
-    # EnvironmentFile for logstash-managed@N / ls-simulate@N
+    # EnvironmentFile for managed-logstash@N / simulate-logstash@N
     # Only path.settings (+ logs/data) are passed to Logstash. Pipeline conf
     # locations are exclusively in settings/pipelines.yml.
     # LOGSTASH_URL: base for simulate_start/end StreamSimulate HTTP outputs
@@ -1661,8 +1665,11 @@ def resolve_multi_instance_units(
     """
     Resolve agent + Logstash systemd unit names for a multi-instance role.
 
-    Managed:  logstash-agent@N + logstash-managed@N
-    Simulate: lsagent-simulate@N + ls-simulate@N
+    Managed:  managed-agent@N + managed-logstash@N
+    Simulate: simulate-agent@N + simulate-logstash@N
+
+    Explicit ``agent_unit`` / ``logstash_unit`` pass through untouched, so a
+    bare packaged ``logstash-agent`` is never rewritten.
     """
     pt = (policy_type or 'SIMULATE').upper()
     if pt == 'DEFAULT':
@@ -1671,12 +1678,12 @@ def resolve_multi_instance_units(
         return agent_unit, logstash_unit
     if pt == 'MANAGED':
         return (
-            agent_unit or f'logstash-agent@{instance_id}',
-            logstash_unit or f'logstash-managed@{instance_id}',
+            agent_unit or f'managed-agent@{instance_id}',
+            logstash_unit or f'managed-logstash@{instance_id}',
         )
     return (
-        agent_unit or f'lsagent-simulate@{instance_id}',
-        logstash_unit or f'ls-simulate@{instance_id}',
+        agent_unit or f'simulate-agent@{instance_id}',
+        logstash_unit or f'simulate-logstash@{instance_id}',
     )
 
 

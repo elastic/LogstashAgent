@@ -282,13 +282,13 @@ def discover_instances_from_disk(
         n = int(n_s)
         path_root = str(root / name)
         if role == "managed":
-            agent_unit = f"logstash-agent@{n}"
-            logstash_unit = f"logstash-managed@{n}"
+            agent_unit = f"managed-agent@{n}"
+            logstash_unit = f"managed-logstash@{n}"
             agent_port = 9600 + n
             ls_port = 9700 + n
         else:
-            agent_unit = f"lsagent-simulate@{n}"
-            logstash_unit = f"ls-simulate@{n}"
+            agent_unit = f"simulate-agent@{n}"
+            logstash_unit = f"simulate-logstash@{n}"
             agent_port = 9500 + n
             ls_port = 9560 + n
         found.append(
