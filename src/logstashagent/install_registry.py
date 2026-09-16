@@ -233,6 +233,28 @@ def unregister_instance(key: str, state_dir: Optional[str] = None) -> bool:
     return True
 
 
+_OLD_INSTANCE_RE = re.compile(
+    r'^(lsagent-simulate|ls-simulate|logstash-agent|logstash-managed)@(\d+)$'
+)
+
+
+def _rewrite_legacy_unit(unit: str) -> str:
+    """Return the canonical unit name for *unit*, or *unit* unchanged.
+
+    Bare ``logstash-agent`` (no ``@``) is never rewritten.
+    """
+    if not isinstance(unit, str) or '@' not in unit:
+        return unit
+    if not _OLD_INSTANCE_RE.match(unit):
+        return unit
+    try:
+        from logstashagent.installer import _canonical_for_old_instance
+        canonical = _canonical_for_old_instance(unit)
+        return canonical if canonical is not None else unit
+    except Exception:
+        return unit
+
+
 def list_instances(
     state_dir: Optional[str] = None,
     *,
@@ -241,9 +263,28 @@ def list_instances(
     """
     Return instance entries, optionally merging filesystem discovery for
     managed-/simulate- trees not yet in the registry.
+
+    Stale legacy unit names in stored entries are rewritten to canonical
+    names and persisted so subsequent reads see the correct names.
     """
     reg = load_registry(state_dir)
-    instances = dict(reg.get("instances") or {})
+    raw_instances: dict[str, Any] = dict(reg.get("instances") or {})
+
+    # Rewrite any stale legacy unit names in registered entries.
+    dirty = False
+    for entry in raw_instances.values():
+        for field in ("agent_unit", "logstash_unit"):
+            old = entry.get(field, "")
+            new = _rewrite_legacy_unit(old)
+            if new != old:
+                entry[field] = new
+                dirty = True
+
+    if dirty:
+        reg["instances"] = raw_instances
+        save_registry(reg, state_dir)
+
+    instances = dict(raw_instances)
     if include_discovered:
         for disc in discover_instances_from_disk():
             if disc["id"] not in instances:

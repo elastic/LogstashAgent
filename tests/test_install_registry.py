@@ -201,3 +201,107 @@ def test_perform_uninstall_instance_keep_data(reg_dir, monkeypatch, tmp_path):
     assert "simulate-agent@3" in stopped
     assert "simulate-3" not in reg.load_registry(str(reg_dir))["instances"]
     assert tree.exists()
+
+
+# ---------- S1 upgrade tests ----------
+
+def _write_legacy_registry(state_dir: Path, instance_id: int = 2) -> None:
+    """Write a registry JSON with old-style unit names (pre-rename)."""
+    import json
+    reg_file = state_dir / "install-registry.json"
+    reg_file.write_text(json.dumps({
+        "package": {},
+        "instances": {
+            f"managed-{instance_id}": {
+                "id": f"managed-{instance_id}",
+                "role": "managed",
+                "instance_id": instance_id,
+                "agent_unit": f"logstash-agent@{instance_id}",
+                "logstash_unit": f"logstash-managed@{instance_id}",
+            },
+            f"simulate-{instance_id}": {
+                "id": f"simulate-{instance_id}",
+                "role": "simulate",
+                "instance_id": instance_id,
+                "agent_unit": f"lsagent-simulate@{instance_id}",
+                "logstash_unit": f"ls-simulate@{instance_id}",
+            },
+        },
+    }))
+
+
+def test_list_instances_rewrites_legacy_unit_names(tmp_path):
+    """acceptance A1: list_instances() returns canonical names from stale registry."""
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    _write_legacy_registry(state_dir, instance_id=2)
+
+    with patch("logstashagent.install_registry.discover_instances_from_disk", return_value=[]):
+        instances = reg.list_instances(str(state_dir), include_discovered=False)
+
+    by_id = {e["id"]: e for e in instances}
+    assert by_id["managed-2"]["agent_unit"] == "managed-agent@2", by_id["managed-2"]
+    assert by_id["managed-2"]["logstash_unit"] == "managed-logstash@2", by_id["managed-2"]
+    assert by_id["simulate-2"]["agent_unit"] == "simulate-agent@2", by_id["simulate-2"]
+    assert by_id["simulate-2"]["logstash_unit"] == "simulate-logstash@2", by_id["simulate-2"]
+
+
+def test_registry_persists_canonical_unit_names(tmp_path):
+    """acceptance A2: canonical names written back to JSON after rewrite."""
+    import json
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    _write_legacy_registry(state_dir, instance_id=3)
+
+    with patch("logstashagent.install_registry.discover_instances_from_disk", return_value=[]):
+        reg.list_instances(str(state_dir), include_discovered=False)
+
+    data = json.loads((state_dir / "install-registry.json").read_text())
+    assert data["instances"]["managed-3"]["agent_unit"] == "managed-agent@3"
+    assert data["instances"]["managed-3"]["logstash_unit"] == "managed-logstash@3"
+    assert data["instances"]["simulate-3"]["agent_unit"] == "simulate-agent@3"
+    assert data["instances"]["simulate-3"]["logstash_unit"] == "simulate-logstash@3"
+
+
+def test_migrate_canonical_registry_noop(tmp_path):
+    """acceptance A5: already-canonical entries are left untouched (idempotent)."""
+    import json
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    # Write canonical registry from the start.
+    reg_file = state_dir / "install-registry.json"
+    reg_file.write_text(json.dumps({
+        "package": {},
+        "instances": {
+            "managed-1": {
+                "id": "managed-1",
+                "role": "managed",
+                "instance_id": 1,
+                "agent_unit": "managed-agent@1",
+                "logstash_unit": "managed-logstash@1",
+            },
+        },
+    }))
+
+    with patch("logstashagent.install_registry.discover_instances_from_disk", return_value=[]):
+        instances1 = reg.list_instances(str(state_dir), include_discovered=False)
+        instances2 = reg.list_instances(str(state_dir), include_discovered=False)
+
+    assert instances1[0]["agent_unit"] == "managed-agent@1"
+    assert instances2[0]["agent_unit"] == "managed-agent@1"
+
+    # Bare logstash-agent (no @) must not be rewritten.
+    reg_file.write_text(json.dumps({
+        "package": {},
+        "instances": {
+            "packaged": {
+                "id": "packaged",
+                "role": "packaged",
+                "agent_unit": "logstash-agent",
+                "logstash_unit": "logstash",
+            },
+        },
+    }))
+    with patch("logstashagent.install_registry.discover_instances_from_disk", return_value=[]):
+        packed = reg.list_instances(str(state_dir), include_discovered=False)
+    assert packed[0]["agent_unit"] == "logstash-agent", "bare packaged unit was rewritten"
