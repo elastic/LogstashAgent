@@ -3493,7 +3493,7 @@ def run_controller():
                 "  sudo logstash-agent install --enroll <TOKEN> --logstash-ui-url <URL>"
             )
             hint_unit = state.get('agent_unit') or (
-                f"lsagent-simulate@{state.get('instance_id')}"
+                f"simulate-agent@{state.get('instance_id')}"
                 if state.get('instance_id') is not None
                 else "logstash-agent"
             )

@@ -251,7 +251,8 @@ def _rewrite_legacy_unit(unit: str) -> str:
         from logstashagent.installer import _canonical_for_old_instance
         canonical = _canonical_for_old_instance(unit)
         return canonical if canonical is not None else unit
-    except Exception:
+    except Exception as exc:
+        logger.warning("_rewrite_legacy_unit: mapping/import failed for %r: %s", unit, exc)
         return unit
 
 
@@ -287,8 +288,8 @@ def list_instances(
         try:
             from logstashagent.installer import migrate_legacy_systemd_units
             migrate_legacy_systemd_units(state_dir=state_dir)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("list_instances: migrate_legacy_systemd_units failed: %s", exc)
 
     instances = dict(raw_instances)
     if include_discovered:

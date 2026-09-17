@@ -365,9 +365,13 @@ def save_enrollment_config(api_key: str, logstash_ui_url: str, policy_id: int, c
         if policy_config.get('keystore_env_file') is not None:
             agent_state.update_state('keystore_env_file', policy_config.get('keystore_env_file'))
         if policy_config.get('logstash_unit'):
-            agent_state.update_state('logstash_unit', policy_config.get('logstash_unit'))
+            from logstashagent.installer import _canonical_for_old_instance
+            _lu = policy_config.get('logstash_unit') or ''
+            agent_state.update_state('logstash_unit', _canonical_for_old_instance(_lu) or _lu)
         if policy_config.get('agent_unit'):
-            agent_state.update_state('agent_unit', policy_config.get('agent_unit'))
+            from logstashagent.installer import _canonical_for_old_instance
+            _au = policy_config.get('agent_unit') or ''
+            agent_state.update_state('agent_unit', _canonical_for_old_instance(_au) or _au)
         if policy_config.get('path_root'):
             agent_state.update_state('path_root', policy_config.get('path_root'))
         if policy_config.get('logstash_source'):
@@ -465,9 +469,11 @@ def perform_enrollment(encoded_token: str, logstash_ui_url: str, agent_id: str):
             if setup_result and setup_result.get('status') == 'complete':
                 iid = policy_config.get('instance_id')
                 if _pt == 'MANAGED':
-                    unit = policy_config.get('agent_unit') or f"logstash-agent@{iid}"
+                    _raw_unit = policy_config.get('agent_unit') or f"managed-agent@{iid}"
                 else:
-                    unit = policy_config.get('agent_unit') or f"lsagent-simulate@{iid}"
+                    _raw_unit = policy_config.get('agent_unit') or f"simulate-agent@{iid}"
+                from logstashagent.installer import _canonical_for_old_instance
+                unit = _canonical_for_old_instance(_raw_unit) or _raw_unit
                 logger.info(f"Setup complete. Start with: sudo systemctl start {unit}")
             else:
                 logger.warning("=" * 60)

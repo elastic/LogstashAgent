@@ -576,3 +576,18 @@ def test_enable_multi_instance_services_enables_canonical_not_alias():
     for old in ("logstash-agent@2", "logstash-agent@2.service",
                 "logstash-managed@2", "logstash-managed@2.service"):
         assert old not in enabled_units, f"old alias {old!r} appeared in enable calls: {enabled}"
+
+
+def test_controller_unenrolled_hint_canonical():
+    """acceptance A3d: controller unenrolled restart hint uses canonical simulate unit."""
+    src = open('/Users/buh/WORK/LogstashAgent/src/logstashagent/controller.py').read()
+    # The canonical simulate unit string must appear in the source.
+    assert 'simulate-agent@' in src, "simulate-agent@ not found in controller.py"
+    # Old lsagent-simulate@ must NOT appear in the hint f-string.
+    assert 'lsagent-simulate@' not in src, (
+        "old lsagent-simulate@ still present in controller.py"
+    )
+    # Bare logstash-agent (no @) must still appear for packaged mode fallback.
+    assert '"logstash-agent"' in src or "'logstash-agent'" in src, (
+        "bare logstash-agent fallback not found in controller.py"
+    )

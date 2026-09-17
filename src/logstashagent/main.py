@@ -3592,7 +3592,7 @@ Examples:
         type=int,
         metavar='N',
         default=None,
-        help='Instance number N for --mode managed|simulate (logstash-agent@N / lsagent-simulate@N)',
+        help='Instance number N for --mode managed|simulate (managed-agent@N / simulate-agent@N)',
     )
 
     parser.add_argument(
@@ -3997,13 +3997,13 @@ if __name__ == "__main__":
         cli_mode = (getattr(args, 'mode', None) or agent_state.get_state().get('mode') or '').lower()
         if not agent_state.get_state().get('logstash_unit'):
             if cli_mode == 'managed':
-                agent_state.update_state('logstash_unit', f'logstash-managed@{args.instance}')
+                agent_state.update_state('logstash_unit', f'managed-logstash@{args.instance}')
                 if not agent_state.get_state().get('agent_unit'):
-                    agent_state.update_state('agent_unit', f'logstash-agent@{args.instance}')
+                    agent_state.update_state('agent_unit', f'managed-agent@{args.instance}')
             else:
-                agent_state.update_state('logstash_unit', f'ls-simulate@{args.instance}')
+                agent_state.update_state('logstash_unit', f'simulate-logstash@{args.instance}')
                 if not agent_state.get_state().get('agent_unit'):
-                    agent_state.update_state('agent_unit', f'lsagent-simulate@{args.instance}')
+                    agent_state.update_state('agent_unit', f'simulate-agent@{args.instance}')
         if not agent_state.get_state().get('agent_api_port'):
             base = 9600 if cli_mode == 'managed' else 9500
             agent_state.update_state('agent_api_port', base + int(args.instance))

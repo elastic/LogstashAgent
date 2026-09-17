@@ -412,3 +412,68 @@ def test_list_instances_invokes_unit_migrate(tmp_path, monkeypatch):
         reg.list_instances(str(state_dir), include_discovered=False)
 
     assert not migrate_calls, "list_instances called migrate unnecessarily on already-canonical entries"
+
+
+def test_rewrite_legacy_unit_logs_on_raise(caplog):
+    """acceptance A4/D1: _rewrite_legacy_unit logs a warning when mapping/import fails."""
+    import logging
+    import importlib
+
+    # Temporarily remove _canonical_for_old_instance from the installer namespace
+    # to trigger the import path's exception branch.
+    from logstashagent import install_registry
+    from logstashagent import installer
+
+    original = installer._canonical_for_old_instance
+
+    def boom(unit):
+        raise RuntimeError("simulated import failure")
+
+    installer._canonical_for_old_instance = boom
+    try:
+        with caplog.at_level(logging.WARNING, logger="logstashagent.install_registry"):
+            result = install_registry._rewrite_legacy_unit("logstash-managed@1")
+        # Should return original unit unchanged, not raise.
+        assert result == "logstash-managed@1"
+        # And must have logged a warning.
+        assert any("_rewrite_legacy_unit" in r.message for r in caplog.records), caplog.records
+    finally:
+        installer._canonical_for_old_instance = original
+
+
+def test_list_instances_migrate_failure_is_logged(tmp_path, caplog, monkeypatch):
+    """acceptance A4/D2: list_instances logs (not silently ignores) migrate failure."""
+    import json, logging
+    from logstashagent import install_registry as reg_mod
+    from logstashagent import installer
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    # Write stale registry to trigger dirty path.
+    (state_dir / "install-registry.json").write_text(json.dumps({
+        "package": {},
+        "instances": {
+            "managed-1": {
+                "id": "managed-1",
+                "role": "managed",
+                "instance_id": 1,
+                "agent_unit": "logstash-agent@1",
+                "logstash_unit": "logstash-managed@1",
+            },
+        },
+    }))
+
+    # Make migrate_legacy_systemd_units raise.
+    def bad_migrate(**kw):
+        raise RuntimeError("migrate exploded")
+
+    monkeypatch.setattr(installer, "migrate_legacy_systemd_units", bad_migrate)
+
+    with patch("logstashagent.install_registry.discover_instances_from_disk", return_value=[]):
+        with caplog.at_level(logging.WARNING, logger="logstashagent.install_registry"):
+            result = reg_mod.list_instances(str(state_dir), include_discovered=False)
+
+    # The call must not raise; registry rewrite still applied.
+    assert result[0]["agent_unit"] == "managed-agent@1"
+    # And must have logged a warning about the migrate failure.
+    assert any("migrate" in r.message.lower() for r in caplog.records), caplog.records
