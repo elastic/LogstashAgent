@@ -85,14 +85,42 @@ def test_is_logstash_unit_prefixes(unit, expected):
 
 
 def test_resolve_multi_instance_units_honors_explicit():
+    # A1: explicit old @N names are rewritten to canonical.
     agent, ls = installer.resolve_multi_instance_units(
         1,
         'MANAGED',
         agent_unit='logstash-agent@9',
         logstash_unit='logstash-managed@9',
     )
-    assert agent == 'logstash-agent@9'
-    assert ls == 'logstash-managed@9'
+    assert agent == 'managed-agent@9'
+    assert ls == 'managed-logstash@9'
+
+
+def test_resolve_rewrites_legacy_at_names_not_packaged():
+    """acceptance A1: old @N names rewritten; bare logstash-agent passthrough."""
+    # Managed old pair.
+    agent, ls = installer.resolve_multi_instance_units(
+        2, "MANAGED",
+        agent_unit="logstash-agent@2", logstash_unit="logstash-managed@2"
+    )
+    assert agent == "managed-agent@2", agent
+    assert ls == "managed-logstash@2", ls
+
+    # Simulate old pair.
+    agent, ls = installer.resolve_multi_instance_units(
+        2, "SIMULATE",
+        agent_unit="lsagent-simulate@2", logstash_unit="ls-simulate@2"
+    )
+    assert agent == "simulate-agent@2", agent
+    assert ls == "simulate-logstash@2", ls
+
+    # Bare packaged name (no @) must NOT be rewritten.
+    agent, ls = installer.resolve_multi_instance_units(
+        1, "MANAGED",
+        agent_unit="logstash-agent", logstash_unit="logstash"
+    )
+    assert agent == "logstash-agent", f"bare packaged agent rewritten to {agent}"
+    assert ls == "logstash", ls
 
 
 def test_materialize_managed_tree(tmp_path, monkeypatch):
@@ -511,3 +539,40 @@ def test_migrate_legacy_systemd_units_prints_rename(tmp_path, monkeypatch, capsy
     # Enabled-instance path: full canonical line
     assert any(ln == "renamed: lsagent-simulate@3 → simulate-agent@3" for ln in out.splitlines())
     assert any(ln == "renamed: logstash-managed@1 → managed-logstash@1" for ln in out.splitlines())
+
+
+def test_enable_multi_instance_services_enables_canonical_not_alias():
+    """acceptance A2: enable_multi_instance_services uses canonical units, not Alias names."""
+    from unittest.mock import MagicMock
+
+    calls = []
+
+    def fake_systemctl_cmd(*args, check=False):
+        calls.append(list(args))
+        r = MagicMock()
+        r.returncode = 0
+        r.stdout = "enabled\n"
+        r.stderr = ""
+        return r
+
+    with patch.object(installer, "_systemctl_cmd", side_effect=fake_systemctl_cmd):
+        installer.enable_multi_instance_services(
+            2,
+            agent_unit="logstash-agent@2",
+            logstash_unit="logstash-managed@2",
+            policy_type="MANAGED",
+        )
+
+    enabled = [args for args in calls if args and args[0] == "enable"]
+    enabled_units = [args[-1] for args in enabled]
+
+    # Canonical units must appear in enable calls.
+    assert any(u == "managed-logstash@2" or u == "managed-logstash@2.service"
+               for u in enabled_units), f"managed-logstash@2 not enabled; enable calls: {enabled}"
+    assert any(u in ("managed-agent@2", "managed-agent@2.service")
+               for u in enabled_units), f"managed-agent@2 not enabled; enable calls: {enabled}"
+
+    # Old Alias names must NOT appear in enable calls.
+    for old in ("logstash-agent@2", "logstash-agent@2.service",
+                "logstash-managed@2", "logstash-managed@2.service"):
+        assert old not in enabled_units, f"old alias {old!r} appeared in enable calls: {enabled}"

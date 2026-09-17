@@ -1820,6 +1820,9 @@ def resolve_multi_instance_units(
     if pt == 'DEFAULT':
         pt = 'PACKAGED'
     if agent_unit and logstash_unit:
+        # Rewrite old @N names to canonical — bare packaged names (no @) pass through.
+        agent_unit = _canonical_for_old_instance(agent_unit) or agent_unit
+        logstash_unit = _canonical_for_old_instance(logstash_unit) or logstash_unit
         return agent_unit, logstash_unit
     if pt == 'MANAGED':
         return (
