@@ -654,7 +654,7 @@ def create_directories():
     logger.info(f"✓ Created {INSTALL_PATHS['cache_dir']} (owned by {owner})")
 
 
-_VERSION_TOKEN_RE = re.compile(r'(\d+\.\d+(?:\.\d+)*)')
+_VERSION_TOKEN_RE = re.compile(r'(\d+\.\d+(?:\.\d+)*)(?:\.dev\d+|[.-]dev\d+)?')
 
 
 def compare_agent_versions(a: str, b: str) -> int:
