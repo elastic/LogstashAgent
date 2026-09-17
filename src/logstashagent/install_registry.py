@@ -251,7 +251,7 @@ def _rewrite_legacy_unit(unit: str) -> str:
         from logstashagent.installer import _canonical_for_old_instance
         canonical = _canonical_for_old_instance(unit)
         return canonical if canonical is not None else unit
-    except Exception as exc:
+    except ImportError as exc:
         logger.warning("_rewrite_legacy_unit: mapping/import failed for %r: %s", unit, exc)
         return unit
 

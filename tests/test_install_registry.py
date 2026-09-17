@@ -414,38 +414,45 @@ def test_list_instances_invokes_unit_migrate(tmp_path, monkeypatch):
     assert not migrate_calls, "list_instances called migrate unnecessarily on already-canonical entries"
 
 
-def test_rewrite_legacy_unit_logs_on_raise(caplog):
-    """acceptance A4/D1: _rewrite_legacy_unit logs a warning when mapping/import fails."""
-    import logging
-    import importlib
-
-    # Temporarily remove _canonical_for_old_instance from the installer namespace
-    # to trigger the import path's exception branch.
+def test_rewrite_legacy_unit_logs_on_import_error(caplog, monkeypatch):
+    """acceptance A1/A4/D1: ImportError from import is caught, logged, returns unchanged."""
+    import types, sys, logging
     from logstashagent import install_registry
-    from logstashagent import installer
 
-    original = installer._canonical_for_old_instance
+    # Replace installer in sys.modules with a stub that lacks _canonical_for_old_instance.
+    # 'from logstashagent.installer import _canonical_for_old_instance' then raises ImportError.
+    dummy = types.ModuleType("logstashagent.installer")
+    monkeypatch.setitem(sys.modules, "logstashagent.installer", dummy)
+
+    with caplog.at_level(logging.WARNING, logger="logstashagent.install_registry"):
+        result = install_registry._rewrite_legacy_unit("logstash-managed@1")
+
+    assert result == "logstash-managed@1"
+    assert any("_rewrite_legacy_unit" in r.message for r in caplog.records), caplog.records
+
+
+def test_rewrite_legacy_unit_propagates_non_import_error(monkeypatch):
+    """acceptance A1: non-ImportError from mapping call propagates (not swallowed)."""
+    import types, sys, pytest
+    from logstashagent import install_registry
 
     def boom(unit):
-        raise RuntimeError("simulated import failure")
+        raise RuntimeError("mapping logic error")
 
-    installer._canonical_for_old_instance = boom
-    try:
-        with caplog.at_level(logging.WARNING, logger="logstashagent.install_registry"):
-            result = install_registry._rewrite_legacy_unit("logstash-managed@1")
-        # Should return original unit unchanged, not raise.
-        assert result == "logstash-managed@1"
-        # And must have logged a warning.
-        assert any("_rewrite_legacy_unit" in r.message for r in caplog.records), caplog.records
-    finally:
-        installer._canonical_for_old_instance = original
+    # Replace installer with a stub whose mapping function raises RuntimeError.
+    # The except ImportError clause must NOT catch this.
+    dummy = types.ModuleType("logstashagent.installer")
+    dummy._canonical_for_old_instance = boom
+    monkeypatch.setitem(sys.modules, "logstashagent.installer", dummy)
+
+    with pytest.raises(RuntimeError, match="mapping logic error"):
+        install_registry._rewrite_legacy_unit("logstash-managed@1")
 
 
 def test_list_instances_migrate_failure_is_logged(tmp_path, caplog, monkeypatch):
     """acceptance A4/D2: list_instances logs (not silently ignores) migrate failure."""
     import json, logging
     from logstashagent import install_registry as reg_mod
-    from logstashagent import installer
 
     state_dir = tmp_path / "state"
     state_dir.mkdir()
@@ -463,13 +470,12 @@ def test_list_instances_migrate_failure_is_logged(tmp_path, caplog, monkeypatch)
         },
     }))
 
-    # Make migrate_legacy_systemd_units raise.
     def bad_migrate(**kw):
         raise RuntimeError("migrate exploded")
 
-    monkeypatch.setattr(installer, "migrate_legacy_systemd_units", bad_migrate)
-
-    with patch("logstashagent.install_registry.discover_instances_from_disk", return_value=[]):
+    # Patch the name inside install_registry's import namespace.
+    with patch("logstashagent.install_registry.discover_instances_from_disk", return_value=[]), \
+         patch("logstashagent.installer.migrate_legacy_systemd_units", side_effect=bad_migrate):
         with caplog.at_level(logging.WARNING, logger="logstashagent.install_registry"):
             result = reg_mod.list_instances(str(state_dir), include_discovered=False)
 

@@ -297,7 +297,6 @@ def test_old_template_filenames_removed():
 
 def test_spec_bundles_new_units():
     """acceptance A3/A5: logstash-agent.spec bundles new names, not old."""
-    import ast
     spec_path = installer._systemd_template_dir().parents[2] / "logstash-agent.spec"
     if not spec_path.is_file():
         import pytest
