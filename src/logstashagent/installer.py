@@ -1210,14 +1210,60 @@ _MULTI_INSTANCE_UNIT_TEMPLATES = (
 )
 
 
+# Alias= lines are keyed to the four old instance names (A9 source of truth in
+# the repo templates). The host copy keeps or drops them per call.
+_ALIAS_OLD_NAME_MARKERS: tuple[str, ...] = (
+    'lsagent-simulate@',
+    'ls-simulate@',
+    'logstash-agent@',
+    'logstash-managed@',
+)
+
+
+def _unit_dest_dir() -> str:
+    """The directory the multi-instance host copies are written into.
+
+    Derived from INSTALL_PATHS so a test that redirects the destinations also
+    redirects the artifact gate — otherwise the gate would always stat the real
+    /etc/systemd/system even under monkeypatch.
+    """
+    first_key = _MULTI_INSTANCE_UNIT_TEMPLATES[0][1]
+    return os.path.dirname(INSTALL_PATHS[first_key]) or '/etc/systemd/system'
+
+
+def _strip_old_name_aliases(content: str) -> str:
+    """Drop `Alias=<old-name>@%i.service` lines from a unit file body (A9a).
+
+    Only the four legacy alias lines are removed; every other directive (including
+    any unrelated Alias=) is preserved verbatim.
+    """
+    kept = []
+    for line in content.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith('Alias=') and any(
+            marker in stripped for marker in _ALIAS_OLD_NAME_MARKERS
+        ):
+            continue
+        kept.append(line)
+    return ''.join(kept)
+
+
 def _write_multi_instance_unit_templates(
-    *, reload: bool = True, dest_dir: str | None = None
+    *,
+    reload: bool = True,
+    dest_dir: str | None = None,
+    alias: bool | None = None,
 ) -> None:
     """
     Write the four canonical template files to their host destinations.
 
     No migrate hook — this is the writer seam migrate() calls so the
     install → migrate → install cycle cannot re-enter.
+
+    The ``Alias=`` lines for the four OLD instance names are included or omitted
+    on the HOST COPY according to legacy-artifact presence, per call, regardless
+    of which command invoked the writer (A9). The repo templates always keep
+    them; only the host copy varies.
 
     Args:
         reload: run daemon-reload after writing. The public install path
@@ -1227,7 +1273,15 @@ def _write_multi_instance_unit_templates(
             destinations. migrate() passes its (possibly test-overridden)
             systemd directory so the unlink and the rewrite target the same
             tree.
+        alias: include the old-name ``Alias=`` lines. None (the default) means
+            evaluate the legacy-artifact gate now — the caller that has already
+            taken a snapshot (migrate, which unlinks before it installs) passes
+            the snapshot explicitly rather than letting a re-stat after the
+            unlink report a clean host.
     """
+    if alias is None:
+        alias = has_legacy_systemd_artifact(systemd_dir=dest_dir or _unit_dest_dir())
+
     for template_name, dest_key in _MULTI_INSTANCE_UNIT_TEMPLATES:
         # Templates ship with User=/Group=logstash already set; the account is
         # guaranteed by ensure_logstash_user() before we get here, so there is
@@ -1235,13 +1289,15 @@ def _write_multi_instance_unit_templates(
         # uncommented only if the account happened to resolve, which meant
         # Logstash silently ran as root on hosts without the DEB/RPM.
         content = _read_unit_template(template_name)
+        if not alias:
+            content = _strip_old_name_aliases(content)
         dest = (
             os.path.join(dest_dir, template_name) if dest_dir else INSTALL_PATHS[dest_key]
         )
         with open(dest, 'w') as f:
             f.write(content)
         os.chmod(dest, 0o644)
-        logger.info(f"✓ Installed {dest}")
+        logger.info(f"✓ Installed {dest} (Alias= {'included' if alias else 'omitted'})")
 
     if not reload:
         return
@@ -1252,22 +1308,42 @@ def _write_multi_instance_unit_templates(
         logger.warning(f"daemon-reload failed (non-fatal): {e}")
 
 
-def install_multi_instance_unit_templates() -> None:
+# Guards install_multi_instance_unit_templates → migrate (recursion edge 2).
+# migrate() installs templates through the private writer seam, so this edge is
+# already non-recursive in practice; the flag keeps any future re-entry (or a
+# caller that installs from inside a migration) from looping. Edge 1
+# (_MIGRATE_REENTRY) is the migrate → list_instances → migrate guard.
+_TEMPLATE_INSTALL_REENTRY = threading.local()
+
+
+def install_multi_instance_unit_templates(*, alias: bool | None = None) -> None:
     """
     Install all multi-instance systemd unit templates (simulate + managed).
 
     Safe to call on every multi-instance install; overwrites templates in place,
     runs daemon-reload once, then runs the legacy-name migrate hook.
-    """
-    logger.info("Installing multi-instance systemd unit templates...")
-    _write_multi_instance_unit_templates(reload=True)
 
-    # Upgrade hook: enable canonical units for any registered instances that
-    # still have stale legacy unit names in the registry.
+    Args:
+        alias: include the old-name ``Alias=`` lines on the host copies. None
+            evaluates the legacy-artifact gate — the host, not the command,
+            decides (A9).
+    """
+    if getattr(_TEMPLATE_INSTALL_REENTRY, 'active', False):
+        logger.debug("install_multi_instance_unit_templates: re-entry suppressed (edge 2)")
+        return
+    _TEMPLATE_INSTALL_REENTRY.active = True
     try:
-        migrate_legacy_systemd_units()
-    except Exception as e:
-        logger.warning("migrate_legacy_systemd_units failed (non-fatal): %s", e)
+        logger.info("Installing multi-instance systemd unit templates...")
+        _write_multi_instance_unit_templates(reload=True, alias=alias)
+
+        # Upgrade hook: enable canonical units for any registered instances that
+        # still have stale legacy unit names in the registry.
+        try:
+            migrate_legacy_systemd_units()
+        except Exception as e:
+            logger.warning("migrate_legacy_systemd_units failed (non-fatal): %s", e)
+    finally:
+        _TEMPLATE_INSTALL_REENTRY.active = False
 
 
 def install_simulate_unit_templates() -> None:
@@ -1534,8 +1610,12 @@ def _migrate_legacy_systemd_units_impl(
             logger.warning('daemon-reload after unlink failed: %s', detail)
 
     # Install the canonical templates (writer seam — no migrate re-entry).
+    # Pass the gate result captured BEFORE the unlink: re-stat'ing here would
+    # see a clean host and omit Alias= on the very hosts that need it (A9b).
     try:
-        _write_multi_instance_unit_templates(reload=False, dest_dir=sysdir)
+        _write_multi_instance_unit_templates(
+            reload=False, dest_dir=sysdir, alias=legacy_artifact_present,
+        )
     except Exception as e:
         logger.warning('Could not install canonical templates: %s', e)
 

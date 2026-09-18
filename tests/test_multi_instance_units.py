@@ -263,8 +263,16 @@ def test_unit_templates_exist_on_disk():
     assert "managed-%i" in managed_ls
 
 
-def test_new_templates_exist_and_alias_old_names():
-    """acceptance A3: new templates exist with correct Alias= entries."""
+def test_a9_repo_templates_keep_alias_lines():
+    """acceptance A9 (source half): the REPO templates always carry the Alias= lines.
+
+    REPLACES the old test_new_templates_exist_and_alias_old_names assert block.
+    That test read the repo/packaging templates and asserted Alias= was present —
+    true, but it says nothing about the HOST copy, which is what A9 governs. The
+    repo files are now pinned as the SOURCE (they keep Alias= always); the host
+    copy behavior is covered by test_a9a_host_without_legacy_* and
+    test_a9b_host_with_legacy_*.
+    """
     d = installer._systemd_template_dir()
     aliases = {
         "simulate-agent@.service": "lsagent-simulate@%i",
@@ -279,7 +287,7 @@ def test_new_templates_exist_and_alias_old_names():
         assert "\nUser=logstash" in text, f"{name} missing User=logstash"
         assert "\nGroup=logstash" in text, f"{name} missing Group=logstash"
         assert f"Alias={expected_alias}.service" in text, (
-            f"{name} missing Alias={expected_alias}.service"
+            f"{name} missing Alias={expected_alias}.service — the repo file is the A9 source"
         )
 
 
@@ -955,3 +963,218 @@ def test_recursion_edge1_migrate_list_instances_migrate(tmp_path, monkeypatch):
         assert len(recorder) == before, "re-entrant migrate was not suppressed"
     finally:
         installer._MIGRATE_REENTRY.active = False
+
+
+# ---------------------------------------------------------------------------
+# systemd-migrate-upgrade-p1s r11 — S3 A9: Alias= follows the host
+# ---------------------------------------------------------------------------
+
+_ALIAS_FOR_TEMPLATE = {
+    "simulate-agent@.service": "Alias=lsagent-simulate@%i.service",
+    "simulate-logstash@.service": "Alias=ls-simulate@%i.service",
+    "managed-agent@.service": "Alias=logstash-agent@%i.service",
+    "managed-logstash@.service": "Alias=logstash-managed@%i.service",
+}
+
+_LEGACY_ARTIFACT = "logstash-agent@.service"
+
+
+def _host_dests(tmp_path):
+    """Point the four INSTALL_PATHS unit dests at a tmp systemd dir."""
+    sysdir = tmp_path / "systemd"
+    sysdir.mkdir(exist_ok=True)
+    dests = {
+        "lsagent_simulate_unit": str(sysdir / "simulate-agent@.service"),
+        "ls_simulate_unit": str(sysdir / "simulate-logstash@.service"),
+        "logstash_agent_template_unit": str(sysdir / "managed-agent@.service"),
+        "logstash_managed_unit": str(sysdir / "managed-logstash@.service"),
+    }
+    for k, v in dests.items():
+        installer.INSTALL_PATHS[k] = v
+    return sysdir, dests
+
+
+def _install_templates_no_migrate(monkeypatch):
+    """Run the public install with daemon-reload and the migrate hook neutralised."""
+    monkeypatch.setattr(installer, "_systemctl_cmd",
+                        lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})())
+    monkeypatch.setattr(installer, "migrate_legacy_systemd_units", lambda **kw: None)
+
+
+def _assert_host_aliases(sysdir, *, present):
+    for name, alias in _ALIAS_FOR_TEMPLATE.items():
+        text = (sysdir / name).read_text()
+        if present:
+            assert alias in text, f"{name}: Alias= missing but the host HAS a legacy artifact"
+        else:
+            assert alias not in text, f"{name}: Alias= present on a host with NO legacy artifact"
+        assert "User=logstash" in text, f"{name}: User=logstash lost"
+
+
+def test_a9a_host_without_legacy_omits_alias(tmp_path, monkeypatch):
+    """acceptance A9a: a host with NO legacy artifact gets host copies with no Alias=.
+
+    The repo templates still carry the lines (pinned separately); only the host
+    copy omits them, which is what prevents the old-name Alias collision.
+    """
+    sysdir, _ = _host_dests(tmp_path)
+    _install_templates_no_migrate(monkeypatch)
+
+    # Gate precondition: really no legacy artifact here.
+    assert installer.has_legacy_systemd_artifact(systemd_dir=str(sysdir)) is False
+
+    installer.install_multi_instance_unit_templates()
+
+    _assert_host_aliases(sysdir, present=False)
+    # The source it was copied from still has them — repo files are untouched.
+    assert "Alias=" in installer._read_unit_template("managed-agent@.service")
+
+
+def test_a9b_host_with_legacy_includes_alias(tmp_path, monkeypatch):
+    """acceptance A9b: a host WITH a legacy artifact gets host copies that keep Alias=.
+
+    Same writer, same call — the only difference is artifact presence, which is
+    what makes the decision host-keyed rather than command-keyed.
+    """
+    sysdir, _ = _host_dests(tmp_path)
+    (sysdir / _LEGACY_ARTIFACT).write_text("[Unit]\n")  # legacy artifact
+    _install_templates_no_migrate(monkeypatch)
+
+    assert installer.has_legacy_systemd_artifact(systemd_dir=str(sysdir)) is True
+
+    installer.install_multi_instance_unit_templates()
+
+    _assert_host_aliases(sysdir, present=True)
+
+
+def test_a9b_migrate_uses_pre_unlink_snapshot(tmp_path, monkeypatch):
+    """acceptance A9b: migrate keeps Alias= because it snapshots the gate BEFORE the unlink.
+
+    migrate unlinks the old files and only then installs the new templates. If it
+    re-stat'ed at install time the host would look clean and Alias= would be
+    stripped on exactly the hosts that need it.
+    """
+    sysdir = tmp_path / "systemd"
+    sysdir.mkdir()
+    for name in _OLD_TEMPLATES:
+        (sysdir / name).write_text("[Unit]\n")
+    state_dir = tmp_path / "state"
+    _legacy_registry(state_dir)
+
+    monkeypatch.setattr(
+        installer, "_systemctl_cmd",
+        lambda *a, **k: type("R", (), {"returncode": 1, "stdout": "", "stderr": ""})(),
+    )
+    monkeypatch.setattr(
+        installer.subprocess, "run",
+        lambda *a, **k: type("R", (), {"returncode": 0, "stdout": ""})(),
+    )
+
+    installer.migrate_legacy_systemd_units(systemd_dir=str(sysdir), state_dir=str(state_dir))
+
+    # The legacy files were removed...
+    assert not (sysdir / _LEGACY_ARTIFACT).exists()
+    # ...and the new host copies still carry Alias=.
+    _assert_host_aliases(sysdir, present=True)
+
+
+def test_a9_configure_legacy_keeps_alias(tmp_path, monkeypatch):
+    """acceptance A9-configure-legacy: the configure/repair writer on a legacy host
+    must leave Alias= on the new files.
+
+    Runs the real repair path (repair_agent_ownership -> install_multi_instance_
+    unit_templates) against a tmp systemd dir that still has an old template file.
+    If this test is green while configure strips Alias=, A9b is not met.
+    """
+    sysdir, _ = _host_dests(tmp_path)
+    (sysdir / _LEGACY_ARTIFACT).write_text("[Unit]\n")
+    _install_templates_no_migrate(monkeypatch)
+
+    # Neutralise the ownership plumbing; the unit-writing half is what is under test.
+    monkeypatch.setattr(installer, "get_logstash_uid_gid", lambda: (1000, 1000))
+    monkeypatch.setattr(installer, "_chown_recursive", lambda *a, **k: True)
+
+    installer.repair_agent_ownership()
+
+    _assert_host_aliases(sysdir, present=True)
+
+
+def test_a9_configure_nonlegacy_omits_alias(tmp_path, monkeypatch):
+    """acceptance A9a via the configure path: a clean host must not gain Alias=.
+
+    The mirror of test_a9_configure_legacy_keeps_alias — proves the decision is
+    host-keyed, not "configure ⇒ always include".
+    """
+    sysdir, _ = _host_dests(tmp_path)
+    _install_templates_no_migrate(monkeypatch)
+
+    monkeypatch.setattr(installer, "get_logstash_uid_gid", lambda: (1000, 1000))
+    monkeypatch.setattr(installer, "_chown_recursive", lambda *a, **k: True)
+
+    installer.repair_agent_ownership()
+
+    _assert_host_aliases(sysdir, present=False)
+
+
+def test_recursion_edge2_install_templates_migrate(tmp_path, monkeypatch):
+    """acceptance A4/recursion edge 2: install_multi_instance_unit_templates -> migrate.
+
+    migrate() installs templates through the private writer seam, so the public
+    install function is never re-entered from inside a migration. The guard makes
+    any such re-entry a no-op instead of a loop.
+    """
+    sysdir, _ = _host_dests(tmp_path)
+    monkeypatch.setattr(
+        installer, "_systemctl_cmd",
+        lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})(),
+    )
+
+    write_passes = []
+    real_write = installer._write_multi_instance_unit_templates
+
+    def counting_write(**kw):
+        write_passes.append(kw)
+        return real_write(**kw)
+
+    monkeypatch.setattr(installer, "_write_multi_instance_unit_templates", counting_write)
+
+    def fake_migrate(**kw):
+        # A migration that (wrongly) tries to install templates must not re-enter.
+        installer.install_multi_instance_unit_templates()
+
+    monkeypatch.setattr(installer, "migrate_legacy_systemd_units", fake_migrate)
+
+    installer.install_multi_instance_unit_templates()
+
+    # Exactly ONE write pass: the outer call. The attempt from inside migrate
+    # was suppressed by the edge-2 guard.
+    assert len(write_passes) == 1, (
+        f"edge-2 guard did not suppress the re-entrant install: {write_passes}"
+    )
+    for name in _ALIAS_FOR_TEMPLATE:
+        assert (sysdir / name).is_file(), f"template not written: {name}"
+
+
+def test_recursion_edge2_guard_resets(tmp_path, monkeypatch):
+    """The edge-2 guard must reset after a run (not latch permanently)."""
+    _host_dests(tmp_path)
+    monkeypatch.setattr(
+        installer, "_systemctl_cmd",
+        lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})(),
+    )
+    monkeypatch.setattr(installer, "migrate_legacy_systemd_units", lambda **kw: None)
+
+    installer.install_multi_instance_unit_templates()
+    assert getattr(installer._TEMPLATE_INSTALL_REENTRY, "active", False) is False
+
+    # A second, independent call still writes.
+    writes = []
+    real_write = installer._write_multi_instance_unit_templates
+
+    def counting_write(**kw):
+        writes.append(kw)
+        return real_write(**kw)
+
+    monkeypatch.setattr(installer, "_write_multi_instance_unit_templates", counting_write)
+    installer.install_multi_instance_unit_templates()
+    assert len(writes) == 1, f"second call was suppressed: {writes}"
