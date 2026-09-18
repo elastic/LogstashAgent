@@ -590,3 +590,368 @@ def test_controller_unenrolled_hint_canonical():
     assert '"logstash-agent"' in src or "'logstash-agent'" in src, (
         "bare logstash-agent fallback not found in controller.py"
     )
+
+
+# ---------------------------------------------------------------------------
+# systemd-migrate-upgrade-p1s r11 — S2 host-side migrate mechanics
+# ---------------------------------------------------------------------------
+
+_OLD_TEMPLATES = (
+    "lsagent-simulate@.service",
+    "ls-simulate@.service",
+    "logstash-agent@.service",
+    "logstash-managed@.service",
+)
+_NEW_TEMPLATES = (
+    "simulate-agent@.service",
+    "simulate-logstash@.service",
+    "managed-agent@.service",
+    "managed-logstash@.service",
+)
+
+
+def _legacy_registry(state_dir, instance_id=2):
+    """Write a registry whose stored managed-<N> names are still the old style."""
+    import json
+
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "install-registry.json").write_text(json.dumps({
+        "package": {},
+        "instances": {
+            f"managed-{instance_id}": {
+                "id": f"managed-{instance_id}",
+                "role": "managed",
+                "instance_id": instance_id,
+                "agent_unit": f"logstash-agent@{instance_id}",
+                "logstash_unit": f"logstash-managed@{instance_id}",
+            },
+        },
+    }))
+
+
+def _matrix_systemctl(monkeypatch, recorder, *, legacy_exist=True,
+                      enabled=(), active=()):
+    """Fake _systemctl_cmd driven by per-unit state sets.
+
+    *enabled* / *active* hold the LEGACY unit names that report enabled/active.
+    When *legacy_exist* is False, `systemctl cat` fails for every legacy name
+    (simulating a host that never had those units).
+    """
+    def fake_systemctl_cmd(*args, check=False):
+        recorder.append(list(args))
+        r = MagicMock()
+        r.returncode = 0
+        r.stdout = ""
+        r.stderr = ""
+        action = args[0] if args else ""
+        unit = args[1] if len(args) > 1 else ""
+        if action == "cat":
+            r.returncode = 0 if legacy_exist else 1
+        elif action == "is-enabled":
+            r.returncode = 0 if unit in enabled else 1
+        elif action == "is-active":
+            r.returncode = 0 if unit in active else 1
+        return r
+
+    monkeypatch.setattr(installer, "_systemctl_cmd", fake_systemctl_cmd)
+
+
+def _run_migrate(tmp_path, monkeypatch, recorder, *, registry=True,
+                 plant_old=True, legacy_exist=True, enabled=(), active=()):
+    """Run migrate against a tmp systemd dir + tmp registry; return (sysdir, state_dir)."""
+    sysdir = tmp_path / "systemd"
+    sysdir.mkdir(exist_ok=True)
+    if plant_old:
+        for name in _OLD_TEMPLATES:
+            (sysdir / name).write_text("[Unit]\n")
+    state_dir = tmp_path / "state"
+    if registry:
+        _legacy_registry(state_dir)
+    _matrix_systemctl(
+        monkeypatch, recorder,
+        legacy_exist=legacy_exist, enabled=enabled, active=active,
+    )
+    # list-units sweep (direct subprocess.run) returns nothing.
+    monkeypatch.setattr(
+        installer.subprocess, "run",
+        lambda *a, **k: type("R", (), {"returncode": 0, "stdout": ""})(),
+    )
+    # ctl must never be used for legacy probes.
+    monkeypatch.setattr(
+        installer, "systemctl_via_sudo",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("ctl used for legacy probe")),
+    )
+    installer.migrate_legacy_systemd_units(
+        systemd_dir=str(sysdir), state_dir=str(state_dir),
+    )
+    return sysdir, state_dir
+
+
+def test_a1_migrate_removes_old_host_templates(tmp_path, monkeypatch):
+    """acceptance A1: after migrate the four old host files are gone, not just printed."""
+    recorder = []
+    sysdir, _ = _run_migrate(tmp_path, monkeypatch, recorder)
+
+    for name in _OLD_TEMPLATES:
+        assert not (sysdir / name).exists(), f"old template survived migrate: {name}"
+    # Canonical files are written, not deleted.
+    for name in _NEW_TEMPLATES:
+        p = sysdir / name
+        assert p.is_file(), f"canonical template missing after migrate: {name}"
+        assert p.read_text().strip(), f"canonical template empty: {name}"
+
+
+def test_a1_retry_failed_migrate_retries_unlink(tmp_path, monkeypatch):
+    """acceptance A1-retry: a later run still attempts the unlink while old files exist."""
+    recorder = []
+    sysdir = tmp_path / "systemd"
+    sysdir.mkdir()
+    for name in _OLD_TEMPLATES:
+        (sysdir / name).write_text("[Unit]\n")
+    state_dir = tmp_path / "state"
+    _legacy_registry(state_dir)
+
+    real_unlink = os.unlink
+    calls = {"n": 0}
+
+    def flaky_unlink(path):
+        if str(path).endswith("logstash-agent@.service") and calls["n"] == 0:
+            calls["n"] += 1
+            raise PermissionError("simulated unlink failure")
+        return real_unlink(path)
+
+    monkeypatch.setattr(os, "unlink", flaky_unlink)
+    _matrix_systemctl(monkeypatch, recorder, legacy_exist=False)
+    monkeypatch.setattr(
+        installer.subprocess, "run",
+        lambda *a, **k: type("R", (), {"returncode": 0, "stdout": ""})(),
+    )
+
+    installer.migrate_legacy_systemd_units(systemd_dir=str(sysdir), state_dir=str(state_dir))
+    assert (sysdir / "logstash-agent@.service").is_file(), "failed unlink did not leave the file for retry"
+
+    # Second run: the retry must unlink it.
+    installer.migrate_legacy_systemd_units(systemd_dir=str(sysdir), state_dir=str(state_dir))
+    assert not (sysdir / "logstash-agent@.service").exists(), "retry did not unlink the old template"
+
+
+def _probe_calls(recorder):
+    return [c for c in recorder if c and c[0] in ("cat", "is-enabled", "is-active")]
+
+
+def _apply_calls(recorder):
+    return [c for c in recorder if c and c[0] in ("enable", "start")]
+
+
+def test_a3a_legacy_enabled_active_copies_both(tmp_path, monkeypatch):
+    """acceptance A3a: legacy enabled+active -> canonical enabled AND started."""
+    recorder = []
+    _run_migrate(
+        tmp_path, monkeypatch, recorder,
+        enabled=("logstash-agent@2", "logstash-managed@2"),
+        active=("logstash-agent@2", "logstash-managed@2"),
+    )
+    applied = [tuple(c) for c in _apply_calls(recorder)]
+    assert ("enable", "managed-agent@2") in applied, applied
+    assert ("start", "managed-agent@2") in applied, applied
+    assert ("enable", "managed-logstash@2") in applied, applied
+    assert ("start", "managed-logstash@2") in applied, applied
+
+
+def test_a3b_legacy_enabled_inactive_enables_without_starting(tmp_path, monkeypatch):
+    """acceptance A3b: legacy enabled+inactive -> enabled, never started."""
+    recorder = []
+    _run_migrate(
+        tmp_path, monkeypatch, recorder,
+        enabled=("logstash-agent@2", "logstash-managed@2"),
+        active=(),
+    )
+    applied = [tuple(c) for c in _apply_calls(recorder)]
+    assert ("enable", "managed-agent@2") in applied, applied
+    assert ("enable", "managed-logstash@2") in applied, applied
+    starts = [c for c in applied if c[0] == "start"]
+    assert not starts, f"an operator-stopped unit must not be started: {applied}"
+
+
+def test_a3c_legacy_disabled_active_starts_without_enabling(tmp_path, monkeypatch):
+    """acceptance A3c: legacy disabled+active -> started, never enabled."""
+    recorder = []
+    _run_migrate(
+        tmp_path, monkeypatch, recorder,
+        enabled=(),
+        active=("logstash-agent@2", "logstash-managed@2"),
+    )
+    applied = [tuple(c) for c in _apply_calls(recorder)]
+    assert ("start", "managed-agent@2") in applied, applied
+    assert ("start", "managed-logstash@2") in applied, applied
+    enables = [c for c in applied if c[0] == "enable"]
+    assert not enables, f"an operator-disabled unit must not be enabled: {applied}"
+
+
+def test_a3d_legacy_disabled_inactive_is_noop(tmp_path, monkeypatch):
+    """acceptance A3d: legacy disabled+inactive -> neither enabled nor started."""
+    recorder = []
+    _run_migrate(
+        tmp_path, monkeypatch, recorder,
+        enabled=(), active=(),
+    )
+    applied = _apply_calls(recorder)
+    assert not applied, f"disabled+inactive legacy unit must be left alone: {applied}"
+
+
+def test_a3e_legacy_missing_is_noop(tmp_path, monkeypatch):
+    """acceptance A3e: legacy unit missing on the host -> nothing enabled/started.
+
+    The enabled/active readings are deliberately truthy here: a missing unit
+    still reads as disabled+inactive through the returncode-only wrappers, which
+    is exactly why existence needs its own probe. The existence gate must win —
+    a missing legacy unit must never enable or start its canonical replacement,
+    and with no old template files on disk the privileged work must not run.
+    """
+    recorder = []
+    _run_migrate(
+        tmp_path, monkeypatch, recorder,
+        registry=True, plant_old=False,
+        legacy_exist=False,
+        enabled=("logstash-agent@2", "logstash-managed@2"),
+        active=("logstash-agent@2", "logstash-managed@2"),
+    )
+    applied = _apply_calls(recorder)
+    assert not applied, f"missing legacy unit produced enable/start calls: {applied}"
+    reloads = [c for c in recorder if c and c[0] == "daemon-reload"]
+    assert not reloads, (
+        f"no legacy artifact exists, yet privileged work ran: {recorder}"
+    )
+
+
+def test_a3_probes_legacy_names_via_direct_systemctl(tmp_path, monkeypatch):
+    """acceptance A3: the probe uses LEGACY names and direct systemctl, never ctl/registry."""
+    recorder = []
+    _run_migrate(
+        tmp_path, monkeypatch, recorder,
+        enabled=("logstash-agent@2",), active=(),
+    )
+    probes = _probe_calls(recorder)
+    probe_units = {c[1] for c in probes if len(c) > 1}
+    assert probe_units, f"no probe calls recorded: {recorder}"
+    assert probe_units <= {"logstash-agent@2", "logstash-managed@2"}, (
+        f"probe used non-legacy units: {probe_units}"
+    )
+    # Never --now: an unconditional enable --now is the defect this slice removes.
+    for call in recorder:
+        assert call[:2] != ["enable", "--now"], f"enable --now issued: {call}"
+
+
+def test_a3_probe_runs_before_unlink_and_daemon_reload(tmp_path, monkeypatch):
+    """acceptance A3/A7a: probe happens BEFORE the unlink and BEFORE the first reload."""
+    import os as _os
+
+    recorder = []
+    sysdir = tmp_path / "systemd"
+    sysdir.mkdir()
+    for name in _OLD_TEMPLATES:
+        (sysdir / name).write_text("[Unit]\n")
+    old_path = sysdir / "logstash-agent@.service"
+    state_dir = tmp_path / "state"
+    _legacy_registry(state_dir)
+
+    unlink_observed = []
+
+    def fake_systemctl_cmd(*args, check=False):
+        recorder.append(list(args))
+        r = MagicMock()
+        r.returncode = 0
+        r.stdout = ""
+        r.stderr = ""
+        action = args[0] if args else ""
+        if action in ("cat", "is-enabled", "is-active"):
+            unlink_observed.append(_os.path.isfile(old_path))
+        if action == "is-enabled":
+            r.returncode = 0 if args[1] == "logstash-agent@2" else 1
+        if action == "is-active":
+            r.returncode = 1
+        return r
+
+    monkeypatch.setattr(installer, "_systemctl_cmd", fake_systemctl_cmd)
+    monkeypatch.setattr(
+        installer.subprocess, "run",
+        lambda *a, **k: type("R", (), {"returncode": 0, "stdout": ""})(),
+    )
+    installer.migrate_legacy_systemd_units(systemd_dir=str(sysdir), state_dir=str(state_dir))
+
+    assert unlink_observed, "no probe calls recorded"
+    assert all(unlink_observed), "legacy probe ran AFTER the unlink"
+
+
+def _reload_snapshots_for(tmp_path, monkeypatch):
+    """Run migrate against a planted legacy host; return reload snapshots.
+
+    Each snapshot is (old_present, new_present) captured at daemon-reload time.
+    """
+    sysdir = tmp_path / "systemd"
+    sysdir.mkdir()
+    for name in _OLD_TEMPLATES:
+        (sysdir / name).write_text("[Unit]\n")
+    state_dir = tmp_path / "state"
+    _legacy_registry(state_dir)
+
+    reload_snapshots = []
+
+    def fake_systemctl_cmd(*args, check=False):
+        r = MagicMock()
+        r.returncode = 1
+        r.stdout = ""
+        r.stderr = ""
+        if args and args[0] == "daemon-reload":
+            assert len(args) == 1, f"daemon-reload must take no unit: {args}"
+            reload_snapshots.append((
+                any((sysdir / n).exists() for n in _OLD_TEMPLATES),
+                any((sysdir / n).exists() for n in _NEW_TEMPLATES),
+            ))
+            r.returncode = 0
+        return r
+
+    monkeypatch.setattr(installer, "_systemctl_cmd", fake_systemctl_cmd)
+    monkeypatch.setattr(
+        installer.subprocess, "run",
+        lambda *a, **k: type("R", (), {"returncode": 0, "stdout": ""})(),
+    )
+    installer.migrate_legacy_systemd_units(systemd_dir=str(sysdir), state_dir=str(state_dir))
+    return reload_snapshots
+
+
+def test_a7a_daemon_reload_after_unlink_before_install(tmp_path, monkeypatch):
+    """acceptance A7a: reload happens after the unlink and before the new templates."""
+    reload_snapshots = _reload_snapshots_for(tmp_path, monkeypatch)
+    assert len(reload_snapshots) >= 2, f"expected A7a and A7b reloads: {reload_snapshots}"
+    a7a_old_present, a7a_new_present = reload_snapshots[0]
+    assert not a7a_old_present, "A7a reload ran before the old templates were unlinked"
+    assert not a7a_new_present, "A7a reload ran after the new templates were installed"
+
+
+def test_a7b_daemon_reload_after_template_install(tmp_path, monkeypatch):
+    """acceptance A7b: after the new templates land, a second unit-less reload runs."""
+    reload_snapshots = _reload_snapshots_for(tmp_path, monkeypatch)
+    assert len(reload_snapshots) >= 2, f"expected A7a and A7b reloads: {reload_snapshots}"
+    a7b_old_present, a7b_new_present = reload_snapshots[1]
+    assert a7b_new_present, "A7b reload ran before the new templates were installed"
+    assert not a7b_old_present, "old templates returned before A7b"
+
+
+def test_recursion_edge1_migrate_list_instances_migrate(tmp_path, monkeypatch):
+    """acceptance A4/recursion edge 1: migrate -> list_instances -> migrate cannot recurse."""
+    recorder = []
+    # The dirty-registry path makes list_instances call migrate from inside the
+    # outer migrate's own list_instances call. Unguarded this is a RecursionError.
+    _run_migrate(tmp_path, monkeypatch, recorder, enabled=("logstash-agent@2",))
+
+    # Direct proof of the guard: a call while a migration is active is a no-op.
+    installer._MIGRATE_REENTRY.active = True
+    try:
+        before = len(recorder)
+        installer.migrate_legacy_systemd_units(
+            systemd_dir=str(tmp_path / "systemd"), state_dir=str(tmp_path / "state"),
+        )
+        assert len(recorder) == before, "re-entrant migrate was not suppressed"
+    finally:
+        installer._MIGRATE_REENTRY.active = False

@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 # Unix-only imports
@@ -1209,14 +1210,24 @@ _MULTI_INSTANCE_UNIT_TEMPLATES = (
 )
 
 
-def install_multi_instance_unit_templates() -> None:
+def _write_multi_instance_unit_templates(
+    *, reload: bool = True, dest_dir: str | None = None
+) -> None:
     """
-    Install all multi-instance systemd unit templates (simulate + managed).
+    Write the four canonical template files to their host destinations.
 
-    Safe to call on every multi-instance install; overwrites templates in place
-    and runs daemon-reload once.
+    No migrate hook — this is the writer seam migrate() calls so the
+    install → migrate → install cycle cannot re-enter.
+
+    Args:
+        reload: run daemon-reload after writing. The public install path
+            passes True; migrate() passes False because it owns the A7a/A7b
+            reload ordering itself.
+        dest_dir: write into this directory instead of the INSTALL_PATHS
+            destinations. migrate() passes its (possibly test-overridden)
+            systemd directory so the unlink and the rewrite target the same
+            tree.
     """
-    logger.info("Installing multi-instance systemd unit templates...")
     for template_name, dest_key in _MULTI_INSTANCE_UNIT_TEMPLATES:
         # Templates ship with User=/Group=logstash already set; the account is
         # guaranteed by ensure_logstash_user() before we get here, so there is
@@ -1224,17 +1235,32 @@ def install_multi_instance_unit_templates() -> None:
         # uncommented only if the account happened to resolve, which meant
         # Logstash silently ran as root on hosts without the DEB/RPM.
         content = _read_unit_template(template_name)
-        dest = INSTALL_PATHS[dest_key]
+        dest = (
+            os.path.join(dest_dir, template_name) if dest_dir else INSTALL_PATHS[dest_key]
+        )
         with open(dest, 'w') as f:
             f.write(content)
         os.chmod(dest, 0o644)
         logger.info(f"✓ Installed {dest}")
 
+    if not reload:
+        return
     try:
         _systemctl_cmd('daemon-reload', check=True)
         logger.info("✓ Reloaded systemd daemon")
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         logger.warning(f"daemon-reload failed (non-fatal): {e}")
+
+
+def install_multi_instance_unit_templates() -> None:
+    """
+    Install all multi-instance systemd unit templates (simulate + managed).
+
+    Safe to call on every multi-instance install; overwrites templates in place,
+    runs daemon-reload once, then runs the legacy-name migrate hook.
+    """
+    logger.info("Installing multi-instance systemd unit templates...")
+    _write_multi_instance_unit_templates(reload=True)
 
     # Upgrade hook: enable canonical units for any registered instances that
     # still have stale legacy unit names in the registry.
@@ -1273,32 +1299,144 @@ def _canonical_for_old_instance(unit: str) -> str | None:
     return None
 
 
+def _legacy_for_canonical_instance(unit: str) -> str | None:
+    """Reverse of :func:`_canonical_for_old_instance`.
+
+    The registry rewrite (``install_registry.list_instances``) replaces stored
+    legacy unit names before migrate ever sees them, so the only way to probe
+    the legacy name is to reverse the prefix map from the canonical name.
+
+    Returns None when *unit* is not a canonical multi-instance name.
+    """
+    for old_prefix, new_prefix in _OLD_TO_CANONICAL_PREFIXES:
+        if unit.startswith(new_prefix):
+            return old_prefix + unit[len(new_prefix):]
+    return None
+
+
+def _systemctl_unit_exists(unit: str) -> bool:
+    """Return True when systemctl knows about *unit* on this host.
+
+    Distinguishes "missing" from "stopped + disabled": the returncode-only
+    ``_systemctl_is_enabled`` / ``_systemctl_is_active`` wrappers collapse both
+    to False. ``systemctl cat`` exits non-zero (1) for an unknown unit and 0
+    for any known unit regardless of its enabled/active state.
+    """
+    ok, _ = _systemctl_ok('cat', unit)
+    return ok
+
+
+def _probe_legacy_enabled_active(old_agent_unit: str, old_logstash_unit: str) -> dict | None:
+    """Probe a legacy instance's enabled/active state via DIRECT systemctl.
+
+    Never ctl (the ctl wrapper canonicalizes old names first) and never the
+    registry entry (already rewritten). Returns None when neither legacy unit
+    exists on the host — the A3e no-op case.
+
+    Returns a dict with ``agent_enabled``, ``agent_active``, ``logstash_enabled``,
+    ``logstash_active`` (each bool) and ``exists`` (bool).
+    """
+    probe = {}
+    exists = False
+    for label, old_unit in (('agent', old_agent_unit), ('logstash', old_logstash_unit)):
+        if _systemctl_unit_exists(old_unit):
+            exists = True
+            probe[f'{label}_enabled'] = _systemctl_is_enabled(old_unit)
+            probe[f'{label}_active'] = _systemctl_is_active(old_unit)
+        else:
+            probe[f'{label}_enabled'] = False
+            probe[f'{label}_active'] = False
+    probe['exists'] = exists
+    return probe if exists else None
+
+
+def _apply_probed_state(canonical_unit: str, *, enabled: bool, active: bool) -> None:
+    """Copy a probed legacy enabled/active state onto *canonical_unit*.
+
+    Never ``enable --now``: an operator-stopped unit must stay stopped and an
+    operator-disabled unit must stay disabled. Enable only when the legacy unit
+    was enabled; start only when it was active.
+    """
+    if enabled:
+        ok, detail = _systemctl_ok('enable', canonical_unit)
+        if ok:
+            logger.info('✓ Enabled canonical unit %s', canonical_unit)
+        else:
+            logger.warning('Could not enable %s: %s', canonical_unit, detail)
+    if active:
+        ok, detail = _systemctl_ok('start', canonical_unit)
+        if ok:
+            logger.info('✓ Started canonical unit %s', canonical_unit)
+        else:
+            logger.warning('Could not start %s: %s', canonical_unit, detail)
+
+
+# Guards migrate → list_instances → migrate (recursion edge 1). The registry
+# rewrite hook calls migrate from inside list_instances, which migrate itself
+# calls to enumerate instances; the flag makes that inner call a no-op instead
+# of an unbounded cycle. Edge 2 (install → migrate) is a later slice.
+_MIGRATE_REENTRY = threading.local()
+
+
 def migrate_legacy_systemd_units(
     *,
     systemd_dir: str | None = None,
     state_dir: str | None = None,
 ) -> None:
-    """Print a rename notice and enable canonical units for old systemd instances.
+    """Migrate legacy systemd instances to canonical names (re-entrancy guarded).
 
-    For each old template file that still exists, or each old instance unit that
-    systemctl reports as enabled, prints a line containing ``renamed`` plus both
-    the old and the canonical instance name. Also issues ``systemctl enable --now``
-    for the canonical agent and Logstash units of any registered instance whose
-    stored unit names are still the old style. No live systemd is required when
-    systemctl is mocked.
+    See :func:`_migrate_legacy_systemd_units_impl` for the full contract. A
+    call issued from within a running migration (migrate → list_instances →
+    migrate, edge 1) is suppressed so the cycle cannot recurse unboundedly.
 
     Args:
         systemd_dir: Override the systemd unit directory (for testing).
         state_dir: Override the registry state directory (for testing).
     """
-    import shutil as _shutil
+    if getattr(_MIGRATE_REENTRY, 'active', False):
+        logger.debug("migrate_legacy_systemd_units: re-entry suppressed (edge 1)")
+        return
+    _MIGRATE_REENTRY.active = True
+    try:
+        _migrate_legacy_systemd_units_impl(systemd_dir=systemd_dir, state_dir=state_dir)
+    finally:
+        _MIGRATE_REENTRY.active = False
 
+
+def _migrate_legacy_systemd_units_impl(
+    *,
+    systemd_dir: str | None = None,
+    state_dir: str | None = None,
+) -> None:
+    """Print a rename notice then migrate old systemd instances to canonical names.
+
+    For each old template file that still exists, or each old instance unit that
+    systemctl knows, prints a line containing ``renamed`` plus both the old and
+    the canonical instance name.
+
+    Then, per legacy instance, in this frozen order:
+
+      1. probe the LEGACY unit names via direct systemctl (A3),
+      2. apply the probed enabled/active state to the canonical units,
+      3. unlink the four old host template files (A1),
+      4. daemon-reload (A7a),
+      5. install the canonical templates,
+      6. daemon-reload (A7b).
+
+    No live systemd is required when systemctl is mocked.
+
+    Args:
+        systemd_dir: Override the systemd unit directory (for testing).
+        state_dir: Override the registry state directory (for testing).
+    """
     sysdir = systemd_dir or '/etc/systemd/system'
 
     # Check for old template files still on disk.
+    old_templates_present = False
     for old_filename in _OLD_TEMPLATE_FILENAMES:
         old_path = os.path.join(sysdir, old_filename)
         if os.path.isfile(old_path):
+            old_templates_present = True
             stem = old_filename.replace('.service', '')  # e.g. logstash-agent@
             canonical = _canonical_for_old_instance(f'{stem}N') or stem
             canonical_stem = canonical.replace('N', '')
@@ -1308,7 +1446,7 @@ def migrate_legacy_systemd_units(
                 flush=True,
             )
 
-    # Check for enabled old instance units via systemctl.
+    # Check for known old instance units via direct systemctl (never ctl).
     systemctl = _systemctl_bin()
     for old_prefix, new_prefix in _OLD_TO_CANONICAL_PREFIXES:
         try:
@@ -1340,22 +1478,71 @@ def migrate_legacy_systemd_units(
     except Exception:
         instances = []
 
+    import re as _re
+    _CANONICAL_INSTANCE_RE = _re.compile(
+        r'^(simulate-agent|simulate-logstash|managed-agent|managed-logstash)@\d+$'
+    )
+
+    any_legacy_instance = False
     for entry in instances:
         agent_unit = entry.get('agent_unit') or ''
         logstash_unit = entry.get('logstash_unit') or ''
-        # list_instances() already rewrote legacy names to canonical; enable them.
-        # Guard: only template instances (with @<digits>) — never bare logstash-agent.
-        import re as _re
-        _CANONICAL_INSTANCE_RE = _re.compile(
-            r'^(simulate-agent|simulate-logstash|managed-agent|managed-logstash)@\d+$'
+        if not (_CANONICAL_INSTANCE_RE.match(agent_unit) and _CANONICAL_INSTANCE_RE.match(logstash_unit)):
+            continue
+        # Reverse the canonical names to the legacy ones for the probe (the
+        # registry no longer carries the legacy strings).
+        old_agent = _legacy_for_canonical_instance(agent_unit) or ''
+        old_logstash = _legacy_for_canonical_instance(logstash_unit) or ''
+        probe = _probe_legacy_enabled_active(old_agent, old_logstash) if (old_agent and old_logstash) else None
+        if probe is None:
+            # A3e: no legacy unit on this host — leave the canonical units alone.
+            continue
+        any_legacy_instance = True
+        _apply_probed_state(
+            agent_unit,
+            enabled=probe['agent_enabled'],
+            active=probe['agent_active'],
         )
-        for unit in (agent_unit, logstash_unit):
-            if unit and _CANONICAL_INSTANCE_RE.match(unit):
-                ok, detail = _systemctl_ok('enable', '--now', unit)
-                if ok:
-                    logger.info('✓ Enabled canonical unit %s', unit)
-                else:
-                    logger.warning('Could not enable %s: %s', unit, detail)
+        _apply_probed_state(
+            logstash_unit,
+            enabled=probe['logstash_enabled'],
+            active=probe['logstash_active'],
+        )
+
+    # The artifact gate (spec §Constraints): one of the four old host template
+    # files, or a legacy instance unit. No artifact → no privileged work at all.
+    legacy_artifact_present = old_templates_present or any_legacy_instance
+    if not legacy_artifact_present:
+        return
+
+    # A1: unlink the old host template files. Each file is re-checked so a
+    # failed unlink (or a file re-appearing) is retried on the next call.
+    for old_filename in _OLD_TEMPLATE_FILENAMES:
+        old_path = os.path.join(sysdir, old_filename)
+        if not os.path.isfile(old_path):
+            continue
+        try:
+            os.unlink(old_path)
+            logger.info('✓ Removed legacy template %s', old_path)
+        except OSError as e:
+            logger.warning('Could not remove legacy template %s: %s', old_path, e)
+
+    # A7a: daemon-reload after the unlink, before the new templates land.
+    if old_templates_present:
+        ok, detail = _systemctl_ok('daemon-reload')
+        if not ok:
+            logger.warning('daemon-reload after unlink failed: %s', detail)
+
+    # Install the canonical templates (writer seam — no migrate re-entry).
+    try:
+        _write_multi_instance_unit_templates(reload=False, dest_dir=sysdir)
+    except Exception as e:
+        logger.warning('Could not install canonical templates: %s', e)
+
+    # A7b: daemon-reload after the new templates.
+    ok, detail = _systemctl_ok('daemon-reload')
+    if not ok:
+        logger.warning('daemon-reload after template install failed: %s', detail)
 
 
 def _materialize_instance_logstash_yml(
@@ -2137,8 +2324,46 @@ def _try_sudo_setup_simulate() -> dict | None:
     else:
         cmd = ['sudo', '-n', agent_bin, 'setup-simulate', '--yes']
 
+    return _run_sudo_heal(cmd, via='sudo')
+
+
+def try_sudo_setup_simulate() -> dict | None:
+    """Public entry for the simulate/managed day-2 heal channel (A6).
+
+    Runs ``sudo -n … setup-simulate --yes`` only. The caller is responsible for
+    evaluating the legacy-artifact gate first — this never checks it, and never
+    writes to /etc/systemd/system in-process.
+
+    Returns a result dict on success, None when sudo is unavailable or denied.
+    """
+    return _try_sudo_setup_simulate()
+
+
+def try_sudo_configure_packaged() -> dict | None:
+    """Packaged day-2 heal channel (A6): ``sudo -n logstash-agent configure --yes``.
+
+    The packaged install has no setup-simulate; configure is the supported
+    privileged channel. The caller must evaluate the legacy-artifact gate first.
+    """
+    binary_candidates = [
+        INSTALL_PATHS.get('binary'),
+        shutil.which('logstash-agent'),
+        '/usr/local/bin/logstash-agent',
+        '/opt/logstash-agent/bin/logstash-agent',
+    ]
+    agent_bin = next((b for b in binary_candidates if b and os.path.isfile(b)), None)
+    if not agent_bin:
+        cmd = ['sudo', '-n', sys.executable, '-m', 'logstashagent.main', 'configure', '--yes']
+    else:
+        cmd = ['sudo', '-n', agent_bin, 'configure', '--yes']
+
+    return _run_sudo_heal(cmd, via='sudo-configure')
+
+
+def _run_sudo_heal(cmd: list[str], *, via: str) -> dict | None:
+    """Run a passwordless-sudo heal command; shared by both A6 channels."""
     try:
-        logger.info("Attempting passwordless sudo for simulate setup: %s", ' '.join(cmd))
+        logger.info("Attempting passwordless sudo: %s", ' '.join(cmd))
         result = subprocess.run(
             cmd,
             capture_output=True,
@@ -2146,17 +2371,17 @@ def _try_sudo_setup_simulate() -> dict | None:
             timeout=600,
         )
         if result.returncode == 0:
-            logger.info("✓ Simulate setup completed via passwordless sudo")
+            logger.info("✓ Privileged heal completed (%s)", via)
             if result.stdout:
                 for line in result.stdout.strip().splitlines()[-20:]:
                     logger.info("  sudo: %s", line)
             return {
                 'status': 'complete',
-                'via': 'sudo',
-                'messages': ['Simulate setup completed via passwordless sudo'],
+                'via': via,
+                'messages': [f'Heal completed via {via}'],
             }
         logger.warning(
-            "Passwordless sudo setup-simulate failed (rc=%s): %s",
+            "Passwordless sudo heal failed (rc=%s): %s",
             result.returncode,
             (result.stderr or result.stdout or '')[:500],
         )
@@ -2165,11 +2390,55 @@ def _try_sudo_setup_simulate() -> dict | None:
         logger.debug("sudo not found")
         return None
     except subprocess.TimeoutExpired:
-        logger.warning("sudo setup-simulate timed out")
+        logger.warning("sudo heal timed out")
         return None
     except Exception as e:
-        logger.warning("sudo setup-simulate error: %s", e)
+        logger.warning("sudo heal error: %s", e)
         return None
+
+
+def has_legacy_systemd_artifact(
+    *,
+    systemd_dir: str | None = None,
+    state_dir: str | None = None,
+) -> bool:
+    """Non-privileged check for a legacy systemd artifact (A6 gate).
+
+    True when one of the four old host template files is present, or a legacy
+    instance unit is known to systemctl. Read-only: no sudo, no writes, and no
+    registry rewrite (reads the JSON directly rather than via ``list_instances``,
+    whose rewrite hook would itself trigger a migration).
+
+    Args:
+        systemd_dir: Override the systemd unit directory (for testing).
+        state_dir: Override the registry state directory (for testing).
+    """
+    sysdir = systemd_dir or '/etc/systemd/system'
+    for old_filename in _OLD_TEMPLATE_FILENAMES:
+        if os.path.isfile(os.path.join(sysdir, old_filename)):
+            return True
+
+    # Legacy instance units: names in the registry may be stale (legacy) or
+    # already canonical; derive the legacy name either way and ask systemctl.
+    try:
+        from logstashagent import install_registry as _reg
+        reg = _reg.load_registry(state_dir)
+        raw = reg.get('instances') or {}
+    except Exception:
+        raw = {}
+    for entry in raw.values():
+        for field in ('agent_unit', 'logstash_unit'):
+            unit = entry.get(field) or ''
+            if not unit:
+                continue
+            old_unit = None
+            if _canonical_for_old_instance(unit):
+                old_unit = unit  # stored name is already legacy
+            else:
+                old_unit = _legacy_for_canonical_instance(unit)
+            if old_unit and _systemctl_unit_exists(old_unit):
+                return True
+    return False
 
 
 def ensure_simulate_setup(policy_config: dict) -> dict:
@@ -3715,6 +3984,19 @@ def perform_upgrade(version: str, auto: bool = False) -> None:
                 logger.info("✓ Set SELinux context for upgraded binary")
         except Exception as e:
             logger.debug(f"SELinux context setting skipped: {e}")
+
+        # Step 8b: install the canonical multi-instance templates and run the
+        # legacy-name migrate (A2). An upgrade-only host otherwise never
+        # receives the new templates and never runs the migrate hook, so old
+        # template files and stale unit enables survive forever.
+        try:
+            install_multi_instance_unit_templates()
+        except Exception as e:
+            logger.warning("Template install during upgrade failed (non-fatal): %s", e)
+        try:
+            migrate_legacy_systemd_units()
+        except Exception as e:
+            logger.warning("Legacy unit migrate during upgrade failed (non-fatal): %s", e)
 
         # Step 9: Restart service (always restart after upgrade)
         logger.info("\nStep 9: Restarting service with new binary...")

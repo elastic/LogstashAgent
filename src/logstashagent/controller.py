@@ -3463,6 +3463,51 @@ def check_in():
         return None
 
 
+def heal_legacy_systemd_units_on_checkin(state: Optional[dict] = None) -> bool:
+    """Day-2 heal for hosts still carrying legacy systemd artifacts (A6).
+
+    Runs EVERY check-in loop iteration — not the startup jvm.options heal.
+    The gate is artifact presence (one of the four old host template files, or
+    a legacy instance unit), evaluated NON-PRIVILEGED, before any sudo. No
+    artifact → no privileged subprocess at all.
+
+    The privileged channels are the packaged ``sudo -n logstash-agent configure
+    --yes`` and the multi-instance ``sudo -n … setup-simulate --yes``. The
+    controller never writes to /etc/systemd/system in-process.
+
+    Returns True when a privileged heal was attempted successfully.
+    """
+    from logstashagent import installer
+
+    state = state if state is not None else agent_state.get_state()
+    try:
+        if not installer.has_legacy_systemd_artifact():
+            logger.debug("No legacy systemd artifact — skipping privileged heal")
+            return False
+    except Exception as exc:
+        logger.debug("Legacy-artifact gate failed: %s", exc)
+        return False
+
+    mode = str(state.get('mode') or '').lower()
+    logger.warning(
+        "Legacy systemd artifact detected (mode=%s) — healing via privileged channel",
+        mode or 'unknown',
+    )
+    try:
+        if mode in ('managed', 'simulate'):
+            result = installer.try_sudo_setup_simulate()
+        else:
+            result = installer.try_sudo_configure_packaged()
+    except Exception as exc:
+        logger.warning("Legacy systemd heal failed: %s", exc)
+        return False
+    if result and result.get('status') == 'complete':
+        logger.info("✓ Legacy systemd units healed via %s", result.get('via'))
+        return True
+    logger.warning("Legacy systemd heal did not complete; will retry next check-in")
+    return False
+
+
 def run_controller():
     """
     Main controller loop - runs indefinitely and checks in every 60 seconds
@@ -3590,6 +3635,13 @@ def run_controller():
 
             # Perform check-in
             result = check_in()
+
+            # A6: day-2 heal for legacy systemd artifacts, every loop iteration.
+            # Gate (non-privileged) runs first; no artifact → no sudo at all.
+            try:
+                heal_legacy_systemd_units_on_checkin(agent_state.get_state())
+            except Exception as exc:
+                logger.warning("Legacy systemd check-in heal failed: %s", exc)
 
             if result:
                 logger.debug(f"Check-in response: {result}")

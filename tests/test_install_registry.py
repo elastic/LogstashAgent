@@ -327,15 +327,20 @@ def _legacy_reg_json(state_dir: Path, instance_id: int = 2) -> None:
     }))
 
 
-def test_migrate_enables_canonical_units(tmp_path, monkeypatch):
-    """acceptance A3: migrate_legacy_systemd_units enables canonical units with systemctl."""
+def test_a3_migrate_copies_legacy_enabled_state_not_enable_now(tmp_path, monkeypatch):
+    """acceptance A3: REWRITE of test_migrate_enables_canonical_units.
+
+    The previous version pinned ``enable --now`` for both canonical units, which
+    always STARTED a unit the operator may have stopped and always ENABLED one
+    the operator may have disabled. The copy now follows the probed legacy state,
+    and the legacy names are probed directly (never the rewritten registry entry).
+    """
     from logstashagent import installer
 
     state_dir = tmp_path / "state"
     state_dir.mkdir()
     _legacy_reg_json(state_dir, instance_id=2)
 
-    # Track systemctl calls.
     systemctl_calls = []
 
     def fake_systemctl_cmd(*args, check=False):
@@ -344,25 +349,107 @@ def test_migrate_enables_canonical_units(tmp_path, monkeypatch):
             returncode = 0
             stdout = ""
             stderr = ""
-        return R()
+        r = R()
+        if args[0] == "cat":
+            r.returncode = 0  # legacy unit exists
+        elif args[0] == "is-enabled":
+            r.returncode = 0 if args[1] == "logstash-agent@2" else 1
+        elif args[0] == "is-active":
+            r.returncode = 1  # stopped on the host
+        return r
 
     monkeypatch.setattr(installer, "_systemctl_cmd", fake_systemctl_cmd)
     monkeypatch.setattr(installer, "_systemctl_bin", lambda: "/usr/bin/systemctl")
 
-    # Suppress the print-path systemctl list-units (subprocess.run) and redirect to fake.
     monkeypatch.setattr(installer.subprocess, "run", lambda *a, **k: type("R", (), {"returncode": 0, "stdout": ""})())
 
     with patch("logstashagent.install_registry.discover_instances_from_disk", return_value=[]):
         installer.migrate_legacy_systemd_units(state_dir=str(state_dir))
 
-    # Must have called enable --now for managed-agent@2 AND managed-logstash@2.
-    enable_units = [args[-1] for args in systemctl_calls if args and args[0] == "enable"]
-    assert "managed-agent@2" in enable_units, f"enable calls: {systemctl_calls}"
-    assert "managed-logstash@2" in enable_units, f"enable calls: {systemctl_calls}"
+    # The legacy name was probed, and the enabled state was COPIED to the canonical name.
+    assert ["is-enabled", "logstash-agent@2"] in systemctl_calls, systemctl_calls
+    assert ["enable", "managed-agent@2"] in systemctl_calls, systemctl_calls
+    # Legacy logstash unit was disabled -> canonical must NOT be enabled.
+    assert ["enable", "managed-logstash@2"] not in systemctl_calls, systemctl_calls
+    # Nothing was active -> nothing may be started.
+    assert not [c for c in systemctl_calls if c[0] == "start"], systemctl_calls
+    # Never --now.
+    assert not [c for c in systemctl_calls if c[:2] == ["enable", "--now"]], systemctl_calls
 
-    # Must NOT enable bare packaged unit.
-    assert "logstash-agent" not in enable_units
-    assert "logstash" not in enable_units
+    # Must NOT enable bare packaged units.
+    enabled_units = [c[-1] for c in systemctl_calls if c[0] == "enable"]
+    assert "logstash-agent" not in enabled_units
+    assert "logstash" not in enabled_units
+
+
+def test_a3_migrate_legacy_missing_is_noop(tmp_path, monkeypatch):
+    """acceptance A3e: no legacy unit on the host -> no enable/start calls at all.
+
+    The enabled/active readings are truthy on purpose: a missing unit reads as
+    disabled+inactive through the returncode-only wrappers, so only the
+    existence probe can tell them apart, and it must gate the action — and with
+    no old template files present the privileged work must not run either.
+    """
+    from logstashagent import installer
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    _legacy_reg_json(state_dir, instance_id=2)
+    sysdir = tmp_path / "systemd"
+    sysdir.mkdir()
+
+    systemctl_calls = []
+
+    def fake_systemctl_cmd(*args, check=False):
+        systemctl_calls.append(list(args))
+        r = type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        if args[0] == "cat":
+            r.returncode = 1  # unit does not exist
+        return r
+
+    monkeypatch.setattr(installer, "_systemctl_cmd", fake_systemctl_cmd)
+    monkeypatch.setattr(installer, "_systemctl_bin", lambda: "/usr/bin/systemctl")
+    monkeypatch.setattr(installer.subprocess, "run", lambda *a, **k: type("R", (), {"returncode": 0, "stdout": ""})())
+
+    with patch("logstashagent.install_registry.discover_instances_from_disk", return_value=[]):
+        installer.migrate_legacy_systemd_units(
+            systemd_dir=str(sysdir), state_dir=str(state_dir),
+        )
+
+    assert not [c for c in systemctl_calls if c[0] in ("enable", "start")], systemctl_calls
+    assert not [c for c in systemctl_calls if c[0] == "daemon-reload"], (
+        f"no legacy artifact exists, yet privileged work ran: {systemctl_calls}"
+    )
+
+
+def test_a2_perform_upgrade_installs_templates_and_migrates(tmp_path, monkeypatch):
+    """acceptance A2: perform_upgrade installs the four templates AND runs migrate."""
+    from logstashagent import installer
+
+    installed = []
+    migrated = []
+
+    monkeypatch.setattr(installer, "install_multi_instance_unit_templates",
+                        lambda: installed.append(True))
+    monkeypatch.setattr(installer, "migrate_legacy_systemd_units",
+                        lambda **kw: migrated.append(kw))
+
+    with patch.object(installer, "verify_root"), \
+         patch.object(installer, "verify_platform"), \
+         patch.object(installer.os.path, "exists", return_value=True), \
+         patch.object(installer, "download_release", return_value="/tmp/x.tgz"), \
+         patch.object(installer, "extract_binary", return_value="/tmp/bin/logstash-agent"), \
+         patch.object(installer, "verify_service_running", return_value=True), \
+         patch.object(installer, "_systemctl_cmd", return_value=type("R", (), {"returncode": 0, "stdout": b"", "stderr": b""})()), \
+         patch("tempfile.mkdtemp", return_value="/tmp/test"), \
+         patch("shutil.copy2"), patch("shutil.copytree"), patch("shutil.rmtree"), \
+         patch("os.chmod"), patch("os.rename"), patch("os.remove"), \
+         patch("time.sleep"), patch("subprocess.run") as run:
+        run.return_value = type("R", (), {"returncode": 1, "stdout": b"", "stderr": b""})()
+        installer.perform_upgrade("0.5.9", auto=False)
+
+    assert installed, "perform_upgrade did not install the multi-instance templates"
+    assert migrated, "perform_upgrade did not run the legacy-name migrate"
 
 
 def test_install_templates_invokes_unit_migrate(tmp_path, monkeypatch):
