@@ -76,21 +76,27 @@ def normalize_opt_path(path) -> str:
 _SYSTEMCTL_CTL_SCRIPT = r'''#!/bin/sh
 #Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
 # Managed by logstash-agent install — do not edit by hand.
-# Usage: logstash-agent-ctl <start|stop|restart|status|is-active|enable|disable> <unit>
+# Usage: logstash-agent-ctl <start|stop|restart|status|is-active|is-enabled|enable|disable> <unit>
+#        logstash-agent-ctl daemon-reload          (no unit argument)
 set -eu
 ACTION="${1:-}"
 UNIT="${2:-}"
-if [ -z "$ACTION" ] || [ -z "$UNIT" ]; then
+if [ -z "$ACTION" ]; then
   echo "usage: logstash-agent-ctl <action> <unit>" >&2
   exit 2
 fi
 case "$ACTION" in
-  start|stop|restart|status|is-active|enable|disable) ;;
+  start|stop|restart|status|is-active|is-enabled|enable|disable|daemon-reload) ;;
   *)
     echo "logstash-agent-ctl: disallowed action: $ACTION" >&2
     exit 2
     ;;
 esac
+# daemon-reload takes no unit; every other action requires one.
+if [ "$ACTION" != "daemon-reload" ] && [ -z "$UNIT" ]; then
+  echo "usage: logstash-agent-ctl <action> <unit>" >&2
+  exit 2
+fi
 # Rewrite deprecated old instance names to canonical names and warn.
 # Old -> canonical mappings (numeric N preserved via sed):
 #   logstash-agent@N   -> managed-agent@N
@@ -124,9 +130,12 @@ esac
 # Packaged: logstash, logstash-agent
 # New canonical: simulate-agent@N, simulate-logstash@N, managed-agent@N, managed-logstash@N
 # Deprecated (already rewritten above, but validate the canonical result):
-if ! echo "$CANONICAL_UNIT" | grep -Eq '^(logstash|logstash-agent|((simulate-agent|simulate-logstash|managed-agent|managed-logstash)@[0-9]+))$'; then
-  echo "logstash-agent-ctl: disallowed unit: $UNIT" >&2
-  exit 2
+# daemon-reload carries no unit, so the unit allowlist does not apply to it.
+if [ "$ACTION" != "daemon-reload" ]; then
+  if ! echo "$CANONICAL_UNIT" | grep -Eq '^(logstash|logstash-agent|((simulate-agent|simulate-logstash|managed-agent|managed-logstash)@[0-9]+))$'; then
+    echo "logstash-agent-ctl: disallowed unit: $UNIT" >&2
+    exit 2
+  fi
 fi
 # Drop PyInstaller/frozen LD_LIBRARY_PATH so host systemctl uses distro OpenSSL
 # (bundled libcrypto under _internal breaks systemd linked to OPENSSL_3.4+).
@@ -150,6 +159,10 @@ fi
 if [ -z "$SYSTEMCTL" ]; then
   echo "logstash-agent-ctl: systemctl not found" >&2
   exit 127
+fi
+# daemon-reload takes no unit argument; forward none.
+if [ "$ACTION" = "daemon-reload" ]; then
+  exec "$SYSTEMCTL" "$ACTION"
 fi
 exec "$SYSTEMCTL" "$ACTION" "$CANONICAL_UNIT"
 '''

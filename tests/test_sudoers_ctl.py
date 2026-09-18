@@ -164,3 +164,65 @@ def test_is_sudo_rs_detects_string(monkeypatch):
         lambda *a, **k: R(),
     )
     assert installer.is_sudo_rs() is True
+
+
+def _ctl_run_with_stub(tmp_path, monkeypatch, *args):
+    """Install the ctl script, stub systemctl on PATH, run ctl with args.
+
+    Returns (CompletedProcess, recorded-args Path). The stub appends each of
+    its argv entries on its own line. macOS/CI have no real systemctl, so the
+    script falls through to `command -v systemctl`, which finds the stub.
+    """
+    import os
+    import subprocess as _subprocess
+
+    ctl_path = tmp_path / "logstash-agent-ctl"
+    monkeypatch.setitem(installer.INSTALL_PATHS, "systemctl_ctl", str(ctl_path))
+    installer.install_systemctl_ctl()
+
+    stub_systemctl = tmp_path / "systemctl"
+    recorded = tmp_path / "recorded_args.txt"
+    stub_systemctl.write_text(
+        f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {recorded}\nexit 0\n"
+    )
+    stub_systemctl.chmod(0o755)
+
+    env = {"PATH": f"{tmp_path}:{os.environ.get('PATH', '/usr/bin:/bin')}"}
+    result = _subprocess.run(
+        ["sh", str(ctl_path), *args],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result, recorded
+
+
+def test_ctl_a8_is_enabled_with_unit(tmp_path, monkeypatch):
+    """acceptance A8: ctl accepts `is-enabled <unit>` and passes it to systemctl."""
+    result, recorded = _ctl_run_with_stub(
+        tmp_path, monkeypatch, "is-enabled", "simulate-agent@1"
+    )
+    assert result.returncode == 0, f"ctl rejected `is-enabled` (stderr: {result.stderr!r})"
+    assert recorded.is_file(), "stub systemctl was not called"
+    assert recorded.read_text().splitlines() == ["is-enabled", "simulate-agent@1"]
+
+
+def test_ctl_a8_is_enabled_requires_unit(tmp_path, monkeypatch):
+    """acceptance A8: `is-enabled` requires a unit — a bare call is rejected (exit 2)."""
+    result, recorded = _ctl_run_with_stub(tmp_path, monkeypatch, "is-enabled")
+    assert result.returncode == 2
+    assert not recorded.exists(), "systemctl must not be reached without a unit"
+
+
+def test_ctl_a8_daemon_reload_no_unit(tmp_path, monkeypatch):
+    """acceptance A8: ctl accepts `daemon-reload` with NO unit and reaches systemctl.
+
+    r11 defers the exact-argv / empty-unit exec pin to a later release, so this
+    test asserts only that the call reaches systemctl with the daemon-reload
+    action — not the full argv handed to systemctl.
+    """
+    result, recorded = _ctl_run_with_stub(tmp_path, monkeypatch, "daemon-reload")
+    assert result.returncode == 0, f"ctl rejected `daemon-reload` (stderr: {result.stderr!r})"
+    assert recorded.is_file(), "systemctl was not reached"
+    assert recorded.read_text().splitlines()[0] == "daemon-reload"
