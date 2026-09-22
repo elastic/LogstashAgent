@@ -6,6 +6,7 @@
 
 import hashlib
 import json
+import logging
 import os
 import subprocess
 from pathlib import Path
@@ -924,6 +925,36 @@ class TestRunController:
                         controller.run_controller()
         # At least one sleep while waiting (poll interval)
         assert sleep.called
+
+    @pytest.mark.parametrize(
+        "state,unit",
+        [
+            ({"agent_unit": "managed-agent@2", "instance_id": 9}, "managed-agent@2"),
+            ({"instance_id": 3}, "simulate-agent@3"),
+            ({}, "logstash-agent"),
+        ],
+    )
+    def test_unenrolled_restart_hint_uses_canonical_unit(self, state, unit, caplog):
+        """acceptance A3d: controller unenrolled restart hint uses canonical simulate unit."""
+        prefix = (
+            "If enrollment is already on disk, restart the unit: "
+            "sudo systemctl restart "
+        )
+        expected = prefix + unit
+        with caplog.at_level(logging.ERROR, logger="logstashagent.controller"):
+            with patch.object(controller.agent_state, "get_state", return_value=state):
+                with patch.object(controller.agent_state, "STATE_DIR", "/tmp/x"):
+                    with patch("time.sleep"):
+                        # 0 sets the deadline, 0 stays inside the 120s window,
+                        # 200 expires it. The fourth 200 is unused and matches
+                        # test_not_enrolled_returns_after_wait.
+                        with patch("time.monotonic", side_effect=[0, 0, 200, 200]):
+                            controller.run_controller()
+        restart = [
+            r.message for r in caplog.records if r.message.startswith(prefix)
+        ]
+        assert restart == [expected], [r.message for r in caplog.records]
+        assert "lsagent-simulate@" not in restart[0]
 
 
 class TestDecryptFromServer:
