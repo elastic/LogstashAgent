@@ -1341,3 +1341,53 @@ def test_prepare_holds_while_inflight_even_if_tree_present(tmp_path):
     assert prep3["ok"] is True
     assert prep3["changed"] is True
     controller.rollback_runtime_upgrade(prep3, restart=False)
+
+
+def test_a6_rollback_does_not_restore_old_legacy_templates(tmp_path, monkeypatch):
+    """acceptance A6: the runtime-upgrade rollback must not bring back the four old files.
+
+    The snapshot restores settings/env only — the old systemd template files are
+    deliberately NOT part of the snapshot, so a rollback after a migrate cannot
+    resurrect them (which would re-create the Alias= collision).
+    """
+    root = tmp_path / "instance"
+    settings = root / "settings"
+    settings.mkdir(parents=True)
+    (settings / "logstash.yml").write_text("a: 1\n", encoding="utf-8")
+
+    snapshot_dir = root / ".runtime-snapshot"
+    (snapshot_dir / "settings").mkdir(parents=True)
+    (snapshot_dir / "settings" / "logstash.yml").write_text("old: 1\n", encoding="utf-8")
+    (snapshot_dir / "meta.json").write_text(json.dumps({
+        "previous": {"settings_path": str(settings), "binary": "/bin/old"},
+    }), encoding="utf-8")
+
+    # Plant an old-template file to prove rollback leaves it alone.
+    sysdir = tmp_path / "systemd"
+    sysdir.mkdir()
+    old_template = sysdir / "logstash-agent@.service"
+    old_template.write_text("[Unit]\n", encoding="utf-8")
+    monkeypatch.setattr(controller, "restart_logstash", lambda: True)
+
+    prep = {
+        "ok": True,
+        "changed": True,
+        "snapshot_dir": str(snapshot_dir),
+        "previous": {"settings_path": str(settings), "binary": "/bin/old"},
+    }
+    assert controller.rollback_runtime_upgrade(prep, restart=False) is True
+
+    # Settings restored...
+    assert (settings / "logstash.yml").read_text() == "old: 1\n"
+    # ...but the rollback path never writes systemd unit files.
+    src = Path(controller.__file__).read_text(encoding="utf-8")
+    restore_body = src.split("def _restore_runtime_snapshot", 1)[1].split("\ndef ", 1)[0]
+    for old_name in (
+        "lsagent-simulate@.service",
+        "ls-simulate@.service",
+        "logstash-agent@.service",
+        "logstash-managed@.service",
+    ):
+        assert old_name not in restore_body, (
+            f"rollback references the old template {old_name}; a rollback must not restore it"
+        )

@@ -18,7 +18,7 @@ class TestIsSystemctlManagedSimulate:
         with patch.object(
             main.agent_state,
             "get_state",
-            return_value={"logstash_unit": "ls-simulate@3", "mode": "simulate"},
+            return_value={"logstash_unit": "simulate-logstash@3", "mode": "simulate"},
         ):
             assert main.is_systemctl_managed_simulate() is True
 
@@ -365,7 +365,7 @@ class TestPipelineBusRetryStormRecovery:
 
     def test_force_kill_uses_mainpid_and_kill_9(self):
         with patch.object(
-            main.controller, "_logstash_unit_name", return_value="ls-simulate@1"
+            main.controller, "_logstash_unit_name", return_value="simulate-logstash@1"
         ), patch("subprocess.run") as run_mock:
             # show MainPID, then kill -9
             show = MagicMock()
@@ -380,7 +380,7 @@ class TestPipelineBusRetryStormRecovery:
 
             out = main.force_kill_simulate_logstash_jvm(reason="test")
 
-        assert out["unit"] == "ls-simulate@1"
+        assert out["unit"] == "simulate-logstash@1"
         assert out["pids_killed"] == [12345]
         assert run_mock.call_count == 2
         kill_cmd = run_mock.call_args_list[1][0][0]
@@ -469,7 +469,7 @@ class TestAllocateStartupGate:
         main._sim_systemctl_healthy_since = time.monotonic() - 60.0
         with patch.object(main, "is_systemctl_managed_simulate", return_value=True), \
              patch.object(main, "force_kill_simulate_logstash_jvm",
-                          return_value={"unit": "ls-simulate@1", "pids_killed": [], "errors": []}), \
+                          return_value={"unit": "simulate-logstash@1", "pids_killed": [], "errors": []}), \
              patch("logstashagent.simulate_recovery.recover_simulate_logstash",
                    return_value={"success": True, "restarted": True}):
             main.trigger_sim_logstash_hard_restart("test")

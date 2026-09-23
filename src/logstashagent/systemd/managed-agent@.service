@@ -22,3 +22,4 @@ Group=logstash
 
 [Install]
 WantedBy=multi-user.target
+Alias=logstash-agent@%i.service

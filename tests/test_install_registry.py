@@ -45,8 +45,8 @@ def test_register_package_and_instance(reg_dir):
         reg.register_instance(
             role="managed",
             instance_id=1,
-            agent_unit="logstash-agent@1",
-            logstash_unit="logstash-managed@1",
+            agent_unit="managed-agent@1",
+            logstash_unit="managed-logstash@1",
             path_root="/opt/logstash-agent/managed-1",
             agent_api_port=9601,
             logstash_api_port=9701,
@@ -59,7 +59,7 @@ def test_register_package_and_instance(reg_dir):
     data = json.loads(path.read_text())
     assert data["package"]["agent_version"] == "0.5.1"
     assert "managed-1" in data["instances"]
-    assert data["instances"]["managed-1"]["agent_unit"] == "logstash-agent@1"
+    assert data["instances"]["managed-1"]["agent_unit"] == "managed-agent@1"
 
     instances = reg.list_instances(str(reg_dir), include_discovered=False)
     assert any(i["id"] == "managed-1" for i in instances)
@@ -70,8 +70,8 @@ def test_unregister_instance(reg_dir):
         reg.register_instance(
             role="simulate",
             instance_id=2,
-            agent_unit="lsagent-simulate@2",
-            logstash_unit="ls-simulate@2",
+            agent_unit="simulate-agent@2",
+            logstash_unit="simulate-logstash@2",
             path_root="/opt/logstash-agent/simulate-2",
             state_dir=str(reg_dir),
         )
@@ -90,8 +90,9 @@ def test_discover_instances_from_disk(tmp_path):
     ids = {f["id"] for f in found}
     assert ids == {"managed-1", "simulate-2"}
     m = next(f for f in found if f["id"] == "managed-1")
-    assert m["agent_unit"] == "logstash-agent@1"
-    assert m["logstash_unit"] == "logstash-managed@1"
+    # acceptance A2: discovery returns canonical names
+    assert m["agent_unit"] == "managed-agent@1"
+    assert m["logstash_unit"] == "managed-logstash@1"
 
 
 def test_remove_path_tree_safety(tmp_path):
@@ -122,21 +123,21 @@ def test_teardown_instance_stops_units(reg_dir, monkeypatch):
     entry = {
         "id": "managed-1",
         "role": "managed",
-        "agent_unit": "logstash-agent@1",
-        "logstash_unit": "logstash-managed@1",
+        "agent_unit": "managed-agent@1",
+        "logstash_unit": "managed-logstash@1",
         "path_root": None,
     }
     with patch("logstashagent.installer.get_logstash_uid_gid", side_effect=Exception("x")):
         reg.register_instance(
             role="managed",
             instance_id=1,
-            agent_unit="logstash-agent@1",
-            logstash_unit="logstash-managed@1",
+            agent_unit="managed-agent@1",
+            logstash_unit="managed-logstash@1",
             state_dir=str(reg_dir),
         )
         reg.teardown_instance(entry, purge_paths=False, state_dir=str(reg_dir), unregister=True)
-    assert "logstash-agent@1" in calls
-    assert "logstash-managed@1" in calls
+    assert "managed-agent@1" in calls
+    assert "managed-logstash@1" in calls
     assert "managed-1" not in reg.load_registry(str(reg_dir))["instances"]
 
 
@@ -152,8 +153,8 @@ def test_perform_uninstall_instance_only(reg_dir, monkeypatch, tmp_path):
         reg.register_instance(
             role="managed",
             instance_id=1,
-            agent_unit="logstash-agent@1",
-            logstash_unit="logstash-managed@1",
+            agent_unit="managed-agent@1",
+            logstash_unit="managed-logstash@1",
             path_root=str(tree),
             state_dir=str(reg_dir),
         )
@@ -166,7 +167,7 @@ def test_perform_uninstall_instance_only(reg_dir, monkeypatch, tmp_path):
         # Default instance uninstall deletes the path tree
         installer.perform_uninstallation(purge=False, instance="managed-1")
 
-    assert "logstash-agent@1" in stopped
+    assert "managed-agent@1" in stopped
     assert "managed-1" not in reg.load_registry(str(reg_dir))["instances"]
     assert not tree.exists()
 
@@ -182,8 +183,8 @@ def test_perform_uninstall_instance_keep_data(reg_dir, monkeypatch, tmp_path):
         reg.register_instance(
             role="simulate",
             instance_id=3,
-            agent_unit="lsagent-simulate@3",
-            logstash_unit="ls-simulate@3",
+            agent_unit="simulate-agent@3",
+            logstash_unit="simulate-logstash@3",
             path_root=str(tree),
             state_dir=str(reg_dir),
         )
@@ -197,6 +198,375 @@ def test_perform_uninstall_instance_keep_data(reg_dir, monkeypatch, tmp_path):
             purge=False, instance="simulate-3", keep_data=True
         )
 
-    assert "lsagent-simulate@3" in stopped
+    assert "simulate-agent@3" in stopped
     assert "simulate-3" not in reg.load_registry(str(reg_dir))["instances"]
     assert tree.exists()
+
+
+# ---------- S1 upgrade tests ----------
+
+def _write_legacy_registry(state_dir: Path, instance_id: int = 2) -> None:
+    """Write a registry JSON with old-style unit names (pre-rename)."""
+    import json
+    reg_file = state_dir / "install-registry.json"
+    reg_file.write_text(json.dumps({
+        "package": {},
+        "instances": {
+            f"managed-{instance_id}": {
+                "id": f"managed-{instance_id}",
+                "role": "managed",
+                "instance_id": instance_id,
+                "agent_unit": f"logstash-agent@{instance_id}",
+                "logstash_unit": f"logstash-managed@{instance_id}",
+            },
+            f"simulate-{instance_id}": {
+                "id": f"simulate-{instance_id}",
+                "role": "simulate",
+                "instance_id": instance_id,
+                "agent_unit": f"lsagent-simulate@{instance_id}",
+                "logstash_unit": f"ls-simulate@{instance_id}",
+            },
+        },
+    }))
+
+
+def test_list_instances_rewrites_legacy_unit_names(tmp_path):
+    """acceptance A1: list_instances() returns canonical names from stale registry."""
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    _write_legacy_registry(state_dir, instance_id=2)
+
+    with patch("logstashagent.install_registry.discover_instances_from_disk", return_value=[]):
+        instances = reg.list_instances(str(state_dir), include_discovered=False)
+
+    by_id = {e["id"]: e for e in instances}
+    assert by_id["managed-2"]["agent_unit"] == "managed-agent@2", by_id["managed-2"]
+    assert by_id["managed-2"]["logstash_unit"] == "managed-logstash@2", by_id["managed-2"]
+    assert by_id["simulate-2"]["agent_unit"] == "simulate-agent@2", by_id["simulate-2"]
+    assert by_id["simulate-2"]["logstash_unit"] == "simulate-logstash@2", by_id["simulate-2"]
+
+
+def test_registry_persists_canonical_unit_names(tmp_path):
+    """acceptance A2: canonical names written back to JSON after rewrite."""
+    import json
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    _write_legacy_registry(state_dir, instance_id=3)
+
+    with patch("logstashagent.install_registry.discover_instances_from_disk", return_value=[]):
+        reg.list_instances(str(state_dir), include_discovered=False)
+
+    data = json.loads((state_dir / "install-registry.json").read_text())
+    assert data["instances"]["managed-3"]["agent_unit"] == "managed-agent@3"
+    assert data["instances"]["managed-3"]["logstash_unit"] == "managed-logstash@3"
+    assert data["instances"]["simulate-3"]["agent_unit"] == "simulate-agent@3"
+    assert data["instances"]["simulate-3"]["logstash_unit"] == "simulate-logstash@3"
+
+
+def test_migrate_canonical_registry_noop(tmp_path):
+    """acceptance A5: already-canonical entries are left untouched (idempotent)."""
+    import json
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    # Write canonical registry from the start.
+    reg_file = state_dir / "install-registry.json"
+    reg_file.write_text(json.dumps({
+        "package": {},
+        "instances": {
+            "managed-1": {
+                "id": "managed-1",
+                "role": "managed",
+                "instance_id": 1,
+                "agent_unit": "managed-agent@1",
+                "logstash_unit": "managed-logstash@1",
+            },
+        },
+    }))
+
+    with patch("logstashagent.install_registry.discover_instances_from_disk", return_value=[]):
+        instances1 = reg.list_instances(str(state_dir), include_discovered=False)
+        instances2 = reg.list_instances(str(state_dir), include_discovered=False)
+
+    assert instances1[0]["agent_unit"] == "managed-agent@1"
+    assert instances2[0]["agent_unit"] == "managed-agent@1"
+
+    # Bare logstash-agent (no @) must not be rewritten.
+    reg_file.write_text(json.dumps({
+        "package": {},
+        "instances": {
+            "packaged": {
+                "id": "packaged",
+                "role": "packaged",
+                "agent_unit": "logstash-agent",
+                "logstash_unit": "logstash",
+            },
+        },
+    }))
+    with patch("logstashagent.install_registry.discover_instances_from_disk", return_value=[]):
+        packed = reg.list_instances(str(state_dir), include_discovered=False)
+    assert packed[0]["agent_unit"] == "logstash-agent", "bare packaged unit was rewritten"
+
+
+# ---------- S2 upgrade tests ----------
+
+def _legacy_reg_json(state_dir: Path, instance_id: int = 2) -> None:
+    """Write a registry with old-style unit names for the given instance_id."""
+    import json
+    reg_file = state_dir / "install-registry.json"
+    reg_file.write_text(json.dumps({
+        "package": {},
+        "instances": {
+            f"managed-{instance_id}": {
+                "id": f"managed-{instance_id}",
+                "role": "managed",
+                "instance_id": instance_id,
+                "agent_unit": f"logstash-agent@{instance_id}",
+                "logstash_unit": f"logstash-managed@{instance_id}",
+            },
+        },
+    }))
+
+
+def test_a3_migrate_copies_legacy_enabled_state_not_enable_now(tmp_path, monkeypatch):
+    """acceptance A3: REWRITE of test_migrate_enables_canonical_units.
+
+    The previous version pinned ``enable --now`` for both canonical units, which
+    always STARTED a unit the operator may have stopped and always ENABLED one
+    the operator may have disabled. The copy now follows the probed legacy state,
+    and the legacy names are probed directly (never the rewritten registry entry).
+    """
+    from logstashagent import installer
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    _legacy_reg_json(state_dir, instance_id=2)
+
+    systemctl_calls = []
+
+    def fake_systemctl_cmd(*args, check=False):
+        systemctl_calls.append(list(args))
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        r = R()
+        if args[0] == "cat":
+            r.returncode = 0  # legacy unit exists
+        elif args[0] == "is-enabled":
+            r.returncode = 0 if args[1] == "logstash-agent@2" else 1
+        elif args[0] == "is-active":
+            r.returncode = 1  # stopped on the host
+        return r
+
+    monkeypatch.setattr(installer, "_systemctl_cmd", fake_systemctl_cmd)
+    monkeypatch.setattr(installer, "_systemctl_bin", lambda: "/usr/bin/systemctl")
+
+    monkeypatch.setattr(installer.subprocess, "run", lambda *a, **k: type("R", (), {"returncode": 0, "stdout": ""})())
+
+    with patch("logstashagent.install_registry.discover_instances_from_disk", return_value=[]):
+        installer.migrate_legacy_systemd_units(state_dir=str(state_dir))
+
+    # The legacy name was probed, and the enabled state was COPIED to the canonical name.
+    assert ["is-enabled", "logstash-agent@2"] in systemctl_calls, systemctl_calls
+    assert ["enable", "managed-agent@2"] in systemctl_calls, systemctl_calls
+    # Legacy logstash unit was disabled -> canonical must NOT be enabled.
+    assert ["enable", "managed-logstash@2"] not in systemctl_calls, systemctl_calls
+    # Nothing was active -> nothing may be started.
+    assert not [c for c in systemctl_calls if c[0] == "start"], systemctl_calls
+    # Never --now.
+    assert not [c for c in systemctl_calls if c[:2] == ["enable", "--now"]], systemctl_calls
+
+    # Must NOT enable bare packaged units.
+    enabled_units = [c[-1] for c in systemctl_calls if c[0] == "enable"]
+    assert "logstash-agent" not in enabled_units
+    assert "logstash" not in enabled_units
+
+
+def test_a3_migrate_legacy_missing_is_noop(tmp_path, monkeypatch):
+    """acceptance A3e: no legacy unit on the host -> no enable/start calls at all.
+
+    The enabled/active readings are truthy on purpose: a missing unit reads as
+    disabled+inactive through the returncode-only wrappers, so only the
+    existence probe can tell them apart, and it must gate the action — and with
+    no old template files present the privileged work must not run either.
+    """
+    from logstashagent import installer
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    _legacy_reg_json(state_dir, instance_id=2)
+    sysdir = tmp_path / "systemd"
+    sysdir.mkdir()
+
+    systemctl_calls = []
+
+    def fake_systemctl_cmd(*args, check=False):
+        systemctl_calls.append(list(args))
+        r = type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        if args[0] == "cat":
+            r.returncode = 1  # unit does not exist
+        return r
+
+    monkeypatch.setattr(installer, "_systemctl_cmd", fake_systemctl_cmd)
+    monkeypatch.setattr(installer, "_systemctl_bin", lambda: "/usr/bin/systemctl")
+    monkeypatch.setattr(installer.subprocess, "run", lambda *a, **k: type("R", (), {"returncode": 0, "stdout": ""})())
+
+    with patch("logstashagent.install_registry.discover_instances_from_disk", return_value=[]):
+        installer.migrate_legacy_systemd_units(
+            systemd_dir=str(sysdir), state_dir=str(state_dir),
+        )
+
+    assert not [c for c in systemctl_calls if c[0] in ("enable", "start")], systemctl_calls
+    assert not [c for c in systemctl_calls if c[0] == "daemon-reload"], (
+        f"no legacy artifact exists, yet privileged work ran: {systemctl_calls}"
+    )
+
+
+def test_a2_perform_upgrade_installs_templates_and_migrates(tmp_path, monkeypatch):
+    """acceptance A2: perform_upgrade installs the four templates AND runs migrate."""
+    from logstashagent import installer
+
+    installed = []
+    migrated = []
+
+    monkeypatch.setattr(installer, "install_multi_instance_unit_templates",
+                        lambda: installed.append(True))
+    monkeypatch.setattr(installer, "migrate_legacy_systemd_units",
+                        lambda **kw: migrated.append(kw))
+
+    with patch.object(installer, "verify_root"), \
+         patch.object(installer, "verify_platform"), \
+         patch.object(installer.os.path, "exists", return_value=True), \
+         patch.object(installer, "download_release", return_value="/tmp/x.tgz"), \
+         patch.object(installer, "extract_binary", return_value="/tmp/bin/logstash-agent"), \
+         patch.object(installer, "verify_service_running", return_value=True), \
+         patch.object(installer, "_systemctl_cmd", return_value=type("R", (), {"returncode": 0, "stdout": b"", "stderr": b""})()), \
+         patch("tempfile.mkdtemp", return_value="/tmp/test"), \
+         patch("shutil.copy2"), patch("shutil.copytree"), patch("shutil.rmtree"), \
+         patch("os.chmod"), patch("os.rename"), patch("os.remove"), \
+         patch("time.sleep"), patch("subprocess.run") as run:
+        run.return_value = type("R", (), {"returncode": 1, "stdout": b"", "stderr": b""})()
+        installer.perform_upgrade("0.5.9", auto=False)
+
+    assert installed, "perform_upgrade did not install the multi-instance templates"
+    assert migrated, "perform_upgrade did not run the legacy-name migrate"
+
+
+def test_install_templates_invokes_unit_migrate(tmp_path, monkeypatch):
+    """acceptance A4a: install_multi_instance_unit_templates calls migrate_legacy_systemd_units."""
+    from logstashagent import installer
+
+    # Stub template install mechanics so we don't need actual service files.
+    monkeypatch.setattr(installer, "_read_unit_template", lambda n: f"[Unit]\nDescription={n}\n")
+
+    dests = {
+        "lsagent_simulate_unit": str(tmp_path / "simulate-agent@.service"),
+        "ls_simulate_unit": str(tmp_path / "simulate-logstash@.service"),
+        "logstash_agent_template_unit": str(tmp_path / "managed-agent@.service"),
+        "logstash_managed_unit": str(tmp_path / "managed-logstash@.service"),
+    }
+    for k, v in dests.items():
+        monkeypatch.setitem(installer.INSTALL_PATHS, k, v)
+
+    migrate_calls = []
+    monkeypatch.setattr(installer, "migrate_legacy_systemd_units", lambda **kw: migrate_calls.append(kw))
+
+    with patch.object(installer.subprocess, "run", return_value=type("R", (), {"returncode": 0})()) as _run:
+        installer.install_multi_instance_unit_templates()
+
+    assert migrate_calls, "install_multi_instance_unit_templates did not call migrate_legacy_systemd_units"
+
+
+def test_list_instances_invokes_unit_migrate(tmp_path, monkeypatch):
+    """acceptance A4b: list_instances invokes migrate when it rewrites stale unit names."""
+    from logstashagent import installer
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    _legacy_reg_json(state_dir, instance_id=5)
+
+    migrate_calls = []
+    monkeypatch.setattr(installer, "migrate_legacy_systemd_units", lambda **kw: migrate_calls.append(kw))
+
+    with patch("logstashagent.install_registry.discover_instances_from_disk", return_value=[]):
+        reg.list_instances(str(state_dir), include_discovered=False)
+
+    assert migrate_calls, "list_instances did not invoke migrate_legacy_systemd_units after rewriting stale units"
+
+    # Second call (already canonical): migrate must NOT be called again.
+    migrate_calls.clear()
+    with patch("logstashagent.install_registry.discover_instances_from_disk", return_value=[]):
+        reg.list_instances(str(state_dir), include_discovered=False)
+
+    assert not migrate_calls, "list_instances called migrate unnecessarily on already-canonical entries"
+
+
+def test_rewrite_legacy_unit_logs_on_import_error(caplog, monkeypatch):
+    """acceptance A1/A4/D1: ImportError from import is caught, logged, returns unchanged."""
+    import types, sys, logging
+    from logstashagent import install_registry
+
+    # Replace installer in sys.modules with a stub that lacks _canonical_for_old_instance.
+    # 'from logstashagent.installer import _canonical_for_old_instance' then raises ImportError.
+    dummy = types.ModuleType("logstashagent.installer")
+    monkeypatch.setitem(sys.modules, "logstashagent.installer", dummy)
+
+    with caplog.at_level(logging.WARNING, logger="logstashagent.install_registry"):
+        result = install_registry._rewrite_legacy_unit("logstash-managed@1")
+
+    assert result == "logstash-managed@1"
+    assert any("_rewrite_legacy_unit" in r.message for r in caplog.records), caplog.records
+
+
+def test_rewrite_legacy_unit_propagates_non_import_error(monkeypatch):
+    """acceptance A1: non-ImportError from mapping call propagates (not swallowed)."""
+    import types, sys, pytest
+    from logstashagent import install_registry
+
+    def boom(unit):
+        raise RuntimeError("mapping logic error")
+
+    # Replace installer with a stub whose mapping function raises RuntimeError.
+    # The except ImportError clause must NOT catch this.
+    dummy = types.ModuleType("logstashagent.installer")
+    dummy._canonical_for_old_instance = boom
+    monkeypatch.setitem(sys.modules, "logstashagent.installer", dummy)
+
+    with pytest.raises(RuntimeError, match="mapping logic error"):
+        install_registry._rewrite_legacy_unit("logstash-managed@1")
+
+
+def test_list_instances_migrate_failure_is_logged(tmp_path, caplog, monkeypatch):
+    """acceptance A4/D2: list_instances logs (not silently ignores) migrate failure."""
+    import json, logging
+    from logstashagent import install_registry as reg_mod
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    # Write stale registry to trigger dirty path.
+    (state_dir / "install-registry.json").write_text(json.dumps({
+        "package": {},
+        "instances": {
+            "managed-1": {
+                "id": "managed-1",
+                "role": "managed",
+                "instance_id": 1,
+                "agent_unit": "logstash-agent@1",
+                "logstash_unit": "logstash-managed@1",
+            },
+        },
+    }))
+
+    def bad_migrate(**kw):
+        raise RuntimeError("migrate exploded")
+
+    # Patch the name inside install_registry's import namespace.
+    with patch("logstashagent.install_registry.discover_instances_from_disk", return_value=[]), \
+         patch("logstashagent.installer.migrate_legacy_systemd_units", side_effect=bad_migrate):
+        with caplog.at_level(logging.WARNING, logger="logstashagent.install_registry"):
+            result = reg_mod.list_instances(str(state_dir), include_discovered=False)
+
+    # The call must not raise; registry rewrite still applied.
+    assert result[0]["agent_unit"] == "managed-agent@1"
+    # And must have logged a warning about the migrate failure.
+    assert any("migrate" in r.message.lower() for r in caplog.records), caplog.records

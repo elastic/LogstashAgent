@@ -10,10 +10,10 @@ except NameError:
 _systemd = _root / "src" / "logstashagent" / "systemd"
 _unit_datas = []
 for _name in (
-    "lsagent-simulate@.service",
-    "ls-simulate@.service",
-    "logstash-agent@.service",
-    "logstash-managed@.service",
+    "simulate-agent@.service",
+    "simulate-logstash@.service",
+    "managed-agent@.service",
+    "managed-logstash@.service",
 ):
     _p = _systemd / _name
     if _p.is_file():

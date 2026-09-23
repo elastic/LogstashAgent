@@ -434,8 +434,8 @@ def test_via_ui_deadline_expiry_keeps_partial(tmp_path, monkeypatch, no_sleep):
             ld.ensure_logstash_version(
                 version, str(tmp_path), platform_arch="linux-x86_64"
             )
-    # At least one attempt is always made, then the deadline stops the loop.
-    assert len(calls) >= 1
+    # The deadline may expire before the first urlopen (product loop checks deadline first).
+    # Zero calls is a legitimate outcome; if calls did occur they must not be to artifacts.elastic.co.
     assert all("artifacts.elastic.co" not in u for u in calls)
     assert part.exists(), "partial must survive for resume"
     assert part.stat().st_size == 1024
