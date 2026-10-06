@@ -1,0 +1,42 @@
+#Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+#or more contributor license agreements. Licensed under the Elastic License;
+#you may not use this file except in compliance with the Elastic License.
+
+name: Build Binary (Test)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag, or commit to build'
+        required: true
+        default: 'main'
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64
+    env:
+      UV_PYTHON: /opt/python/cp312-cp312/bin/python3.12
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Sync deps
+        run: uv sync --dev
+
+      - name: Build executable
+        run: uv run pyinstaller logstash-agent.spec
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: logstash-agent-linux-amd64-manylinux
+          path: dist/logstash-agent/
+          retention-days: 7
