@@ -18,7 +18,7 @@ jobs:
     container:
       image: quay.io/pypa/manylinux_2_28_x86_64
     env:
-      UV_PYTHON: /opt/python/cp312-cp312/bin/python3.12
+      UV_PYTHON: "3.12"
 
     steps:
       - uses: actions/checkout@v4
