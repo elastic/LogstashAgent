@@ -35,9 +35,14 @@ jobs:
       - name: Build executable
         run: uv run pyinstaller --noconfirm logstash-agent.spec
 
+      - name: Archive release bundle
+        run: |
+          mkdir -p release
+          tar -czf release/logstash-agent-linux-amd64.tar.gz -C dist logstash-agent
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: logstash-agent-linux-amd64-manylinux
-          path: dist/logstash-agent/
+          name: logstash-agent-linux-amd64
+          path: release/logstash-agent-linux-amd64.tar.gz
           retention-days: 7
