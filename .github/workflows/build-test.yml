@@ -19,6 +19,7 @@ jobs:
       image: quay.io/pypa/manylinux_2_28_x86_64
     env:
       UV_PYTHON: "3.12"
+      UV_PYTHON_PREFERENCE: only-managed
 
     steps:
       - uses: actions/checkout@v4
@@ -32,7 +33,7 @@ jobs:
         run: uv sync --dev
 
       - name: Build executable
-        run: uv run pyinstaller logstash-agent.spec
+        run: uv run pyinstaller --noconfirm logstash-agent.spec
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
