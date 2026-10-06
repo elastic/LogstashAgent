@@ -46,7 +46,7 @@ def _systemctl_side_effect(cmd, **kwargs):
         r.stdout = "enabled\n"
     elif action == "is-active":
         # Logstash unit is enable-only (not started)
-        if unit.startswith("ls-simulate") or unit.startswith("logstash-managed"):
+        if installer._is_logstash_unit(unit):
             r.returncode = 3
             r.stdout = "inactive\n"
         else:
@@ -58,12 +58,13 @@ def test_enable_simulate_services_starts_agent_not_logstash():
     with patch.object(installer.subprocess, "run", side_effect=_systemctl_side_effect) as run:
         status = installer.enable_simulate_services(3)
     args_list = [tuple(c.args[0]) for c in run.call_args_list]
-    assert ("systemctl", "enable", "ls-simulate@3") in args_list
+    # acceptance A2: install path uses canonical simulate-* names
+    assert ("systemctl", "enable", "simulate-logstash@3") in args_list
     joined = [" ".join(a) for a in args_list]
-    assert any("lsagent-simulate@3" in j and ("--now" in j or "start" in j) for j in joined)
-    # Must not start ls-simulate@3 at install
-    assert ("systemctl", "start", "ls-simulate@3") not in args_list
-    assert not any(j == "systemctl enable --now ls-simulate@3" for j in joined)
+    assert any("simulate-agent@3" in j and ("--now" in j or "start" in j) for j in joined)
+    # Must not start simulate-logstash@3 at install
+    assert ("systemctl", "start", "simulate-logstash@3") not in args_list
+    assert not any(j == "systemctl enable --now simulate-logstash@3" for j in joined)
     assert status["agent_enabled"] is True
     assert status["agent_active"] is True
     assert status["ls_enabled"] is True
@@ -132,13 +133,13 @@ def test_restart_running_agent_units_restarts_active_agent_not_logstash(monkeypa
             },
             {
                 "id": "managed-1",
-                "agent_unit": "logstash-agent@1",
-                "logstash_unit": "logstash-managed@1",
+                "agent_unit": "managed-agent@1",
+                "logstash_unit": "managed-logstash@1",
             },
             {
                 "id": "simulate-2",
-                "agent_unit": "lsagent-simulate@2",
-                "logstash_unit": "ls-simulate@2",
+                "agent_unit": "simulate-agent@2",
+                "logstash_unit": "simulate-logstash@2",
             },
         ],
     )
@@ -148,7 +149,7 @@ def test_restart_running_agent_units_restarts_active_agent_not_logstash(monkeypa
         calls.append((action, unit))
         r = MagicMock(returncode=0, stdout="active\n", stderr="")
         if action == "is-active":
-            if unit in ("logstash-agent", "logstash-agent@1"):
+            if unit in ("logstash-agent", "managed-agent@1"):
                 r.returncode = 0
                 r.stdout = "active\n"
             else:
@@ -162,11 +163,11 @@ def test_restart_running_agent_units_restarts_active_agent_not_logstash(monkeypa
     checked = [u for a, u in calls if a == "is-active"]
     restarted = [u for a, u in calls if a == "restart"]
     assert "logstash-agent" in checked
-    assert "logstash-agent@1" in checked
-    assert "lsagent-simulate@2" in checked
+    assert "managed-agent@1" in checked
+    assert "simulate-agent@2" in checked
     assert checked.count("logstash-agent") == 1
     assert "logstash" not in checked
-    assert "logstash-managed@1" not in checked
-    assert "ls-simulate@2" not in checked
-    assert restarted == ["logstash-agent", "logstash-agent@1"]
-    assert "lsagent-simulate@2" not in restarted
+    assert "managed-logstash@1" not in checked
+    assert "simulate-logstash@2" not in checked
+    assert restarted == ["logstash-agent", "managed-agent@1"]
+    assert "simulate-agent@2" not in restarted

@@ -6,6 +6,7 @@
 
 import hashlib
 import json
+import logging
 import os
 import subprocess
 from pathlib import Path
@@ -156,7 +157,7 @@ class TestHealStaleLogstashLaunch:
             "mode": mode,
             "settings_path": str(settings),
             "keystore_env_file": str(tmp_path / "env"),
-            "logstash_unit": "logstash-managed@1",
+            "logstash_unit": "managed-logstash@1",
         }
         state.update(extra)
         return state
@@ -168,7 +169,7 @@ class TestHealStaleLogstashLaunch:
 
     def test_adds_ls_jvm_opts_without_touching_units(self, tmp_path):
         state = self._state(tmp_path)
-        unit = tmp_path / "logstash-managed@.service"
+        unit = tmp_path / "managed-logstash@.service"
         unit.write_text('ExecStart=/bin/bash -c \'exec "${LOGSTASH_BINARY}" --path.settings "${LOGSTASH_PATH_SETTINGS}"\'\n')
 
         with patch.dict(
@@ -184,7 +185,7 @@ class TestHealStaleLogstashLaunch:
 
     def test_stale_unit_triggers_template_reinstall_as_root(self, tmp_path):
         state = self._state(tmp_path)
-        unit = tmp_path / "logstash-managed@.service"
+        unit = tmp_path / "managed-logstash@.service"
         unit.write_text('ExecStart=/bin/bash -c \'exec "${LOGSTASH_BINARY}" --path.settings="${LOGSTASH_PATH_SETTINGS}"\'\n')
 
         with patch.dict(
@@ -199,7 +200,7 @@ class TestHealStaleLogstashLaunch:
 
     def test_stale_unit_escalates_via_sudo_when_not_root(self, tmp_path):
         state = self._state(tmp_path)
-        unit = tmp_path / "logstash-managed@.service"
+        unit = tmp_path / "managed-logstash@.service"
         unit.write_text('ExecStart=/bin/bash -c \'exec "${LOGSTASH_BINARY}" --path.settings="${LOGSTASH_PATH_SETTINGS}"\'\n')
 
         inst = controller_installer()
@@ -216,7 +217,7 @@ class TestHealStaleLogstashLaunch:
 
     def test_failed_escalation_still_leaves_env_fix(self, tmp_path):
         state = self._state(tmp_path)
-        unit = tmp_path / "logstash-managed@.service"
+        unit = tmp_path / "managed-logstash@.service"
         unit.write_text('ExecStart=/bin/bash -c \'exec "${LOGSTASH_BINARY}" --path.settings="${LOGSTASH_PATH_SETTINGS}"\'\n')
 
         inst = controller_installer()
@@ -391,9 +392,9 @@ class TestLogstashUnitName:
         with patch.object(
             controller.agent_state,
             "get_state",
-            return_value={"logstash_unit": "ls-simulate@9", "mode": "host", "instance_id": 1},
+            return_value={"logstash_unit": "simulate-logstash@9", "mode": "host", "instance_id": 1},
         ):
-            assert controller._logstash_unit_name() == "ls-simulate@9"
+            assert controller._logstash_unit_name() == "simulate-logstash@9"
 
     def test_host_alias_maps_to_managed_unit(self):
         with patch.object(
@@ -401,7 +402,7 @@ class TestLogstashUnitName:
             "get_state",
             return_value={"mode": "host", "instance_id": 3},
         ):
-            assert controller._logstash_unit_name() == "logstash-managed@3"
+            assert controller._logstash_unit_name() == "managed-logstash@3"
 
     def test_default_and_agent_aliases_use_packaged_unit(self):
         for mode in ("default", "agent", "packaged", None):
@@ -925,6 +926,36 @@ class TestRunController:
         # At least one sleep while waiting (poll interval)
         assert sleep.called
 
+    @pytest.mark.parametrize(
+        "state,unit",
+        [
+            ({"agent_unit": "managed-agent@2", "instance_id": 9}, "managed-agent@2"),
+            ({"instance_id": 3}, "simulate-agent@3"),
+            ({}, "logstash-agent"),
+        ],
+    )
+    def test_unenrolled_restart_hint_uses_canonical_unit(self, state, unit, caplog):
+        """acceptance A3d: controller unenrolled restart hint uses canonical simulate unit."""
+        prefix = (
+            "If enrollment is already on disk, restart the unit: "
+            "sudo systemctl restart "
+        )
+        expected = prefix + unit
+        with caplog.at_level(logging.ERROR, logger="logstashagent.controller"):
+            with patch.object(controller.agent_state, "get_state", return_value=state):
+                with patch.object(controller.agent_state, "STATE_DIR", "/tmp/x"):
+                    with patch("time.sleep"):
+                        # 0 sets the deadline, 0 stays inside the 120s window,
+                        # 200 expires it. The fourth 200 is unused and matches
+                        # test_not_enrolled_returns_after_wait.
+                        with patch("time.monotonic", side_effect=[0, 0, 200, 200]):
+                            controller.run_controller()
+        restart = [
+            r.message for r in caplog.records if r.message.startswith(prefix)
+        ]
+        assert restart == [expected], [r.message for r in caplog.records]
+        assert "lsagent-simulate@" not in restart[0]
+
 
 class TestDecryptFromServer:
     def test_decrypts_value_successfully(self):
@@ -1409,3 +1440,132 @@ class TestLogstashProbePortDefault:
         base = kwargs.get("base_url") or (args[0] if args else "")
         assert str(base).endswith(":9561") or str(base) == "http://localhost:9561"
         assert "9600" not in str(base)
+
+
+class TestA6LegacySystemdHealOnCheckin:
+    """A6 day-2 heal: every check-in loop iteration, gated on artifact presence."""
+
+    def test_a6_no_legacy_artifact_skips_privileged_subprocess(self, monkeypatch):
+        """acceptance A6-no-legacy-skip: no artifact -> no privileged subprocess at all."""
+        called = []
+
+        monkeypatch.setattr(
+            controller_installer(), "has_legacy_systemd_artifact", lambda **kw: False
+        )
+        monkeypatch.setattr(
+            controller_installer(), "try_sudo_setup_simulate",
+            lambda: called.append("setup-simulate"),
+        )
+        monkeypatch.setattr(
+            controller_installer(), "try_sudo_configure_packaged",
+            lambda: called.append("configure"),
+        )
+
+        out = controller.heal_legacy_systemd_units_on_checkin({"mode": "simulate"})
+
+        assert out is False
+        assert called == [], f"privileged channel ran with no legacy artifact: {called}"
+
+    def test_a6_multinstance_uses_setup_simulate_not_configure(self, monkeypatch):
+        """acceptance A6: managed/simulate hosts heal via `sudo -n … setup-simulate`."""
+        calls = []
+
+        monkeypatch.setattr(
+            controller_installer(), "has_legacy_systemd_artifact", lambda **kw: True
+        )
+        monkeypatch.setattr(
+            controller_installer(), "try_sudo_setup_simulate",
+            lambda: (calls.append("setup-simulate"),
+                     {"status": "complete", "via": "sudo"})[1],
+        )
+        monkeypatch.setattr(
+            controller_installer(), "try_sudo_configure_packaged",
+            lambda: calls.append("configure"),
+        )
+
+        assert controller.heal_legacy_systemd_units_on_checkin({"mode": "managed"}) is True
+        assert calls == ["setup-simulate"], calls
+
+    def test_a6_packaged_uses_configure_yes(self, monkeypatch):
+        """acceptance A6-packaged: packaged hosts heal via `configure --yes`, not setup-simulate."""
+        calls = []
+
+        monkeypatch.setattr(
+            controller_installer(), "has_legacy_systemd_artifact", lambda **kw: True
+        )
+        monkeypatch.setattr(
+            controller_installer(), "try_sudo_configure_packaged",
+            lambda: (calls.append("configure"),
+                     {"status": "complete", "via": "sudo-configure"})[1],
+        )
+        monkeypatch.setattr(
+            controller_installer(), "try_sudo_setup_simulate",
+            lambda: calls.append("setup-simulate"),
+        )
+
+        assert controller.heal_legacy_systemd_units_on_checkin({"mode": "packaged"}) is True
+        assert calls == ["configure"], calls
+
+    def test_a6_failed_heal_returns_false_for_retry(self, monkeypatch):
+        """A6 retry: a heal that did not complete returns False so the next loop retries."""
+        monkeypatch.setattr(
+            controller_installer(), "has_legacy_systemd_artifact", lambda **kw: True
+        )
+        monkeypatch.setattr(
+            controller_installer(), "try_sudo_configure_packaged", lambda: None
+        )
+
+        assert controller.heal_legacy_systemd_units_on_checkin({"mode": "packaged"}) is False
+
+    def test_a6_gate_failure_does_not_raise(self, monkeypatch):
+        """A6: a gate that itself fails must not take the check-in loop down."""
+        def boom(**kw):
+            raise OSError("cannot stat /etc/systemd/system")
+
+        monkeypatch.setattr(controller_installer(), "has_legacy_systemd_artifact", boom)
+        assert controller.heal_legacy_systemd_units_on_checkin({"mode": "packaged"}) is False
+
+    def test_a6_check_in_loop_drives_heal_each_iteration(self, monkeypatch):
+        """acceptance A6-check-in-loop: the loop body calls the heal on EVERY iteration."""
+        heal_calls = []
+
+        monkeypatch.setattr(
+            controller, "heal_legacy_systemd_units_on_checkin",
+            lambda state=None: heal_calls.append(state),
+        )
+        monkeypatch.setattr(controller, "check_in", lambda: {"success": True})
+        monkeypatch.setattr(
+            controller.agent_state, "get_state",
+            lambda: {
+                "enrolled": True, "api_key": "k", "connection_id": 1,
+                "mode": "packaged", "logs_path": "",
+            },
+        )
+        monkeypatch.setattr(controller.agent_state, "STATE_DIR", "/tmp/x")
+        monkeypatch.setattr(
+            controller, "recover_incomplete_runtime_upgrade", lambda: None
+        )
+        monkeypatch.setattr(controller, "heal_stale_logstash_launch", lambda s: False)
+
+        # Let the loop iterate twice, then break out via KeyboardInterrupt.
+        iterations = {"n": 0}
+
+        class _Event:
+            def wait(self, timeout=None):
+                iterations["n"] += 1
+                if iterations["n"] >= 2:
+                    raise KeyboardInterrupt
+                return False
+
+            def clear(self):
+                return None
+
+        monkeypatch.setattr(controller.threading, "Event", lambda: _Event())
+        monkeypatch.setattr(controller, "LogstashLogWatcher", None, raising=False)
+        controller._log_watcher = None
+
+        controller.run_controller()
+
+        assert len(heal_calls) == 2, (
+            f"expected the heal on both loop iterations, got {len(heal_calls)}"
+        )

@@ -609,13 +609,17 @@ def test_source_agent_version_returns_dotted_version():
 
 
 def test_source_agent_version_pyproject_when_metadata_missing(monkeypatch):
+    import tomllib
     from importlib.metadata import PackageNotFoundError
+    from pathlib import Path
 
     def _missing(_name):
         raise PackageNotFoundError(_name)
 
     monkeypatch.setattr("importlib.metadata.version", _missing)
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    expected = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"]
     ver = installer.source_agent_version()
-    assert ver == AGENT_VERSION
+    assert ver == expected
     assert installer._VERSION_TOKEN_RE.fullmatch(ver)
     assert ver != "0.0.0+unknown"

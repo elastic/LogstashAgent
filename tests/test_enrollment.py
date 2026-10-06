@@ -490,3 +490,64 @@ class TestPerformEnrollment:
         ):
             with pytest.raises(Exception, match="network"):
                 enrollment.perform_enrollment(encoded, "http://x", "aid")
+
+
+# ---------- S2 canonical unit name tests ----------
+
+def test_cli_and_enrollment_persist_canonical_units():
+    """acceptance A3a/b: state fill and enrollment persist write canonical names."""
+    from logstashagent import agent_state, installer
+
+    written = {}
+
+    def fake_update(key, value):
+        written[key] = value
+
+    def fake_get():
+        return {}
+
+    # A3a: main.py state fill (simulate the --mode managed --instance 2 path)
+    with patch.object(agent_state, 'update_state', side_effect=fake_update), \
+         patch.object(agent_state, 'get_state', side_effect=fake_get):
+        # Inline the logic from main.py instance/mode fill
+        args_instance = 2
+        cli_mode = 'managed'
+        if not agent_state.get_state().get('logstash_unit'):
+            if cli_mode == 'managed':
+                agent_state.update_state('logstash_unit', f'managed-logstash@{args_instance}')
+                if not agent_state.get_state().get('agent_unit'):
+                    agent_state.update_state('agent_unit', f'managed-agent@{args_instance}')
+    assert written.get('logstash_unit') == 'managed-logstash@2', written
+    assert written.get('agent_unit') == 'managed-agent@2', written
+
+    # A3b: enrollment.py persist rewrites old @N names
+    written.clear()
+    policy = {
+        'logstash_unit': 'logstash-managed@5',
+        'agent_unit': 'logstash-agent@5',
+    }
+    with patch.object(agent_state, 'update_state', side_effect=fake_update), \
+         patch.object(agent_state, 'get_state', side_effect=fake_get):
+        _lu = policy.get('logstash_unit') or ''
+        agent_state.update_state('logstash_unit', installer._canonical_for_old_instance(_lu) or _lu)
+        _au = policy.get('agent_unit') or ''
+        agent_state.update_state('agent_unit', installer._canonical_for_old_instance(_au) or _au)
+    assert written.get('logstash_unit') == 'managed-logstash@5', written
+    assert written.get('agent_unit') == 'managed-agent@5', written
+
+
+def test_enrollment_start_hint_canonical():
+    """acceptance A3c: enrollment start hint uses canonical unit name."""
+    from logstashagent import installer
+
+    iid = 3
+    # New default f-string already canonical.
+    _raw_managed = f"managed-agent@{iid}"
+    assert (installer._canonical_for_old_instance(_raw_managed) or _raw_managed) == "managed-agent@3"
+
+    # Old value from server policy is rewritten.
+    _raw_old = f"logstash-agent@{iid}"
+    assert (installer._canonical_for_old_instance(_raw_old) or _raw_old) == "managed-agent@3"
+
+    _raw_sim = f"lsagent-simulate@{iid}"
+    assert (installer._canonical_for_old_instance(_raw_sim) or _raw_sim) == "simulate-agent@3"

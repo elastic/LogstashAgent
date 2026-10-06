@@ -88,8 +88,8 @@ def test_smoke_registry_tracks_packaged_and_multi(host_tree):
         reg.register_instance(
             role="managed",
             instance_id=1,
-            agent_unit="logstash-agent@1",
-            logstash_unit="logstash-managed@1",
+            agent_unit="managed-agent@1",
+            logstash_unit="managed-logstash@1",
             path_root=str(host_tree["opt"] / "managed-1"),
             agent_api_port=9601,
             logstash_api_port=9701,
@@ -100,8 +100,8 @@ def test_smoke_registry_tracks_packaged_and_multi(host_tree):
         reg.register_instance(
             role="simulate",
             instance_id=1,
-            agent_unit="lsagent-simulate@1",
-            logstash_unit="ls-simulate@1",
+            agent_unit="simulate-agent@1",
+            logstash_unit="simulate-logstash@1",
             path_root=str(host_tree["opt"] / "simulate-1"),
             agent_api_port=9501,
             logstash_api_port=9561,
@@ -113,8 +113,8 @@ def test_smoke_registry_tracks_packaged_and_multi(host_tree):
     ids = {i["id"] for i in instances}
     assert ids == {"packaged", "managed-1", "simulate-1"}
     table = reg.format_instances_table(instances)
-    assert "logstash-agent@1" in table
-    assert "lsagent-simulate@1" in table
+    assert "managed-agent@1" in table
+    assert "simulate-agent@1" in table
     data = json.loads(reg.registry_path(str(host_tree["var"])).read_text())
     assert data["package"]["agent_version"] == "0.5.1"
 
@@ -158,8 +158,11 @@ def test_smoke_materialize_managed_and_simulate_isolated(host_tree):
         )
     assert m["mode"] == "managed"
     assert s["mode"] == "simulate"
-    assert m["agent_unit"] == "logstash-agent@1"
-    assert s["agent_unit"] == "lsagent-simulate@1"
+    # acceptance A1: canonical <nodetype>-<instance>@N names
+    assert m["agent_unit"] == "managed-agent@1"
+    assert m["logstash_unit"] == "managed-logstash@1"
+    assert s["agent_unit"] == "simulate-agent@1"
+    assert s["logstash_unit"] == "simulate-logstash@1"
     # Isolation env vars for coexistence
     m_env = Path(m["agent_env"]).read_text()
     assert "LOGSTASH_AGENT_STATE_DIR=" in m_env
@@ -213,12 +216,12 @@ def test_smoke_state_relocate_preserves_packaged(host_tree):
 def test_smoke_unit_templates_shipped():
     d = installer._systemd_template_dir()
     for name in (
-        "logstash-agent@.service",
-        "logstash-managed@.service",
-        "lsagent-simulate@.service",
-        "ls-simulate@.service",
+        "simulate-agent@.service",
+        "simulate-logstash@.service",
+        "managed-agent@.service",
+        "managed-logstash@.service",
     ):
         assert (d / name).is_file(), name
-    agent_unit = (d / "logstash-agent@.service").read_text()
+    agent_unit = (d / "managed-agent@.service").read_text()
     assert "LOGSTASH_AGENT_STATE_DIR" in agent_unit or "managed-%i" in agent_unit
     assert "--mode managed" in agent_unit

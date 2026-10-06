@@ -1,3 +1,43 @@
+## [0.5.3] - Canonical systemd unit names, RPS scale testing - 10/06/2026
+
+Package version is **0.5.3**. Pair with **LogstashUI 0.5.3** (lockstep).
+
+### Added
+
+- Upgrades rename existing systemd units automatically. `migrate_legacy_systemd_units` runs from `perform_upgrade`, template install, and `list_instances`. It checks whether each legacy unit is enabled or active (using `systemctl cat` to confirm the unit exists), copies those two states to the canonical unit separately, removes the four old host template files, installs the canonical templates, and runs `daemon-reload` before and after the install. It never runs `enable --now`, so a unit the operator stopped stays stopped and a unit the operator disabled stays disabled. If removing a file fails, the next run tries again. Each rename prints a `renamed: <old> -> <canonical>` line.
+- Already-enrolled hosts repair themselves on check-in. `heal_legacy_systemd_units_on_checkin` runs on every check-in loop, but only escalates when a legacy unit file is actually present (that check needs no privileges). Multi-instance hosts escalate through `sudo -n … setup-simulate --yes` and packaged hosts through `sudo -n logstash-agent configure --yes`. The controller never writes to `/etc/systemd/system` itself.
+- `logstash-agent-ctl` accepts `is-enabled <unit>` and `daemon-reload` with no unit argument. The sudoers file is unchanged.
+- `scripts/scale_test.py` has an RPS mode. `--checkins-per-second` sends check-ins from a small agent pool at a fixed rate for `--rps-duration-seconds` (default 60). It reports the target rate, actual rate and success rate, and estimates how many agents that rate supports at the configured check-in interval (a nominal figure, and a conservative one that subtracts jitter). Results go to `scale-test-rps-<run_id>.json`.
+- New scale-test options: `--concurrent-enrollment`, `--checkin-interval-seconds`, `--checkin-jitter-seconds`, `--startup-spread-seconds`, `--checkin-concurrency`, `--verify-tls` (verifies against the enrollment-token trust; off by default) and `--yes`/`--no-yes`. HTTP errors are grouped and summarised.
+
+### Changed
+
+- **Multi-instance systemd units now use canonical `<nodetype>-<role>@N` names.** The four templates were renamed, and `logstash-agent.spec` bundles the new files:
+
+  | Old | New |
+  | --- | --- |
+  | `logstash-agent@N` | `managed-agent@N` |
+  | `logstash-managed@N` | `managed-logstash@N` |
+  | `lsagent-simulate@N` | `simulate-agent@N` |
+  | `ls-simulate@N` | `simulate-logstash@N` |
+
+  Packaged `logstash-agent` / `logstash` units are unchanged. The bare `logstash-agent` name (without `@`) is never rewritten.
+- The repo templates declare `User=logstash`/`Group=logstash` and `Alias=` lines for the old names. The installed copy on each host keeps those `Alias=` lines only if legacy files were present on that host (checked before they are removed), so clean installs never get the old names.
+- Old `@N` names are converted to canonical names wherever they appear: registry discovery, `resolve_multi_instance_units`, policy `agent_unit`/`logstash_unit` saved at enrollment, controller restart hints, `main.py` state fill, and `install-registry.json`. `list_instances` saves the corrected entries back to the registry.
+- `logstash-agent-ctl` accepts both canonical and old instance names. An old name prints `DEPRECATED` plus the canonical name to stderr, then calls `systemctl` with the canonical name.
+- `pyproject.toml` versions use the PEP 440 form (`0.5.3.devN` rather than `0.5.3-devN`), and `_VERSION_TOKEN_RE` accepts `.devN` suffixes.
+
+### Fixed
+
+- `systemctl` returned `Refusing to operate on linked unit file` when `enable_multi_instance_services` was given old `@N` names from policy or state. Those names are now rewritten to canonical names first.
+- `_rewrite_legacy_unit` and the `list_instances` upgrade hook no longer swallow exceptions silently. Only `ImportError` is caught (and logged as a warning); any other mapping error propagates.
+- Tests: the artifact-deadline test no longer assumes at least one `urlopen` call, and the source-version test reads the expected version from `pyproject.toml` instead of a hard-coded path or constant.
+
+### Upgrade notes
+
+- No re-enrollment needed. After the upgrade, or on the first check-in, the agent switches multi-instance units to the canonical names and keeps their enabled and running state. Scripts or monitoring that use the old names keep working through `Alias=` and the deprecated-name handling in `logstash-agent-ctl`, but should move to the new names.
+
+
 ## [0.5.2] - CLI modes, gated --help, env-vs-yml precedence - 09/02/2026
 
 Package version is **0.5.2**. Works with **LogstashUI 0.5.1 & 0.5.2**.

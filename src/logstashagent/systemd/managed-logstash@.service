@@ -34,3 +34,4 @@ Group=logstash
 
 [Install]
 WantedBy=multi-user.target
+Alias=logstash-managed@%i.service
