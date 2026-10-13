@@ -39,7 +39,7 @@ def test_replace_ctl_only_writes_ctl_and_exits_0(tmp_path, monkeypatch, extra):
     monkeypatch.setattr("builtins.input", _forbid("input"))
     code = _run(monkeypatch, ["logstash-agent", "upgrade", "--replace-ctl", *extra])
     assert code == 0
-    assert dest.read_text(encoding="utf-8") == installer._SYSTEMCTL_CTL_SCRIPT
+    assert dest.read_bytes() == installer._SYSTEMCTL_CTL_SCRIPT.encode()
     assert (dest.stat().st_mode & 0o777) == 0o755
 
 
@@ -92,11 +92,12 @@ def test_ignore_errors_does_not_skip_prompt(monkeypatch, capsys):
     assert _PROMPT_STEP in capsys.readouterr().out
 
 
-def test_ignore_errors_installerror_exits_1(monkeypatch):
-    # acceptance #10
+def test_ignore_errors_forwarded_to_perform_upgrade(monkeypatch):
+    # B1 mutant P: handler must forward --ignore-errors to perform_upgrade
+    seen = {}
+
     def perform_upgrade(**kwargs):
-        assert kwargs["ignore_errors"] is True
-        raise installer.InstallError("--ignore-errors: upgrade failed: boom")
+        seen.update(kwargs)
 
     monkeypatch.setattr(installer, "perform_upgrade", perform_upgrade)
     monkeypatch.setattr("builtins.input", _forbid("input"))
@@ -104,7 +105,53 @@ def test_ignore_errors_installerror_exits_1(monkeypatch):
         monkeypatch,
         ["logstash-agent", "upgrade", "--version", "0.1.4", "--yes", "--ignore-errors"],
     )
+    assert code == 0
+    assert seen["ignore_errors"] is True
+
+
+def test_replace_ctl_forwarded_to_perform_upgrade(monkeypatch):
+    # B1 mutant Q: handler must forward --replace-ctl to perform_upgrade
+    seen = {}
+
+    def perform_upgrade(**kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr(installer, "perform_upgrade", perform_upgrade)
+    monkeypatch.setattr("builtins.input", _forbid("input"))
+    code = _run(
+        monkeypatch,
+        ["logstash-agent", "upgrade", "--version", "0.1.4", "--yes", "--replace-ctl"],
+    )
+    assert code == 0
+    assert seen["replace_ctl"] is True
+
+
+def test_ignore_errors_installerror_exits_1(monkeypatch, caplog):
+    # acceptance #10: exit 1 via main's InstallError mapping, not the generic path
+    seen = {}
+
+    def perform_upgrade(**kwargs):
+        seen.update(kwargs)
+        raise installer.InstallError("--ignore-errors: upgrade failed: boom")
+
+    monkeypatch.setattr(installer, "perform_upgrade", perform_upgrade)
+    monkeypatch.setattr("builtins.input", _forbid("input"))
+    caplog.set_level("ERROR")
+    code = _run(
+        monkeypatch,
+        ["logstash-agent", "upgrade", "--version", "0.1.4", "--yes", "--ignore-errors"],
+    )
     assert code == 1
+    assert seen["ignore_errors"] is True
+    # InstallError message surfaced via the InstallError mapping (main.py upgrade handler)
+    assert any(
+        r.message == "Upgrade failed: --ignore-errors: upgrade failed: boom"
+        for r in caplog.records
+    )
+    # generic-Exception mapping did not run
+    assert not any(
+        r.message.startswith("Unexpected upgrade error") for r in caplog.records
+    )
 
 
 @pytest.mark.parametrize(
