@@ -266,7 +266,7 @@ def _expect_argv(flags=()):
         f"--unit=logstash-agent-upgrade-{version}-{_EPOCH}",
         "--collect",
         "--property=Type=exec",
-        sys.executable,
+        installer.INSTALL_PATHS["binary"],
         "upgrade",
         "--version",
         version,
@@ -385,7 +385,15 @@ def test_guard_not_called_when_predicate_false(monkeypatch, argv, euid):
     ],
 )
 def test_guard_reexec_exact_argv_once(monkeypatch, caplog, extra, flags):
-    # acceptance #3 #4 #5
+    # acceptance #1 #3 #4 #5
+    _real_exists = os.path.exists
+
+    def _exists(path):
+        if path == "/opt/logstash-agent/bin/logstash-agent":
+            return True
+        return _real_exists(path)
+
+    monkeypatch.setattr(os.path, "exists", _exists)
     _arm(monkeypatch, 0)
     calls = _spy_run(monkeypatch, subprocess.CompletedProcess([], 0, "", ""))
     seen = _seen_upgrade(monkeypatch)
@@ -485,4 +493,3 @@ def test_guard_other_exception_falls_back(monkeypatch, caplog):
         r.levelno == logging.WARNING and "detach-boom" in r.message
         for r in caplog.records
     )
-

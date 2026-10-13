@@ -7,7 +7,6 @@
 import logging
 import os
 import subprocess
-import sys
 import time
 from unittest.mock import MagicMock
 
@@ -180,9 +179,17 @@ def test_ignore_errors_skips_rollback_retains_backups(tmp_path, monkeypatch, cap
 
 
 def test_detach_upgrade_systemd_run_contract(tmp_path, monkeypatch):
-    # acceptance #3
+    # acceptance #1 #3
     calls = []
     env = {"ENV_SENTINEL": "detach"}
+    _real_exists = os.path.exists
+
+    def _exists(path):
+        if path == "/opt/logstash-agent/bin/logstash-agent":
+            return True
+        return _real_exists(path)
+
+    monkeypatch.setattr(os.path, "exists", _exists)
 
     def fake_run(argv, **kwargs):
         calls.append((list(argv), kwargs))
@@ -199,7 +206,7 @@ def test_detach_upgrade_systemd_run_contract(tmp_path, monkeypatch):
         "--unit=logstash-agent-upgrade-0.1.4-1700000000",
         "--collect",
         "--property=Type=exec",
-        sys.executable,
+        installer.INSTALL_PATHS["binary"],
         "upgrade",
         "--version",
         "0.1.4",
@@ -234,4 +241,3 @@ def test_detach_upgrade_systemd_run_contract(tmp_path, monkeypatch):
     assert argv[-3:] == ["--yes", "--ignore-errors", "--_detached"]
     assert "--replace-ctl" not in argv
     assert len(calls) == 1
-
