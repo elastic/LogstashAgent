@@ -5,7 +5,10 @@
 """perform_upgrade unit guard, ctl regen, and ignore-errors (acceptance #1 #2 #3 #6 #10)."""
 
 import logging
+import os
 import subprocess
+import sys
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -174,3 +177,61 @@ def test_ignore_errors_skips_rollback_retains_backups(tmp_path, monkeypatch, cap
     assert any(
         r.levelno == logging.WARNING and r.message == _IGNORE_WARNING for r in caplog.records
     )
+
+
+def test_detach_upgrade_systemd_run_contract(tmp_path, monkeypatch):
+    # acceptance #3
+    calls = []
+    env = {"ENV_SENTINEL": "detach"}
+
+    def fake_run(argv, **kwargs):
+        calls.append((list(argv), kwargs))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(installer.subprocess, "run", fake_run)
+    monkeypatch.setattr(installer, "host_subprocess_env", lambda: env)
+    monkeypatch.setattr(time, "time", lambda: 1700000000.4)
+
+    installer.detach_upgrade("0.1.4")
+    argv, kwargs = calls[0]
+    assert argv == [
+        "systemd-run",
+        "--unit=logstash-agent-upgrade-0.1.4-1700000000",
+        "--collect",
+        "--property=Type=exec",
+        sys.executable,
+        "upgrade",
+        "--version",
+        "0.1.4",
+        "--yes",
+        "--_detached",
+    ]
+    assert "--_self-upgrade" not in argv
+    assert "--yes" in argv
+    assert kwargs == {
+        "capture_output": True,
+        "text": True,
+        "timeout": 30,
+        "check": False,
+        "env": env,
+    }
+
+    binary = tmp_path / "logstash-agent"
+    binary.write_bytes(b"x")
+    monkeypatch.setitem(installer.INSTALL_PATHS, "binary", str(binary))
+    calls.clear()
+    installer.detach_upgrade("1.2.3", replace_ctl=True, ignore_errors=False)
+    argv, kwargs = calls[0]
+    assert argv[4] == str(binary)
+    assert argv[-3:] == ["--yes", "--replace-ctl", "--_detached"]
+    assert "--ignore-errors" not in argv
+    assert "--_self-upgrade" not in argv
+    assert os.path.exists(binary)
+
+    calls.clear()
+    installer.detach_upgrade("1.2.3", replace_ctl=False, ignore_errors=True)
+    argv, _kwargs = calls[0]
+    assert argv[-3:] == ["--yes", "--ignore-errors", "--_detached"]
+    assert "--replace-ctl" not in argv
+    assert len(calls) == 1
+

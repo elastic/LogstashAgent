@@ -3880,6 +3880,44 @@ def systemctl_via_sudo(action: str, unit: str, *, timeout: int = 30) -> subproce
     )
 
 
+def detach_upgrade(
+    version: str,
+    *,
+    replace_ctl: bool = False,
+    ignore_errors: bool = False,
+) -> subprocess.CompletedProcess:
+    """Re-launch this upgrade in a transient systemd-run unit (caller is root)."""
+    import time
+    epoch = int(time.time())
+    binary = INSTALL_PATHS['binary']
+    if not os.path.exists(binary):
+        binary = sys.executable
+    argv = [
+        'systemd-run',
+        f'--unit=logstash-agent-upgrade-{version}-{epoch}',
+        '--collect',
+        '--property=Type=exec',
+        binary,
+        'upgrade',
+        '--version',
+        version,
+        '--yes',
+    ]
+    if replace_ctl:
+        argv.append('--replace-ctl')
+    if ignore_errors:
+        argv.append('--ignore-errors')
+    argv.append('--_detached')
+    return subprocess.run(
+        argv,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+        env=host_subprocess_env(),
+    )
+
+
 def verify_service_running() -> bool:
     """
     Verify that the logstash-agent service is running.

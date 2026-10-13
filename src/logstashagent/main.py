@@ -3567,6 +3567,18 @@ Examples:
         action='store_true',
         help='Ignore upgrade errors and proceed without rollback'
     )
+    upgrade_parser.add_argument(
+        '--_self-upgrade',
+        dest='_self_upgrade',
+        action='store_true',
+        help=argparse.SUPPRESS,
+    )
+    upgrade_parser.add_argument(
+        '--_detached',
+        dest='_detached',
+        action='store_true',
+        help=argparse.SUPPRESS,
+    )
 
     # Legacy arguments for backward compatibility
     parser.add_argument(
@@ -3941,6 +3953,29 @@ if __name__ == "__main__":
                 logger.error("Failed to regenerate logstash-agent-ctl")
                 sys.exit(1)
             sys.exit(0)
+
+        if args._self_upgrade and not args._detached and os.geteuid() == 0:
+            import subprocess
+            try:
+                result = installer.detach_upgrade(
+                    args.version,
+                    replace_ctl=args.replace_ctl,
+                    ignore_errors=args.ignore_errors,
+                )
+            except subprocess.TimeoutExpired:
+                logger.error("systemd-run timed out")
+                sys.exit(1)
+            except OSError as exc:
+                logger.warning(f"systemd-run unavailable: {exc}")
+            except Exception as exc:
+                logger.warning(f"systemd-run failed: {exc}")
+            else:
+                if result.returncode == 0:
+                    logger.info("Re-launched upgrade in transient unit")
+                    sys.exit(0)
+                logger.warning(
+                    f"systemd-run failed rc={result.returncode}: {result.stderr}"
+                )
 
         if not args.yes and not args.force:
             print(f"\nThis will upgrade LogstashAgent to version {args.version}.")
