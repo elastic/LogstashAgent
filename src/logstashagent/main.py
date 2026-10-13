@@ -3545,13 +3545,39 @@ Examples:
         '--version',
         type=str,
         metavar='VERSION',
-        required=True,
         help='Version to upgrade to (e.g., 0.1.4)'
     )
     upgrade_parser.add_argument(
         '--yes',
         action='store_true',
         help='Skip the upgrade confirmation prompt'
+    )
+    upgrade_parser.add_argument(
+        '--replace-ctl',
+        action='store_true',
+        help='Regenerate the on-disk logstash-agent-ctl'
+    )
+    upgrade_parser.add_argument(
+        '--force',
+        action='store_true',
+        help='Force the upgrade; skip the confirmation prompt'
+    )
+    upgrade_parser.add_argument(
+        '--ignore-errors',
+        action='store_true',
+        help='Ignore upgrade errors and proceed without rollback'
+    )
+    upgrade_parser.add_argument(
+        '--_self-upgrade',
+        dest='_self_upgrade',
+        action='store_true',
+        help=argparse.SUPPRESS,
+    )
+    upgrade_parser.add_argument(
+        '--_detached',
+        dest='_detached',
+        action='store_true',
+        help=argparse.SUPPRESS,
     )
 
     # Legacy arguments for backward compatibility
@@ -3601,7 +3627,10 @@ Examples:
         help='Skip the enrollment confirmation prompt'
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.command == 'upgrade' and not args.version and not args.replace_ctl:
+        upgrade_parser.error('the following arguments are required: --version')
+    return args
 
 
 if __name__ == "__main__":
@@ -3917,7 +3946,38 @@ if __name__ == "__main__":
 
     # Check if we're in upgrade mode
     if args.command == 'upgrade':
-        if not args.yes:
+        if args.replace_ctl and not args.version:
+            try:
+                installer.install_systemctl_ctl()
+            except Exception:
+                logger.error("Failed to regenerate logstash-agent-ctl")
+                sys.exit(1)
+            sys.exit(0)
+
+        if args._self_upgrade and not args._detached and os.geteuid() == 0:
+            import subprocess
+            try:
+                result = installer.detach_upgrade(
+                    args.version,
+                    replace_ctl=args.replace_ctl,
+                    ignore_errors=args.ignore_errors,
+                )
+            except subprocess.TimeoutExpired:
+                logger.error("systemd-run timed out")
+                sys.exit(1)
+            except OSError as exc:
+                logger.warning(f"systemd-run unavailable: {exc}")
+            except Exception as exc:
+                logger.warning(f"systemd-run failed: {exc}")
+            else:
+                if result.returncode == 0:
+                    logger.info("Re-launched upgrade in transient unit")
+                    sys.exit(0)
+                logger.warning(
+                    f"systemd-run failed rc={result.returncode}: {result.stderr}"
+                )
+
+        if not args.yes and not args.force:
             print(f"\nThis will upgrade LogstashAgent to version {args.version}.")
             print("\nThe upgrade process will:")
             print(f"  1. Download version {args.version} from GitHub")
@@ -3934,7 +3994,12 @@ if __name__ == "__main__":
                 sys.exit(0)
 
         try:
-            installer.perform_upgrade(version=args.version, auto=False)
+            installer.perform_upgrade(
+                version=args.version,
+                auto=False,
+                replace_ctl=args.replace_ctl,
+                ignore_errors=args.ignore_errors,
+            )
             sys.exit(0)
         except installer.InstallError as e:
             logger.error(f"Upgrade failed: {e}")

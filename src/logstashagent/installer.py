@@ -3880,6 +3880,44 @@ def systemctl_via_sudo(action: str, unit: str, *, timeout: int = 30) -> subproce
     )
 
 
+def detach_upgrade(
+    version: str,
+    *,
+    replace_ctl: bool = False,
+    ignore_errors: bool = False,
+) -> subprocess.CompletedProcess:
+    """Re-launch this upgrade in a transient systemd-run unit (caller is root)."""
+    import time
+    epoch = int(time.time())
+    binary = INSTALL_PATHS['binary']
+    if not os.path.exists(binary):
+        binary = sys.executable
+    argv = [
+        'systemd-run',
+        f'--unit=logstash-agent-upgrade-{version}-{epoch}',
+        '--collect',
+        '--property=Type=exec',
+        binary,
+        'upgrade',
+        '--version',
+        version,
+        '--yes',
+    ]
+    if replace_ctl:
+        argv.append('--replace-ctl')
+    if ignore_errors:
+        argv.append('--ignore-errors')
+    argv.append('--_detached')
+    return subprocess.run(
+        argv,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+        env=host_subprocess_env(),
+    )
+
+
 def verify_service_running() -> bool:
     """
     Verify that the logstash-agent service is running.
@@ -3894,13 +3932,21 @@ def verify_service_running() -> bool:
         return False
 
 
-def perform_upgrade(version: str, auto: bool = False) -> None:
+def perform_upgrade(
+    version: str,
+    auto: bool = False,
+    *,
+    replace_ctl: bool = False,
+    ignore_errors: bool = False,
+) -> None:
     """
     Perform the upgrade process.
 
     Args:
         version: Version to upgrade to (e.g., "0.1.4")
         auto: If True, this is an automatic upgrade triggered by the controller
+        replace_ctl: If True, regenerate the on-disk ctl after Step 8b (non-fatal)
+        ignore_errors: If True, skip rollback when Step 9/10 fail
     """
     logger.info("="*60)
     logger.info(f"LOGSTASH AGENT UPGRADE TO VERSION {version}")
@@ -4078,92 +4124,106 @@ def perform_upgrade(version: str, auto: bool = False) -> None:
         except Exception as e:
             logger.warning("Legacy unit migrate during upgrade failed (non-fatal): %s", e)
 
-        # Step 9: Restart service (always restart after upgrade)
-        logger.info("\nStep 9: Restarting service with new binary...")
-        try:
-            _systemctl_cmd('restart', 'logstash-agent', check=True)
-            logger.info("✓ Service restarted")
-
-            # Step 10: Verify service is running
-            logger.info("\nStep 10: Verifying service health...")
-            import time
-            time.sleep(2)  # Give it a moment to start
-
-            if verify_service_running():
-                logger.info("✓ Service is running successfully")
-            else:
-                raise InstallError("Service failed to start with new binary")
-
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, InstallError) as e:
-            # Rollback!
-            logger.error(f"Service failed to start: {e}")
-            logger.info("\nPerforming rollback...")
-
-            rollback_success = True
-            rollback_errors = []
-
+        if replace_ctl:
             try:
-                # Stop the failed service
-                _systemctl_cmd('stop', 'logstash-agent')
-                logger.info("✓ Stopped failed service")
-            except Exception as stop_error:
-                logger.warning(f"Could not stop service: {stop_error}")
-                rollback_errors.append(f"Failed to stop service: {stop_error}")
+                install_systemctl_ctl()
+            except Exception as e:
+                logger.warning("Could not install systemctl helper: %s", e)
 
+        if not os.path.exists(INSTALL_PATHS['systemd_service']):
+            logger.warning(
+                "logstash-agent systemd unit not found; skipping service restart"
+            )
+        else:
+            # Step 9: Restart service (always restart after upgrade)
+            logger.info("\nStep 9: Restarting service with new binary...")
             try:
-                # Restore backup binary
-                if not os.path.exists(backup_path):
-                    raise InstallError(f"Backup binary not found at {backup_path}")
-                shutil.copy2(backup_path, INSTALL_PATHS['binary'])
-                logger.info("✓ Restored previous binary")
-            except Exception as restore_error:
-                logger.error(f"Failed to restore binary: {restore_error}")
-                rollback_errors.append(f"Failed to restore binary: {restore_error}")
-                rollback_success = False
+                _systemctl_cmd('restart', 'logstash-agent', check=True)
+                logger.info("✓ Service restarted")
 
-            try:
-                # Restore backup _internal if it exists
-                internal_backup_path = f"{INSTALL_PATHS['binary_dir']}/_internal.backup"
-                if os.path.exists(internal_backup_path):
-                    internal_dest = os.path.join(INSTALL_PATHS['binary_dir'], '_internal')
-                    if os.path.exists(internal_dest):
-                        shutil.rmtree(internal_dest)
-                    shutil.copytree(internal_backup_path, internal_dest)
-                    logger.info("✓ Restored previous dependencies")
-            except Exception as deps_error:
-                logger.warning(f"Failed to restore dependencies: {deps_error}")
-                rollback_errors.append(f"Failed to restore dependencies: {deps_error}")
+                # Step 10: Verify service is running
+                logger.info("\nStep 10: Verifying service health...")
+                import time
+                time.sleep(2)  # Give it a moment to start
 
-            if rollback_success:
+                if verify_service_running():
+                    logger.info("✓ Service is running successfully")
+                else:
+                    raise InstallError("Service failed to start with new binary")
+
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, InstallError) as e:
+                if ignore_errors:
+                    logger.warning("--ignore-errors: rollback skipped; backups retained")
+                    raise InstallError(f"--ignore-errors: upgrade failed: {e}")
+                # Rollback!
+                logger.error(f"Service failed to start: {e}")
+                logger.info("\nPerforming rollback...")
+
+                rollback_success = True
+                rollback_errors = []
+
                 try:
-                    # Start with old binary
-                    _systemctl_cmd('start', 'logstash-agent', check=True)
-                    logger.info("✓ Service restarted with previous version")
-                    logger.info("\nRollback completed successfully")
-                except Exception as start_error:
-                    logger.error(f"Failed to start service after rollback: {start_error}")
-                    rollback_errors.append(f"Failed to start service: {start_error}")
+                    # Stop the failed service
+                    _systemctl_cmd('stop', 'logstash-agent')
+                    logger.info("✓ Stopped failed service")
+                except Exception as stop_error:
+                    logger.warning(f"Could not stop service: {stop_error}")
+                    rollback_errors.append(f"Failed to stop service: {stop_error}")
+
+                try:
+                    # Restore backup binary
+                    if not os.path.exists(backup_path):
+                        raise InstallError(f"Backup binary not found at {backup_path}")
+                    shutil.copy2(backup_path, INSTALL_PATHS['binary'])
+                    logger.info("✓ Restored previous binary")
+                except Exception as restore_error:
+                    logger.error(f"Failed to restore binary: {restore_error}")
+                    rollback_errors.append(f"Failed to restore binary: {restore_error}")
                     rollback_success = False
 
-            if not rollback_success:
-                logger.error("\n" + "="*60)
-                logger.error("ROLLBACK FAILED - MANUAL INTERVENTION REQUIRED")
-                logger.error("="*60)
-                logger.error("\nRollback errors:")
-                for error in rollback_errors:
-                    logger.error(f"  - {error}")
-                logger.error("\nManual recovery steps:")
-                logger.error(f"  1. Check if backup exists: ls -la {backup_path}")
-                logger.error(f"  2. Manually restore: sudo cp {backup_path} {INSTALL_PATHS['binary']}")
-                logger.error(f"  3. Restore permissions: sudo chmod 755 {INSTALL_PATHS['binary']}")
-                logger.error("  4. Start service: sudo systemctl start logstash-agent")
-                logger.error("  5. Check status: sudo systemctl status logstash-agent")
-                logger.error("="*60)
-                raise InstallError(
-                    "Upgrade failed and rollback encountered errors. "
-                    "Manual recovery required. See log for details.")
+                try:
+                    # Restore backup _internal if it exists
+                    internal_backup_path = f"{INSTALL_PATHS['binary_dir']}/_internal.backup"
+                    if os.path.exists(internal_backup_path):
+                        internal_dest = os.path.join(INSTALL_PATHS['binary_dir'], '_internal')
+                        if os.path.exists(internal_dest):
+                            shutil.rmtree(internal_dest)
+                        shutil.copytree(internal_backup_path, internal_dest)
+                        logger.info("✓ Restored previous dependencies")
+                except Exception as deps_error:
+                    logger.warning(f"Failed to restore dependencies: {deps_error}")
+                    rollback_errors.append(f"Failed to restore dependencies: {deps_error}")
 
-            raise InstallError(f"Upgrade failed and was rolled back: {e}")
+                if rollback_success:
+                    try:
+                        # Start with old binary
+                        _systemctl_cmd('start', 'logstash-agent', check=True)
+                        logger.info("✓ Service restarted with previous version")
+                        logger.info("\nRollback completed successfully")
+                    except Exception as start_error:
+                        logger.error(f"Failed to start service after rollback: {start_error}")
+                        rollback_errors.append(f"Failed to start service: {start_error}")
+                        rollback_success = False
+
+                if not rollback_success:
+                    logger.error("\n" + "="*60)
+                    logger.error("ROLLBACK FAILED - MANUAL INTERVENTION REQUIRED")
+                    logger.error("="*60)
+                    logger.error("\nRollback errors:")
+                    for error in rollback_errors:
+                        logger.error(f"  - {error}")
+                    logger.error("\nManual recovery steps:")
+                    logger.error(f"  1. Check if backup exists: ls -la {backup_path}")
+                    logger.error(f"  2. Manually restore: sudo cp {backup_path} {INSTALL_PATHS['binary']}")
+                    logger.error(f"  3. Restore permissions: sudo chmod 755 {INSTALL_PATHS['binary']}")
+                    logger.error("  4. Start service: sudo systemctl start logstash-agent")
+                    logger.error("  5. Check status: sudo systemctl status logstash-agent")
+                    logger.error("="*60)
+                    raise InstallError(
+                        "Upgrade failed and rollback encountered errors. "
+                        "Manual recovery required. See log for details.")
+
+                raise InstallError(f"Upgrade failed and was rolled back: {e}")
 
         # Step 11: Cleanup
         logger.info("\nStep 11: Cleaning up...")
