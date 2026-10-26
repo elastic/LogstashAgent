@@ -4,7 +4,7 @@
 >
 > Warning: **Beta Release** - This project is under active development. Features may change.
 >
-> **Current package version: 0.5.2** — see [CHANGELOG.md](CHANGELOG.md).
+> See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## Overview
 
@@ -21,12 +21,14 @@ Product documentation (roles, ports, coexistence, VERSION CLI) lives in the Logs
 | Mode | Policy type | Role |
 |------|-------------|------|
 | `packaged` | PACKAGED | Production agent (enrolled). Manages package Logstash via `systemctl` (`logstash` + `logstash-agent`). |
-| `managed` | MANAGED | Multi-instance agent **N**. Tree under `/opt/logstash-agent/managed-N/`; units `logstash-agent@N` / `logstash-managed@N`. Ports **9600+N** / **9700+N**. |
-| `simulate` | SIMULATE | Simulation agent **N**. Isolated under `/opt/logstash-agent/simulate-N/`; units `lsagent-simulate@N` / `ls-simulate@N`. Ports **9500+N** / **9560+N**. |
+| `managed` | MANAGED | Multi-instance agent **N**. Tree under `/opt/logstash-agent/managed-N/`; units `managed-agent@N` / `managed-logstash@N`. Ports **9600+N** / **9700+N**. |
+| `simulate` | SIMULATE | Simulation agent **N**. Isolated under `/opt/logstash-agent/simulate-N/`; units `simulate-agent@N` / `simulate-logstash@N`. Ports **9500+N** / **9560+N**. |
 | `embedded` | EMBEDDED | Docker/local sim without enrollment (FastAPI + supervisor). Ports **9500** / **9560**. |
 | `default` | (legacy) | Alias of packaged (still accepted). |
 
 Legacy aliases (rewritten on load / CLI): `default` and `agent` → **packaged**; `host` → **managed**.
+
+The pre-0.5.3 unit names (`logstash-agent@N`, `logstash-managed@N`, `lsagent-simulate@N`, `ls-simulate@N`) are migrated to the canonical names above on upgrade. `logstash-agent-ctl` still accepts them but prints a deprecation notice.
 
 **Host coexistence:** Packaged + Managed + Simulate can share one machine. Multi-instance state/config live under the instance tree (`LOGSTASH_AGENT_STATE_DIR` / `LOGSTASH_AGENT_CONFIG` in `agent.env`), not under packaged `/var/lib` or `/etc`.
 
@@ -137,24 +139,24 @@ uv sync
 ```
 
 ### Configure
-Copy and adjust the example config:
+Copy and adjust the example config (optional):
 ```bash
 cp src/logstashagent/config/logstashagent.example.yml src/logstashagent/config/logstashagent.yml
 ```
 
 ### Run agent process
 ```bash
-python src/logstashagent/main.py
+uv run python src/logstashagent/main.py
 ```
 
-By default this starts the agent service (including management API) on `0.0.0.0:9600` unless overridden in config.
+By default this starts the agent service (including management API) on `0.0.0.0:9500` unless overridden in config or environment.
 
 ---
 ## Enroll And Run Controller
 
 ### 1. Enroll the agent
 ```bash
-python src/logstashagent/main.py --enroll=<BASE64_TOKEN> --logstash-ui-url=http://localhost:8080
+uv run python src/logstashagent/main.py --enroll=<BASE64_TOKEN> --logstash-ui-url=http://localhost:8080
 ```
 
 Prefer root install for production:
@@ -167,16 +169,16 @@ If you enroll without root, enrollment still saves state. Finish privileged setu
 ```bash
 sudo logstash-agent setup-simulate
 # then (example):
-sudo systemctl start lsagent-simulate@N
+sudo systemctl start simulate-agent@N
 # or managed:
-sudo systemctl start logstash-agent@N
+sudo systemctl start managed-agent@N
 ```
 
 ### 2. Start controller mode
 ```bash
-python src/logstashagent/main.py --run
+uv run python src/logstashagent/main.py --run
 # multi-instance:
-python src/logstashagent/main.py --run --mode managed --instance 1
+uv run python src/logstashagent/main.py --run --mode managed --instance 1
 ```
 
 ### 3. Host inventory
@@ -192,11 +194,11 @@ logstash-agent list-versions
 sudo systemctl status logstash-agent
 
 # Managed N
-sudo systemctl status logstash-agent@N
-sudo logstash-agent-ctl status logstash-agent@N
+sudo systemctl status managed-agent@N
+sudo logstash-agent-ctl status managed-agent@N
 
 # Simulate N
-sudo systemctl status lsagent-simulate@N
+sudo systemctl status simulate-agent@N
 
 # Drop one multi-instance role only
 sudo logstash-agent uninstall --instance managed-1
@@ -232,4 +234,4 @@ Please open an issue to discuss large changes before submitting a pull request.
 
 Copyright 2024-2026 Elasticsearch and contributors.
 
-Licensed under the Apache License, Version 2.0. See [LICENSE](../LICENSE.txt) for details.
+Licensed under the Elastic License 2.0. See [LICENSE.txt](LICENSE.txt) for details.

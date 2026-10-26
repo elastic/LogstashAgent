@@ -1,3 +1,27 @@
+## [0.5.4] - Safer self-upgrades, upgrade CLI flags - 10/26/2026
+
+### Added
+
+- `logstash-agent upgrade` accepts new flags (#10):
+  - `--replace-ctl` regenerates the on-disk `logstash-agent-ctl`. On its own, without `--version`, it only regenerates the ctl and exits. Combined with `--version`, it regenerates the ctl after the binary swap (non-fatal if it fails).
+  - `--force` skips the confirmation prompt (like `--yes`).
+  - `--ignore-errors` skips rollback if the service restart or health check fails. Backups are kept and the upgrade still exits with an error.
+- Controller-triggered self-upgrades re-launch themselves in a transient `systemd-run` unit named `logstash-agent-upgrade-<version>-<epoch>`. The upgrade no longer dies when it stops the agent service that spawned it. Two hidden flags (`--_self-upgrade`, `--_detached`) support this and aren't meant for operators.
+
+### Changed
+
+- `--version` is no longer required for `upgrade` when `--replace-ctl` is given. Without `--replace-ctl`, a missing `--version` still exits with an argument error.
+
+### Fixed
+
+- `perform_upgrade` no longer fails on hosts without the `logstash-agent` systemd unit (for example, when running only multi-instance `managed-agent@N` units). It logs a warning and skips the service restart and health check (steps 9 and 10) instead of failing and rolling back.
+- If the systemd-run re-launch isn't available or fails, the upgrade falls back to running in-process rather than aborting.
+- Tests: detach binary-path tests no longer depend on the host having `/opt/logstash-agent/bin/logstash-agent`.
+
+### Notes
+
+- No re-enrollment needed. Hosts running 0.5.3 upgrade through the UI as usual. The detached upgrade path only applies once the host is already on 0.5.4.
+
 ## [0.5.3] - Canonical systemd unit names, RPS scale testing - 10/06/2026
 
 Package version is **0.5.3**. Pair with **LogstashUI 0.5.3** (lockstep).
