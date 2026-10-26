@@ -3691,13 +3691,13 @@ def run_controller():
                                 # Fallback to current executable if not installed
                                 binary_path = sys.executable
                             
-                            logger.info(f"Spawning upgrade process: sudo {binary_path} upgrade --version {upgrade_version} --yes")
+                            logger.info(f"Spawning upgrade process: sudo {binary_path} upgrade --version {upgrade_version} --yes --_self-upgrade")
                             
                             # Spawn upgrade subprocess with full detachment
                             # The upgrade will stop the service (killing us), replace binary, and restart
                             # Let stdout/stderr go to systemd journal for error visibility
                             subprocess.Popen(
-                                ['sudo', binary_path, 'upgrade', '--version', upgrade_version, '--yes'],
+                                ['sudo', binary_path, 'upgrade', '--version', upgrade_version, '--yes', '--_self-upgrade'],
                                 stdin=subprocess.DEVNULL,
                                 start_new_session=True,
                                 close_fds=True
