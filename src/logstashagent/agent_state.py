@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 _STATE_IO_LOCK = threading.RLock()
 
 # Keys that should be encrypted when stored
-ENCRYPTED_KEYS = {'api_key', 'keystore_password'}
+ENCRYPTED_KEYS = {'api_key', 'keystore_password', 'inbound_api_key'}
 
 OPT_ROOT = Path('/opt/logstash-agent')
 PACKAGED_STATE_DIR = OPT_ROOT / 'state'

@@ -23,13 +23,18 @@ services:
       # URL where LogstashUI is running (HTTPS :8443)
       - LOGSTASH_UI_URL=${LOGSTASH_UI_URL:-https://host.docker.internal:8443}
       - LOGSTASH_URL=${LOGSTASH_URL:-https://host.docker.internal:8443}
-      - LOGSTASHUI_AGENT_CSR_SECRET=${LOGSTASHUI_AGENT_CSR_SECRET:-logstashui-compose-dev}
+      # Must match LogstashUI's values (no defaults: unset = refused).
+      # LogstashUI's bin/start_logstashui.sh writes them to logstashui_data/.agent_*.
+      - LOGSTASHUI_AGENT_CSR_SECRET=${LOGSTASHUI_AGENT_CSR_SECRET:-}
+      # Required on every /_logstash/* request as "Authorization: ApiKey <key>"
+      - LOGSTASH_AGENT_API_KEY=${LOGSTASH_AGENT_API_KEY:-}
     extra_hosts:
       # Allow container to reach host machine
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9500/"]
+      # "/" stays unauthenticated; HTTPS once the server cert is issued
+      test: ["CMD-SHELL", "curl -fsk https://localhost:9500/ || curl -fs http://localhost:9500/"]
       interval: 30s
       timeout: 10s
       retries: 3

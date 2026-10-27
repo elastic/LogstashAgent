@@ -385,6 +385,7 @@ class TestPerformEnrollment:
         enroll_result = {
             "success": True,
             "api_key": "long-api-key-value",
+            "inbound_api_key": "inbound-key-value",
             "policy_id": 1,
             "connection_id": 2,
             "policy_config": {"settings_path": "/s", "logs_path": "/l"},
@@ -403,6 +404,7 @@ class TestPerformEnrollment:
             policy_id=1,
             connection_id=2,
             policy_config={"settings_path": "/s", "logs_path": "/l"},
+            inbound_api_key="inbound-key-value",
         )
 
     def test_simulate_setup_complete_clears_pending(self):

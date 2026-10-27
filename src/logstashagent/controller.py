@@ -18,6 +18,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from cryptography.fernet import Fernet
 from . import agent_state
+from .api_auth import inbound_key_fingerprint
 from . import log_analyzer
 from .logstash_api import persist_resolved_logstash_api_port, resolve_logstash_api_port
 from .ls_keystore_utils import LogstashKeystore
@@ -38,6 +39,20 @@ def _decrypt_from_server(raw_api_key: str, encrypted: str) -> str:
     """
     key = base64.urlsafe_b64encode(hashlib.sha256(raw_api_key.encode('utf-8')).digest())
     return Fernet(key).decrypt(encrypted.encode('utf-8')).decode('utf-8')
+
+
+def _maybe_persist_inbound_key(raw_api_key: str, result: dict) -> None:
+    """Store the inbound API key the UI delivered (encrypted) on check-in."""
+    encrypted = result.get('inbound_api_key_encrypted')
+    if not encrypted:
+        return
+    try:
+        inbound_key = _decrypt_from_server(raw_api_key, encrypted)
+    except Exception as e:
+        logger.error("Could not decrypt inbound API key from check-in: %s", e)
+        return
+    agent_state.update_state('inbound_api_key', inbound_key)
+    logger.info("Inbound API key provisioned on check-in")
 
 
 def _managed_rollup(pipelines, keystore):
@@ -3276,6 +3291,8 @@ def check_in():
                     state.get('snmp_keystore', {}),
                 ),
             },
+            # Lets the UI detect a missing/stale inbound key and re-deliver it
+            'inbound_api_key_sha256': inbound_key_fingerprint(state.get('inbound_api_key')),
         }
         if callback_host:
             check_in_data['host'] = callback_host
@@ -3339,6 +3356,7 @@ def check_in():
                 result.get('logstash_via_ui', result.get('via_ui', agent_via_ui))
             )
             _maybe_persist_via_ui(result)
+            _maybe_persist_inbound_key(api_key, result)
 
             try:
                 from logstashagent import tls_server

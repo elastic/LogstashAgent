@@ -30,6 +30,11 @@ def _safe_makedirs(name, mode=0o777, exist_ok=False):
 
 os.makedirs = _safe_makedirs  # type: ignore[assignment]
 
+# Inbound API auth: every /_logstash/* route requires this key (see api_auth).
+TEST_AGENT_API_KEY = "test-agent-api-key"
+os.environ.setdefault("LOGSTASH_AGENT_API_KEY", TEST_AGENT_API_KEY)
+AUTH_HEADERS = {"Authorization": f"ApiKey {os.environ['LOGSTASH_AGENT_API_KEY']}"}
+
 from logstashagent import main
 
 from logstashagent import logstash_supervisor
@@ -37,8 +42,8 @@ from logstashagent import logstash_supervisor
 
 @pytest.fixture
 def client():
-    """FastAPI test client"""
-    return TestClient(main.app)
+    """FastAPI test client (authenticated)"""
+    return TestClient(main.app, headers=AUTH_HEADERS)
 
 
 @pytest.fixture
