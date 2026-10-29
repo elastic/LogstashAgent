@@ -313,7 +313,8 @@ def compute_hash(content: str) -> str:
     return hashlib.sha256(content.encode('utf-8')).hexdigest()
 
 
-def save_enrollment_config(api_key: str, logstash_ui_url: str, policy_id: int, connection_id: int, policy_config: dict):
+def save_enrollment_config(api_key: str, logstash_ui_url: str, policy_id: int, connection_id: int, policy_config: dict,
+                           inbound_api_key: str | None = None):
     """
     Save enrollment configuration to state.json
 
@@ -323,12 +324,16 @@ def save_enrollment_config(api_key: str, logstash_ui_url: str, policy_id: int, c
         policy_id: Policy ID assigned to this agent
         connection_id: Connection ID created for this agent
         policy_config: Policy configuration containing paths and config files
+        inbound_api_key: Key LogstashUI presents when calling this agent's API
+            (older UIs omit it; it is then delivered on check-in)
     """
     try:
         # Save enrollment data to state.json
         agent_state.update_state('enrolled', True)
         agent_state.update_state('logstash_ui_url', logstash_ui_url)
         agent_state.update_state('api_key', api_key)
+        if inbound_api_key:
+            agent_state.update_state('inbound_api_key', inbound_api_key)
         agent_state.update_state('policy_id', policy_id)
         agent_state.update_state('connection_id', connection_id)
 
@@ -437,7 +442,8 @@ def perform_enrollment(encoded_token: str, logstash_ui_url: str, agent_id: str):
             logstash_ui_url=ui_url,
             policy_id=result['policy_id'],
             connection_id=result['connection_id'],
-            policy_config=policy_config
+            policy_config=policy_config,
+            inbound_api_key=result.get('inbound_api_key'),
         )
 
         # Multi-instance (SIMULATE / MANAGED): materialize dirs/units

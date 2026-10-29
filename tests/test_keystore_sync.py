@@ -9,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from logstashagent import main, agent_state
+from conftest import AUTH_HEADERS
 from logstashagent.ls_keystore_utils.keystore_write import (
     generate_default_keystore_password,
     write_keystore_secrets,
@@ -17,7 +18,7 @@ from logstashagent.ls_keystore_utils.keystore_write import (
 
 @pytest.fixture
 def client(temp_dir, mock_dirs):
-    return TestClient(main.app)
+    return TestClient(main.app, headers=AUTH_HEADERS)
 
 
 def test_keystore_sync_writes_when_different(client, temp_dir, mock_dirs):

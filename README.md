@@ -44,6 +44,17 @@ The pre-0.5.3 unit names (`logstash-agent@N`, `logstash-managed@N`, `lsagent-sim
 | Logstash binary & paths | Logstash env (`LOGSTASH_BINARY`, `LOGSTASH_PATH_*`) | yml / state |
 | UI URL | state / `LOGSTASH_UI_URL` | yml `logstash_ui_url` |
 
+### API authentication
+
+Every `/_logstash/*` route requires `Authorization: ApiKey <key>`. Only `/` (health check) is open, and the OpenAPI/docs pages are disabled.
+
+| Agent | Key source |
+|-------|------------|
+| Enrolled (Packaged / Managed / Simulate) | Issued by LogstashUI at enrollment, or delivered encrypted on the next check-in for agents enrolled earlier. Stored encrypted in state as `inbound_api_key`. |
+| Embedded / compose (never enrolled) | `LOGSTASH_AGENT_API_KEY` env. Must match LogstashUI's `LOGSTASH_AGENT_API_KEY`. |
+
+The agent fails closed: with no key configured, protected routes return `503`. A missing or wrong key returns `401`.
+
 ### TLS (not recommended to disable)
 
 By default the agent serves FastAPI over HTTPS (product-CA cert) and verifies LogstashUI certificates.

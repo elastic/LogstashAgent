@@ -99,10 +99,11 @@ from datetime import UTC, datetime
 from typing import Any
 
 import yaml
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi import Path as FastAPIPath
 from fastapi.responses import JSONResponse
 
+from logstashagent.api_auth import require_agent_key
 from logstashagent import (
     agent_state,
     controller,
@@ -131,6 +132,7 @@ def cli_mode_type(value: str) -> str:
 
 import atexit
 import base64
+import tempfile
 import threading
 import time
 from collections import deque
@@ -1138,7 +1140,17 @@ def _atexit_shutdown_supervisor():
     logstash_supervisor.shutdown_supervisor()
 
 
-app = FastAPI(title="logstashagent API", version="0.0.1")
+app = FastAPI(
+    title="logstashagent API",
+    version="0.0.1",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
+
+# Every /_logstash/* route requires the inbound API key (see api_auth).
+# Only "/" (container healthcheck) is registered directly on app.
+router = APIRouter(prefix="/_logstash", dependencies=[Depends(require_agent_key)])
 
 # Request queue for simulation requests during Logstash restarts
 _simulation_queue: deque = deque(maxlen=100)  # Max 100 queued requests
@@ -1727,7 +1739,7 @@ async def _process_simulation_queue():
             await asyncio.sleep(5)
 
 
-@app.get("/_logstash/health")
+@router.get("/health")
 async def logstash_health():
     """
     Check if Logstash is healthy and ready to accept simulation requests.
@@ -1764,7 +1776,7 @@ async def logstash_health():
     )
 
 
-@app.get("/_logstash/tls-status")
+@router.get("/tls-status")
 async def tls_status():
     """
     Product CA pin / bootstrap status for UI online+secure indicators.
@@ -1782,7 +1794,7 @@ async def tls_status():
         )
 
 
-@app.post("/_logstash/simulate")
+@router.post("/simulate")
 async def simulate_log(request: Request):
     """
     Proxy endpoint for simulation log input.
@@ -2000,7 +2012,7 @@ async def simulate_log(request: Request):
         )
 
 
-@app.get("/_logstash/pipeline")
+@router.get("/pipeline")
 async def list_pipelines():
     """List all pipelines (mimics Elasticsearch API)"""
     pipelines = _load_pipelines_yml()
@@ -2039,7 +2051,7 @@ async def list_pipelines():
     return result
 
 
-@app.get("/_logstash/pipeline/{pipeline_id}")
+@router.get("/pipeline/{pipeline_id}")
 async def get_pipeline(pipeline_id: str = FastAPIPath(..., description="Pipeline ID")):
     """Get a specific pipeline (mimics Elasticsearch API)"""
     _validate_pipeline_id(pipeline_id)
@@ -2076,7 +2088,7 @@ async def get_pipeline(pipeline_id: str = FastAPIPath(..., description="Pipeline
     return result
 
 
-@app.put("/_logstash/pipeline/{pipeline_id}")
+@router.put("/pipeline/{pipeline_id}")
 async def put_pipeline(pipeline_id: str, body: dict[str, Any]):
     """Create or update a pipeline (mimics Elasticsearch API)"""
     _validate_pipeline_id(pipeline_id)
@@ -2159,7 +2171,7 @@ async def put_pipeline(pipeline_id: str, body: dict[str, Any]):
     return {"acknowledged": True}
 
 
-@app.delete("/_logstash/pipeline/{pipeline_id}")
+@router.delete("/pipeline/{pipeline_id}")
 async def delete_pipeline(pipeline_id: str = FastAPIPath(..., description="Pipeline ID")):
     """Delete a pipeline (mimics Elasticsearch API)"""
     _validate_pipeline_id(pipeline_id)
@@ -2280,7 +2292,7 @@ async def _adaptive_bus_settle(
         await asyncio.sleep(poll_seconds)
 
 
-@app.post("/_logstash/slots/allocate")
+@router.post("/slots/allocate")
 async def allocate_simulation_slot(body: dict[str, Any]):
     """
     Allocate a slot for simulation pipelines.
@@ -2744,13 +2756,13 @@ output {{
     return {"create_ms": create_ms, "verify_ms": verify_ms}
 
 
-@app.get("/_logstash/slots")
+@router.get("/slots")
 async def get_slots():
     """Get the current state of all slots."""
     return slots.get_slot_state()
 
 
-@app.delete("/_logstash/slots/{slot_id}")
+@router.delete("/slots/{slot_id}")
 async def release_slot(slot_id: int = FastAPIPath(..., description="Slot ID", ge=1, le=10)):
     """
     Release a specific slot and remove its named Logstash pipelines
@@ -2769,7 +2781,7 @@ async def release_slot(slot_id: int = FastAPIPath(..., description="Slot ID", ge
     return {"acknowledged": True, "slot_id": slot_id, "existed": existed}
 
 
-@app.get("/_logstash/pipeline/{pipeline_id}/logs")
+@router.get("/pipeline/{pipeline_id}/logs")
 async def get_pipeline_logs(
         pipeline_id: str = FastAPIPath(..., description="Pipeline ID"),
         max_entries: int = Query(50, description="Maximum number of log entries to return", ge=1, le=500),
@@ -2827,7 +2839,7 @@ async def get_pipeline_logs(
         )
 
 
-@app.get("/_logstash/pipelines/status")
+@router.get("/pipelines/status")
 async def get_pipelines_status():
     """
     Get the current status of all running pipelines from Logstash API.
@@ -2961,7 +2973,7 @@ def _restart_logstash_for_sim() -> bool:
     return False
 
 
-@app.get("/_logstash/keystore")
+@router.get("/keystore")
 async def keystore_get():
     """
     Return the current simulate-instance keystore user secrets (for comparison).
@@ -2984,7 +2996,7 @@ async def keystore_get():
     )
 
 
-@app.post("/_logstash/keystore/sync")
+@router.post("/keystore/sync")
 async def keystore_sync(request: Request):
     """
     Replace the simulate instance Logstash keystore with the provided secrets
@@ -3103,7 +3115,7 @@ async def keystore_sync(request: Request):
         raise HTTPException(status_code=500, detail=f"Keystore sync failed: {e}")
 
 
-@app.post("/_logstash/write-file")
+@router.post("/write-file")
 async def write_file(request: Request):
     """
     Write a file to the uploaded directory for simulation use.
@@ -3173,7 +3185,7 @@ async def write_file(request: Request):
         )
 
 
-@app.post("/_logstash/validate")
+@router.post("/validate")
 async def validate_logstash_config(request: Request):
     """
     Validate a Logstash pipeline configuration using logstash --config.test_and_exit.
@@ -3200,8 +3212,13 @@ async def validate_logstash_config(request: Request):
                 detail="No configuration provided"
             )
 
-        # Create temporary config file
-        temp_file_path = f"/tmp/{pipeline_name}.conf"
+        if not isinstance(pipeline_name, str):
+            raise HTTPException(status_code=400, detail="pipeline_name must be a string")
+        _validate_pipeline_id(pipeline_name)
+
+        # Unpredictable, exclusively-created temp file; the name is never caller-controlled
+        temp_fd, temp_file_path = tempfile.mkstemp(prefix="lsagent-validate-", suffix=".conf")
+        os.close(temp_fd)
 
         try:
             # Replace keystore variables without defaults to avoid validation failures
@@ -3322,6 +3339,9 @@ async def validate_logstash_config(request: Request):
             status_code=500,
             detail=f"Error validating configuration: {e!s}"
         )
+
+
+app.include_router(router)
 
 
 def parse_arguments():

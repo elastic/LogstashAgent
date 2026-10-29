@@ -1,3 +1,22 @@
+## [0.5.5] - Unreleased: Agent API authentication, validate path traversal fix
+
+### Security
+
+- **Agent API requires authentication.** Every `/_logstash/*` route now requires `Authorization: ApiKey <key>`. Previously anyone who could reach the agent port could read, create and delete pipelines, write files and run validation. Only `/` stays open, for container health checks. The OpenAPI and docs pages (`/docs`, `/redoc`, `/openapi.json`) are disabled.
+  - Enrolled agents get their key from LogstashUI. New enrollments receive it directly. Agents enrolled earlier receive it encrypted on their next check-in, so no re-enrollment is needed.
+  - Embedded and compose agents read it from the new `LOGSTASH_AGENT_API_KEY` env var.
+  - The agent fails closed: protected routes return `503` until a key is provisioned, and `401` for a missing or wrong key.
+- **Path traversal in `/_logstash/validate` fixed.** `pipeline_name` was put straight into `/tmp/{pipeline_name}.conf`, so `../` sequences could write a file anywhere the agent user could write. The name now goes through the same validation as every other pipeline route, and the temp file gets a random name from `tempfile.mkstemp`.
+
+### Changed
+
+- `docker/docker-compose.yml` no longer defaults `LOGSTASHUI_AGENT_CSR_SECRET` to `logstashui-compose-dev`, and it adds `LOGSTASH_AGENT_API_KEY`. The healthcheck now tries HTTPS first.
+
+### Upgrade notes
+
+- Upgrade LogstashUI before, or together with, the agents. An older UI sends no key, so a new agent rejects all of its calls.
+- Embedded/compose: set the same `LOGSTASH_AGENT_API_KEY` on the UI and the agent. LogstashUI's `bin/start_logstashui.sh` generates it for you.
+
 ## [0.5.4] - Safer self-upgrades, upgrade CLI flags - 10/26/2026
 
 ### Added
