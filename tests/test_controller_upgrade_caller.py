@@ -289,3 +289,82 @@ def test_r4_acceptance_4_same_second_ids(tmp_path, monkeypatch):
     assert paths[0].is_file() and paths[1].is_file()
     assert paths[0].read_bytes() == paths[1].read_bytes() == _caller_bytes("simulate-2")
     assert not (staged["state"] / "upgrade-caller.json").exists()
+
+
+def test_r6_acceptance_1_spawn_log_caller_id(tmp_path, monkeypatch, caplog):
+    # acceptance #1
+    staged = _stage(tmp_path, monkeypatch)
+    spawned = []
+    snapshots = []
+
+    def fake_popen(argv, **kwargs):
+        spawned.append(list(argv))
+        if "--_caller-id" in argv:
+            at = argv.index("--_caller-id")
+            if at + 1 < len(argv):
+                caller_id = argv[at + 1]
+                path = staged["state"] / f"upgrade-caller-{caller_id}.json"
+                snapshots.append((caller_id, path.read_bytes() if path.is_file() else b""))
+        return MagicMock()
+
+    monkeypatch.setattr(controller.subprocess, "Popen", fake_popen)
+    binary_path = _INSTALLED if os.path.exists(_INSTALLED) else sys.executable
+    assert binary_path == _INSTALLED
+
+    def _assert_single_spawn_log(records, argv):
+        spawn_logs = [
+            r for r in records if r.getMessage().startswith("Spawning upgrade process")
+        ]
+        assert len(spawn_logs) == 1
+        msg = spawn_logs[0].getMessage()
+        assert "--_caller-id" in msg
+        tokens = msg.split()
+        logged_id = tokens[tokens.index("--_caller-id") + 1]
+        assert "--_caller-id" in argv
+        argv_id = argv[argv.index("--_caller-id") + 1]
+        assert logged_id == argv_id
+        return argv_id
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="logstashagent.controller"):
+        assert controller._spawn_self_upgrade(
+            binary_path, _VERSION, mode="simulate", instance_id=2
+        ) is True
+    direct_id = _assert_single_spawn_log(caplog.records, spawned[-1])
+    assert snapshots[-1] == (direct_id, _caller_bytes("simulate-2"))
+
+    # Drive run_controller once so a duplicate spawn log in the caller fails.
+    class _StopLoopEvent:
+        def wait(self, timeout=None):
+            raise KeyboardInterrupt()
+
+        def clear(self):
+            pass
+
+    monkeypatch.setattr(controller, "_log_watcher", None)
+    monkeypatch.setattr(
+        controller.agent_state,
+        "get_state",
+        lambda: {
+            "enrolled": True,
+            "api_key": "k",
+            "connection_id": "c",
+            "mode": "simulate",
+            "instance_id": 2,
+        },
+    )
+    monkeypatch.setattr(controller, "recover_incomplete_runtime_upgrade", lambda: None)
+    monkeypatch.setattr(controller, "heal_stale_logstash_launch", lambda state: None)
+    monkeypatch.setattr(controller, "heal_legacy_systemd_units_on_checkin", lambda state: None)
+    monkeypatch.setattr(controller, "check_in", lambda: {"desired_agent_version": _VERSION})
+    monkeypatch.setattr(controller, "get_version", lambda name: "0.0.1")
+    monkeypatch.setattr(controller.log_analyzer, "is_logstash_restarting", lambda log_dir="": False)
+    monkeypatch.setattr(controller.threading, "Event", _StopLoopEvent)
+
+    before = len(spawned)
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="logstashagent.controller"):
+        controller.run_controller()
+    assert len(spawned) == before + 1
+    rc_id = _assert_single_spawn_log(caplog.records, spawned[-1])
+    assert snapshots[-1] == (rc_id, _caller_bytes("simulate-2"))

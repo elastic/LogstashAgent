@@ -3534,6 +3534,9 @@ def _spawn_self_upgrade(binary_path: str, upgrade_version: str, *, mode: str, in
         key = 'packaged'
     from logstashagent import installer
     caller_id = os.urandom(8).hex()
+    logger.info(
+        f"Spawning upgrade process: sudo {binary_path} upgrade --version {upgrade_version} --yes --_self-upgrade --_caller-id {caller_id}"
+    )
     path = Path(installer.INSTALL_PATHS['state_dir']) / f'upgrade-caller-{caller_id}.json'
     try:
         path.write_text(f'{{"instance_key":"{key}"}}\n', encoding='utf-8')
@@ -3730,8 +3733,6 @@ def run_controller():
                             if not os.path.exists(binary_path):
                                 # Fallback to current executable if not installed
                                 binary_path = sys.executable
-                            
-                            logger.info(f"Spawning upgrade process: sudo {binary_path} upgrade --version {upgrade_version} --yes --_self-upgrade")
                             
                             # Spawn upgrade subprocess with full detachment
                             # The upgrade will stop the service (killing us), replace binary, and restart
