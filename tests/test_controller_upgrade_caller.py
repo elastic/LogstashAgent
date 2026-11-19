@@ -6,7 +6,9 @@
 
 import logging
 import os
+import re
 import sys
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -16,16 +18,21 @@ from logstashagent import install_registry
 
 _VERSION = "9.9.9"
 _INSTALLED = "/opt/logstash-agent/bin/logstash-agent"
-_SPAWN_ARGV = [
-    "sudo",
-    _INSTALLED,
-    "upgrade",
-    "--version",
-    _VERSION,
-    "--yes",
-    "--_self-upgrade",
-]
-_READ_ID = "readid"
+_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def _expect_argv(caller_id):
+    return [
+        "sudo",
+        _INSTALLED,
+        "upgrade",
+        "--version",
+        _VERSION,
+        "--yes",
+        "--_self-upgrade",
+        "--_caller-id",
+        caller_id,
+    ]
 
 
 def _caller_bytes(key):
@@ -118,37 +125,22 @@ def test_acceptance_2_controller_spawn(tmp_path, monkeypatch, caplog):
         logstash_unit="logstash",
         state_dir=str(staged["state"]),
     )
-    caller = staged["state"] / "upgrade-caller.json"
-    assert not caller.exists()
+    shared = staged["state"] / "upgrade-caller.json"
+    assert not shared.exists()
 
     spawned = []
     snapshots = []
 
     def fake_popen(argv, **kwargs):
         spawned.append(list(argv))
-        snapshots.append(caller.read_bytes() if caller.is_file() else b"")
+        # acceptance #4: the invocation file already exists when Popen starts
+        at = argv.index("--_caller-id")
+        caller_id = argv[at + 1]
+        path = staged["state"] / f"upgrade-caller-{caller_id}.json"
+        snapshots.append((caller_id, path.read_bytes() if path.is_file() else b""))
         os.environ.pop("LOGSTASH_AGENT_STATE_DIR", None)
         assert "LOGSTASH_AGENT_STATE_DIR" not in os.environ
-        per_id = staged["state"] / f"upgrade-caller-{_READ_ID}.json"
-        per_id.write_bytes(snapshots[-1])
-        monkeypatch.setattr(
-            sys,
-            "argv",
-            [
-                "logstash-agent",
-                "upgrade",
-                "--version",
-                _VERSION,
-                "--yes",
-                "--_caller-id",
-                _READ_ID,
-                "--_detached",
-            ],
-        )
-        assert "--_self-upgrade" not in sys.argv
-        assert "--mode" not in sys.argv and "--instance" not in sys.argv
-        installer.perform_upgrade(version=_VERSION)
-        assert not per_id.exists()
+        assert "--mode" not in argv and "--instance" not in argv
         return MagicMock()
 
     monkeypatch.setattr(controller.subprocess, "Popen", fake_popen)
@@ -159,10 +151,13 @@ def test_acceptance_2_controller_spawn(tmp_path, monkeypatch, caplog):
     assert controller._spawn_self_upgrade(
         binary_path, _VERSION, mode="simulate", instance_id=2
     ) is True
-    assert snapshots[-1] == _caller_bytes("simulate-2")
-    assert spawned[-1] == _SPAWN_ARGV
-    assert set(_units(staged["calls"])) == {"simulate-agent@2"}
-    assert caller.read_bytes() == _caller_bytes("simulate-2")
+    sim_id, sim_body = snapshots[-1]
+    assert sim_body == _caller_bytes("simulate-2")
+    assert spawned[-1] == _expect_argv(sim_id)
+    sim_path = staged["state"] / f"upgrade-caller-{sim_id}.json"
+    assert sim_path.name != "upgrade-caller.json"
+    assert sim_path.read_bytes() == _caller_bytes("simulate-2")
+    assert not shared.exists()
 
     staged["calls"].clear()
     monkeypatch.setattr(
@@ -177,20 +172,82 @@ def test_acceptance_2_controller_spawn(tmp_path, monkeypatch, caplog):
     assert controller._spawn_self_upgrade(
         binary_path, _VERSION, mode="managed", instance_id=1
     ) is True
-    assert snapshots[-1] == _caller_bytes("managed-1")
-    assert spawned[-1] == _SPAWN_ARGV
+    man_id, man_body = snapshots[-1]
+    assert man_body == _caller_bytes("managed-1")
+    assert spawned[-1] == _expect_argv(man_id)
+    man_path = staged["state"] / f"upgrade-caller-{man_id}.json"
+    assert man_path.name != "upgrade-caller.json"
+    # acceptance #3
+    assert sim_id != man_id
+    assert sim_path.is_file() and man_path.is_file()
+    assert sim_path.read_bytes() == _caller_bytes("simulate-2")
+    assert man_path.read_bytes() == _caller_bytes("managed-1")
+    assert not shared.exists()
+
+    staged["calls"].clear()
+    child = [
+        "logstash-agent",
+        "upgrade",
+        "--version",
+        _VERSION,
+        "--yes",
+        "--_caller-id",
+        sim_id,
+        "--_detached",
+    ]
+    assert "--_self-upgrade" not in child
+    monkeypatch.setattr(sys, "argv", child)
+    installer.perform_upgrade(version=_VERSION)
+    assert not sim_path.exists()
+    assert man_path.read_bytes() == _caller_bytes("managed-1")
+    assert set(_units(staged["calls"])) == {"simulate-agent@2"}
+
+    staged["calls"].clear()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "logstash-agent",
+            "upgrade",
+            "--version",
+            _VERSION,
+            "--yes",
+            "--_caller-id",
+            man_id,
+            "--_detached",
+        ],
+    )
+    installer.perform_upgrade(version=_VERSION)
     assert set(_units(staged["calls"])) == {"managed-agent@1"}
-    assert caller.read_bytes() == _caller_bytes("managed-1")
 
     staged["calls"].clear()
     assert controller._spawn_self_upgrade(
         binary_path, _VERSION, mode="packaged", instance_id=None
     ) is True
-    assert snapshots[-1] == _caller_bytes("packaged")
-    assert spawned[-1] == _SPAWN_ARGV
+    pkg_id, pkg_body = snapshots[-1]
+    assert pkg_body == _caller_bytes("packaged")
+    assert spawned[-1] == _expect_argv(pkg_id)
+    pkg_path = staged["state"] / f"upgrade-caller-{pkg_id}.json"
+    assert pkg_path.name != "upgrade-caller.json"
+    assert pkg_path.read_bytes() == _caller_bytes("packaged")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "logstash-agent",
+            "upgrade",
+            "--version",
+            _VERSION,
+            "--yes",
+            "--_caller-id",
+            pkg_id,
+            "--_detached",
+        ],
+    )
+    installer.perform_upgrade(version=_VERSION)
     assert set(_units(staged["calls"])) == {"logstash-agent"}
-    assert caller.read_bytes() == _caller_bytes("packaged")
 
+    # acceptance #4
     missing = tmp_path / "no-such-parent" / "state"
     assert not missing.parent.exists()
     monkeypatch.setitem(installer.INSTALL_PATHS, "state_dir", str(missing))
@@ -204,3 +261,31 @@ def test_acceptance_2_controller_spawn(tmp_path, monkeypatch, caplog):
     assert any(
         r.getMessage() == "upgrade: cannot record caller instance" for r in caplog.records
     )
+
+
+def test_r4_acceptance_4_same_second_ids(tmp_path, monkeypatch):
+    # acceptance #4
+    staged = _stage(tmp_path, monkeypatch)
+    monkeypatch.setattr(time, "time", lambda: 1700000000.0)
+    spawned = []
+
+    def fake_popen(argv, **kwargs):
+        spawned.append(list(argv))
+        return MagicMock()
+
+    monkeypatch.setattr(controller.subprocess, "Popen", fake_popen)
+    binary_path = _INSTALLED if os.path.exists(_INSTALLED) else sys.executable
+    assert binary_path == _INSTALLED
+    for _ in range(2):
+        assert controller._spawn_self_upgrade(
+            binary_path, _VERSION, mode="simulate", instance_id=2
+        ) is True
+    ids = [argv[argv.index("--_caller-id") + 1] for argv in spawned]
+    assert len(ids) == 2
+    assert ids[0] != ids[1]
+    assert _ID_RE.fullmatch(ids[0]) and _ID_RE.fullmatch(ids[1])
+    paths = [staged["state"] / f"upgrade-caller-{caller_id}.json" for caller_id in ids]
+    assert paths[0] != paths[1]
+    assert paths[0].is_file() and paths[1].is_file()
+    assert paths[0].read_bytes() == paths[1].read_bytes() == _caller_bytes("simulate-2")
+    assert not (staged["state"] / "upgrade-caller.json").exists()

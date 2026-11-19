@@ -3533,14 +3533,15 @@ def _spawn_self_upgrade(binary_path: str, upgrade_version: str, *, mode: str, in
     else:
         key = 'packaged'
     from logstashagent import installer
-    path = Path(installer.INSTALL_PATHS['state_dir']) / 'upgrade-caller.json'
+    caller_id = os.urandom(8).hex()
+    path = Path(installer.INSTALL_PATHS['state_dir']) / f'upgrade-caller-{caller_id}.json'
     try:
         path.write_text(f'{{"instance_key":"{key}"}}\n', encoding='utf-8')
     except OSError:
         logger.error('upgrade: cannot record caller instance')
         return False
     subprocess.Popen(
-        ['sudo', binary_path, 'upgrade', '--version', upgrade_version, '--yes', '--_self-upgrade'],
+        ['sudo', binary_path, 'upgrade', '--version', upgrade_version, '--yes', '--_self-upgrade', '--_caller-id', caller_id],
         stdin=subprocess.DEVNULL,
         start_new_session=True,
         close_fds=True,
