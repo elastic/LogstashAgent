@@ -25,6 +25,7 @@ _SPAWN_ARGV = [
     "--yes",
     "--_self-upgrade",
 ]
+_READ_ID = "readid"
 
 
 def _caller_bytes(key):
@@ -128,13 +129,26 @@ def test_acceptance_2_controller_spawn(tmp_path, monkeypatch, caplog):
         snapshots.append(caller.read_bytes() if caller.is_file() else b"")
         os.environ.pop("LOGSTASH_AGENT_STATE_DIR", None)
         assert "LOGSTASH_AGENT_STATE_DIR" not in os.environ
+        per_id = staged["state"] / f"upgrade-caller-{_READ_ID}.json"
+        per_id.write_bytes(snapshots[-1])
         monkeypatch.setattr(
             sys,
             "argv",
-            ["logstash-agent", "upgrade", "--version", _VERSION, "--yes", "--_self-upgrade"],
+            [
+                "logstash-agent",
+                "upgrade",
+                "--version",
+                _VERSION,
+                "--yes",
+                "--_caller-id",
+                _READ_ID,
+                "--_detached",
+            ],
         )
+        assert "--_self-upgrade" not in sys.argv
         assert "--mode" not in sys.argv and "--instance" not in sys.argv
         installer.perform_upgrade(version=_VERSION)
+        assert not per_id.exists()
         return MagicMock()
 
     monkeypatch.setattr(controller.subprocess, "Popen", fake_popen)
@@ -148,9 +162,14 @@ def test_acceptance_2_controller_spawn(tmp_path, monkeypatch, caplog):
     assert snapshots[-1] == _caller_bytes("simulate-2")
     assert spawned[-1] == _SPAWN_ARGV
     assert set(_units(staged["calls"])) == {"simulate-agent@2"}
-    assert not caller.exists()
+    assert caller.read_bytes() == _caller_bytes("simulate-2")
 
     staged["calls"].clear()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["logstash-agent", "upgrade", "--version", _VERSION, "--yes"],
+    )
     installer.perform_upgrade(version=_VERSION)
     assert set(_units(staged["calls"])) == {"logstash-agent"}
 
@@ -161,7 +180,7 @@ def test_acceptance_2_controller_spawn(tmp_path, monkeypatch, caplog):
     assert snapshots[-1] == _caller_bytes("managed-1")
     assert spawned[-1] == _SPAWN_ARGV
     assert set(_units(staged["calls"])) == {"managed-agent@1"}
-    assert not caller.exists()
+    assert caller.read_bytes() == _caller_bytes("managed-1")
 
     staged["calls"].clear()
     assert controller._spawn_self_upgrade(
@@ -170,7 +189,7 @@ def test_acceptance_2_controller_spawn(tmp_path, monkeypatch, caplog):
     assert snapshots[-1] == _caller_bytes("packaged")
     assert spawned[-1] == _SPAWN_ARGV
     assert set(_units(staged["calls"])) == {"logstash-agent"}
-    assert not caller.exists()
+    assert caller.read_bytes() == _caller_bytes("packaged")
 
     missing = tmp_path / "no-such-parent" / "state"
     assert not missing.parent.exists()

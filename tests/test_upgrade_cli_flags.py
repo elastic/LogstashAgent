@@ -214,6 +214,7 @@ options:
 """
 
 _EPOCH = 1700000000
+_CALLER_ID = "cli-id"
 
 
 def _upgrade_help(columns):
@@ -272,6 +273,8 @@ def _expect_argv(flags=()):
         version,
         "--yes",
         *flags,
+        "--_caller-id",
+        _CALLER_ID,
         "--_detached",
     ]
 
@@ -294,6 +297,8 @@ def test_upgrade_help_hides_detach_flags():
         assert out == expected
         assert out.count("--_self-upgrade") == 0
         assert out.count("--_detached") == 0
+        # r4 acceptance #5
+        assert "--_caller-id" not in out
 
 
 def test_hidden_flag_dests(monkeypatch):
@@ -400,7 +405,7 @@ def test_guard_reexec_exact_argv_once(monkeypatch, caplog, extra, flags):
     caplog.set_level(logging.INFO)
     code = _run(
         monkeypatch,
-        ["logstash-agent", "upgrade", "--version", "0.1.4", "--yes", "--_self-upgrade", *extra],
+        ["logstash-agent", "upgrade", "--version", "0.1.4", "--yes", "--_self-upgrade", "--_caller-id", _CALLER_ID, *extra],
     )
     assert code == 0
     assert seen == []
@@ -427,7 +432,7 @@ def test_guard_nonzero_rc_falls_back(monkeypatch, caplog):
     caplog.set_level(logging.INFO)
     code = _run(
         monkeypatch,
-        ["logstash-agent", "upgrade", "--version", "0.1.4", "--yes", "--_self-upgrade"],
+        ["logstash-agent", "upgrade", "--version", "0.1.4", "--yes", "--_self-upgrade", "--_caller-id", _CALLER_ID],
     )
     assert code == 0
     assert len(calls) == 1
@@ -446,7 +451,7 @@ def test_guard_oserror_falls_back(monkeypatch, caplog):
     caplog.set_level(logging.INFO)
     code = _run(
         monkeypatch,
-        ["logstash-agent", "upgrade", "--version", "0.1.4", "--yes", "--_self-upgrade"],
+        ["logstash-agent", "upgrade", "--version", "0.1.4", "--yes", "--_self-upgrade", "--_caller-id", _CALLER_ID],
     )
     assert code == 0
     assert len(calls) == 1
@@ -465,7 +470,7 @@ def test_guard_timeout_exits_1_without_fallback(monkeypatch, caplog):
     caplog.set_level(logging.INFO)
     code = _run(
         monkeypatch,
-        ["logstash-agent", "upgrade", "--version", "0.1.4", "--yes", "--_self-upgrade"],
+        ["logstash-agent", "upgrade", "--version", "0.1.4", "--yes", "--_self-upgrade", "--_caller-id", _CALLER_ID],
     )
     assert code == 1
     assert len(calls) == 1
@@ -484,7 +489,7 @@ def test_guard_other_exception_falls_back(monkeypatch, caplog):
     caplog.set_level(logging.INFO)
     code = _run(
         monkeypatch,
-        ["logstash-agent", "upgrade", "--version", "0.1.4", "--yes", "--_self-upgrade"],
+        ["logstash-agent", "upgrade", "--version", "0.1.4", "--yes", "--_self-upgrade", "--_caller-id", _CALLER_ID],
     )
     assert code == 0
     assert len(calls) == 1
@@ -493,3 +498,40 @@ def test_guard_other_exception_falls_back(monkeypatch, caplog):
         r.levelno == logging.WARNING and "detach-boom" in r.message
         for r in caplog.records
     )
+
+
+def test_r4_acceptance_1_cli_handoff(monkeypatch):
+    # acceptance #1
+    _real_exists = os.path.exists
+
+    def _exists(path):
+        if path == "/opt/logstash-agent/bin/logstash-agent":
+            return True
+        return _real_exists(path)
+
+    monkeypatch.setattr(os.path, "exists", _exists)
+    for caller_id in ("handA", "handB"):
+        _arm(monkeypatch, 0)
+        calls = _spy_run(monkeypatch, subprocess.CompletedProcess([], 0, "", ""))
+        seen = _seen_upgrade(monkeypatch)
+        argv_in = [
+            "logstash-agent",
+            "upgrade",
+            "--version",
+            "0.1.4",
+            "--yes",
+            "--_self-upgrade",
+            "--_caller-id",
+            caller_id,
+        ]
+        assert "--_detached" not in argv_in
+        assert "--_caller-id" in argv_in
+        code = _run(monkeypatch, argv_in)
+        assert code == 0
+        assert seen == []
+        assert len(calls) == 1
+        argv, _kwargs = calls[0]
+        assert "--_self-upgrade" not in argv
+        at = argv.index("--_caller-id")
+        assert argv[at + 1] == caller_id
+        assert argv[at + 2] == "--_detached"

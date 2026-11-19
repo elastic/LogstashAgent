@@ -3885,6 +3885,7 @@ def detach_upgrade(
     *,
     replace_ctl: bool = False,
     ignore_errors: bool = False,
+    caller_id: str | None = None,
 ) -> subprocess.CompletedProcess:
     """Re-launch this upgrade in a transient systemd-run unit (caller is root)."""
     import time
@@ -3907,6 +3908,9 @@ def detach_upgrade(
         argv.append('--replace-ctl')
     if ignore_errors:
         argv.append('--ignore-errors')
+    if caller_id is not None:
+        argv.append('--_caller-id')
+        argv.append(caller_id)
     argv.append('--_detached')
     return subprocess.run(
         argv,
@@ -3918,9 +3922,9 @@ def detach_upgrade(
     )
 
 
-_UPGRADE_CALLER_NAME = 'upgrade-caller.json'
 _NO_REGISTRY_ENTRY = 'upgrade: no registry entry for this instance'
 _CALLER_KEY_RE = re.compile(r'^(packaged|managed-[0-9]+|simulate-[0-9]+)$')
+_CALLER_ID_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
 
 
 def _upgrade_caller_key(text: str):
@@ -3936,24 +3940,36 @@ def _upgrade_caller_key(text: str):
     return key
 
 
-def _select_upgrade_agent_unit() -> str:
-    if '--_self-upgrade' not in sys.argv:
-        return 'logstash-agent'
-    path = Path(INSTALL_PATHS['state_dir']) / _UPGRADE_CALLER_NAME
-    if not path.is_file():
-        return 'logstash-agent'
-    text = path.read_text(encoding='utf-8')
-    path.unlink()
-    key = _upgrade_caller_key(text)
-    if key is None:
-        logger.error(_NO_REGISTRY_ENTRY)
-        raise InstallError(_NO_REGISTRY_ENTRY)
-    from logstashagent import install_registry as _reg
-    for entry in _reg.list_instances():
-        if entry.get('id') == key:
-            return entry['agent_unit']
+def _reject_missing_registry_entry():
     logger.error(_NO_REGISTRY_ENTRY)
     raise InstallError(_NO_REGISTRY_ENTRY)
+
+
+def _select_upgrade_agent_unit() -> str:
+    argv = sys.argv
+    try:
+        idx = argv.index('--_caller-id')
+    except ValueError:
+        idx = -1
+    if idx >= 0:
+        if idx + 1 >= len(argv) or _CALLER_ID_RE.fullmatch(argv[idx + 1]) is None:
+            return _reject_missing_registry_entry()
+        path = Path(INSTALL_PATHS['state_dir']) / f'upgrade-caller-{argv[idx + 1]}.json'
+        if not path.is_file():
+            return _reject_missing_registry_entry()
+        text = path.read_text(encoding='utf-8')
+        path.unlink()
+        key = _upgrade_caller_key(text)
+        if key is None:
+            return _reject_missing_registry_entry()
+        from logstashagent import install_registry as _reg
+        for entry in _reg.list_instances():
+            if entry.get('id') == key:
+                return entry['agent_unit']
+        return _reject_missing_registry_entry()
+    if '--_detached' in argv or '--_self-upgrade' in argv:
+        return _reject_missing_registry_entry()
+    return 'logstash-agent'
 
 
 def _upgrade_unit_file(unit: str) -> str:

@@ -3599,6 +3599,12 @@ Examples:
         action='store_true',
         help=argparse.SUPPRESS,
     )
+    upgrade_parser.add_argument(
+        '--_caller-id',
+        dest='_caller_id',
+        default=None,
+        help=argparse.SUPPRESS,
+    )
 
     # Legacy arguments for backward compatibility
     parser.add_argument(
@@ -3981,6 +3987,7 @@ if __name__ == "__main__":
                     args.version,
                     replace_ctl=args.replace_ctl,
                     ignore_errors=args.ignore_errors,
+                    caller_id=args._caller_id,
                 )
             except subprocess.TimeoutExpired:
                 logger.error("systemd-run timed out")

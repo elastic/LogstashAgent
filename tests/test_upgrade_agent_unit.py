@@ -101,16 +101,21 @@ def _stage(tmp_path, monkeypatch, *, instances=_ENTRIES):
     }
 
 
-def _write_caller(staged, key):
-    path = staged["state"] / "upgrade-caller.json"
+_CALLER_ID = "inv1"
+
+
+def _write_caller(staged, key, caller_id=_CALLER_ID):
+    path = staged["state"] / f"upgrade-caller-{caller_id}.json"
     path.write_bytes(_caller_bytes(key))
     return path
 
 
-def _argv(self_upgrade):
+def _argv(self_upgrade, caller_id=None):
     argv = ["logstash-agent", "upgrade", "--version", "0.1.30", "--yes"]
     if self_upgrade:
         argv.append("--_self-upgrade")
+    if caller_id is not None:
+        argv.extend(["--_caller-id", caller_id])
     return argv
 
 
@@ -135,7 +140,7 @@ def test_acceptance_1_selection(tmp_path, monkeypatch):
     ):
         staged["calls"].clear()
         caller = _write_caller(staged, key)
-        monkeypatch.setattr(sys, "argv", _argv(True))
+        monkeypatch.setattr(sys, "argv", _argv(True, _CALLER_ID))
         assert "--mode" not in sys.argv and "--instance" not in sys.argv
         monkeypatch.setattr(os, "rename", fail_rename)
         with pytest.raises(installer.InstallError):
@@ -160,13 +165,17 @@ def test_acceptance_1_selection(tmp_path, monkeypatch):
             assert seen, action
             assert set(seen) == {unit}, (key, action, seen)
 
+    # r4 acceptance #3 shape 4: --_self-upgrade, no caller id, no --_detached
     staged["calls"].clear()
     monkeypatch.setattr(sys, "argv", _argv(True))
     monkeypatch.setattr(installer, "_systemctl_cmd", staged["systemctl"])
-    installer.perform_upgrade("0.1.30")
-    assert _units(staged["calls"], "restart") == ["logstash-agent"]
+    with pytest.raises(installer.InstallError) as raised:
+        installer.perform_upgrade("0.1.30")
+    assert str(raised.value) == _NO_ENTRY
+    assert staged["calls"] == []
     assert not (staged["state"] / "upgrade-caller.json").exists()
 
+    # r4 acceptance #5: operator CLI ignores a leftover per-id file
     staged["calls"].clear()
     caller = _write_caller(staged, "simulate-2")
     exact = caller.read_bytes()
@@ -190,7 +199,7 @@ def test_acceptance_3_existence_gate(tmp_path, monkeypatch, caplog):
         assert not staged["packaged"].exists()
         assert not absent.exists()
         _write_caller(staged, key)
-        monkeypatch.setattr(sys, "argv", _argv(True))
+        monkeypatch.setattr(sys, "argv", _argv(True, _CALLER_ID))
         caplog.clear()
         with caplog.at_level(logging.WARNING, logger="logstashagent.installer"):
             installer.perform_upgrade("0.1.30")
@@ -241,7 +250,7 @@ def test_acceptance_4_operator_hints(tmp_path, monkeypatch, caplog):
         return MagicMock(returncode=0, stdout=b"active\n", stderr=b"")
 
     monkeypatch.setattr(installer, "_systemctl_cmd", fail_restart_and_start)
-    monkeypatch.setattr(sys, "argv", _argv(True))
+    monkeypatch.setattr(sys, "argv", _argv(True, _CALLER_ID))
     _write_caller(staged, "simulate-2")
     start = len(caplog.records)
     with pytest.raises(installer.InstallError):
@@ -300,7 +309,7 @@ def test_acceptance_5_missing_entry(tmp_path, monkeypatch, caplog):
     assert not (tmp_path / "simulate-9").exists()
     caller = _write_caller(staged, "simulate-9")
     before = staged["binary"].read_bytes()
-    monkeypatch.setattr(sys, "argv", _argv(True))
+    monkeypatch.setattr(sys, "argv", _argv(True, _CALLER_ID))
     caplog.clear()
     with caplog.at_level(logging.ERROR, logger="logstashagent.installer"):
         with pytest.raises(installer.InstallError) as raised:
@@ -314,3 +323,135 @@ def test_acceptance_5_missing_entry(tmp_path, monkeypatch, caplog):
     assert staged["calls"] == []
     assert staged["binary"].read_bytes() == before
     assert not caller.exists()
+
+
+def _fail_closed(staged, monkeypatch, caplog, argv):
+    before = staged["binary"].read_bytes()
+    monkeypatch.setattr(sys, "argv", argv)
+    caplog.clear()
+    with caplog.at_level(logging.ERROR, logger="logstashagent.installer"):
+        with pytest.raises(installer.InstallError) as raised:
+            installer.perform_upgrade("0.1.30")
+    assert str(raised.value) == _NO_ENTRY
+    assert any(
+        r.levelno == logging.ERROR and r.getMessage() == _NO_ENTRY
+        for r in caplog.records
+    )
+    assert staged["calls"] == []
+    assert staged["downloads"] == []
+    assert staged["binary"].read_bytes() == before
+    assert not any(
+        len(call) > 1 and call[1] == "logstash-agent" for call in staged["calls"]
+    )
+
+
+def test_r4_acceptance_2_detached_child_reads_record(tmp_path, monkeypatch):
+    # acceptance #2
+    for key, unit, unit_name, caller_id in (
+        ("simulate-2", "simulate-agent@2", "simulate", "sim2id"),
+        ("managed-1", "managed-agent@1", "managed", "man1id"),
+    ):
+        staged = _stage(tmp_path / key, monkeypatch)
+        staged[unit_name].write_text("[Unit]\n")
+        staged["packaged"].write_text("[Unit]\n")
+        argv = [
+            "logstash-agent",
+            "upgrade",
+            "--version",
+            "0.1.30",
+            "--yes",
+            "--_caller-id",
+            caller_id,
+            "--_detached",
+        ]
+        assert "--_self-upgrade" not in argv
+        monkeypatch.setattr(sys, "argv", argv)
+        caller = _write_caller(staged, key, caller_id)
+        installer.perform_upgrade("0.1.30")
+        assert not caller.exists()
+        assert _units(staged["calls"], "restart") == [unit]
+
+
+def test_r4_acceptance_3_detached_without_caller_id(tmp_path, monkeypatch, caplog):
+    # acceptance #3
+    staged = _stage(tmp_path, monkeypatch)
+    staged["packaged"].write_text("[Unit]\n")
+    _fail_closed(
+        staged,
+        monkeypatch,
+        caplog,
+        ["logstash-agent", "upgrade", "--version", "0.1.30", "--yes", "--_detached"],
+    )
+
+
+def test_r4_acceptance_3_caller_id_file_missing(tmp_path, monkeypatch, caplog):
+    # acceptance #3
+    staged = _stage(tmp_path, monkeypatch)
+    staged["packaged"].write_text("[Unit]\n")
+    _fail_closed(
+        staged,
+        monkeypatch,
+        caplog,
+        [
+            "logstash-agent",
+            "upgrade",
+            "--version",
+            "0.1.30",
+            "--yes",
+            "--_caller-id",
+            "goneid",
+        ],
+    )
+
+
+def test_r4_acceptance_3_self_upgrade_without_caller_id(tmp_path, monkeypatch, caplog):
+    # acceptance #3
+    staged = _stage(tmp_path, monkeypatch)
+    staged["packaged"].write_text("[Unit]\n")
+    _fail_closed(
+        staged,
+        monkeypatch,
+        caplog,
+        ["logstash-agent", "upgrade", "--version", "0.1.30", "--yes", "--_self-upgrade"],
+    )
+
+
+def test_r4_acceptance_3_reads_only_own_file(tmp_path, monkeypatch):
+    # acceptance #3
+    staged = _stage(tmp_path, monkeypatch)
+    staged["simulate"].write_text("[Unit]\n")
+    staged["packaged"].write_text("[Unit]\n")
+    sim_id = "simonly"
+    other_id = "manother"
+    sim = _write_caller(staged, "simulate-2", sim_id)
+    other = _write_caller(staged, "managed-1", other_id)
+    other_bytes = other.read_bytes()
+    argv = [
+        "logstash-agent",
+        "upgrade",
+        "--version",
+        "0.1.30",
+        "--yes",
+        "--_caller-id",
+        sim_id,
+        "--_detached",
+    ]
+    assert "--_self-upgrade" not in argv
+    monkeypatch.setattr(sys, "argv", argv)
+    installer.perform_upgrade("0.1.30")
+    assert not sim.exists()
+    assert other.read_bytes() == other_bytes
+    assert _units(staged["calls"], "restart") == ["simulate-agent@2"]
+
+
+def test_r4_acceptance_5_operator_cli_no_caller_file(tmp_path, monkeypatch):
+    # acceptance #5
+    staged = _stage(tmp_path, monkeypatch)
+    staged["packaged"].write_text("[Unit]\n")
+    argv = ["logstash-agent", "upgrade", "--version", "0.1.30", "--yes"]
+    assert "--_self-upgrade" not in argv
+    assert "--_detached" not in argv
+    assert "--_caller-id" not in argv
+    monkeypatch.setattr(sys, "argv", argv)
+    installer.perform_upgrade("0.1.30")
+    assert _units(staged["calls"], "restart") == ["logstash-agent"]
