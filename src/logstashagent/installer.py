@@ -3885,6 +3885,7 @@ def detach_upgrade(
     *,
     replace_ctl: bool = False,
     ignore_errors: bool = False,
+    caller_id: str | None = None,
 ) -> subprocess.CompletedProcess:
     """Re-launch this upgrade in a transient systemd-run unit (caller is root)."""
     import time
@@ -3907,6 +3908,9 @@ def detach_upgrade(
         argv.append('--replace-ctl')
     if ignore_errors:
         argv.append('--ignore-errors')
+    if caller_id is not None:
+        argv.append('--_caller-id')
+        argv.append(caller_id)
     argv.append('--_detached')
     return subprocess.run(
         argv,
@@ -3918,7 +3922,65 @@ def detach_upgrade(
     )
 
 
-def verify_service_running() -> bool:
+_NO_REGISTRY_ENTRY = 'upgrade: no registry entry for this instance'
+_CALLER_KEY_RE = re.compile(r'^(packaged|managed-[0-9]+|simulate-[0-9]+)$')
+_CALLER_ID_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
+
+
+def _upgrade_caller_key(text: str):
+    try:
+        data = json.loads(text.strip())
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict) or set(data) != {'instance_key'}:
+        return None
+    key = data.get('instance_key')
+    if not isinstance(key, str) or _CALLER_KEY_RE.fullmatch(key) is None:
+        return None
+    return key
+
+
+def _reject_missing_registry_entry():
+    logger.error(_NO_REGISTRY_ENTRY)
+    raise InstallError(_NO_REGISTRY_ENTRY)
+
+
+def _select_upgrade_agent_unit() -> str:
+    argv = sys.argv
+    try:
+        idx = argv.index('--_caller-id')
+    except ValueError:
+        idx = -1
+    if idx >= 0:
+        if idx + 1 >= len(argv) or _CALLER_ID_RE.fullmatch(argv[idx + 1]) is None:
+            return _reject_missing_registry_entry()
+        path = Path(INSTALL_PATHS['state_dir']) / f'upgrade-caller-{argv[idx + 1]}.json'
+        if not path.is_file():
+            return _reject_missing_registry_entry()
+        text = path.read_text(encoding='utf-8')
+        path.unlink()
+        key = _upgrade_caller_key(text)
+        if key is None:
+            return _reject_missing_registry_entry()
+        from logstashagent import install_registry as _reg
+        for entry in _reg.list_instances():
+            if entry.get('id') == key:
+                return entry['agent_unit']
+        return _reject_missing_registry_entry()
+    if '--_detached' in argv or '--_self-upgrade' in argv:
+        return _reject_missing_registry_entry()
+    return 'logstash-agent'
+
+
+def _upgrade_unit_file(unit: str) -> str:
+    if unit.startswith('managed-agent@'):
+        return INSTALL_PATHS['logstash_agent_template_unit']
+    if unit.startswith('simulate-agent@'):
+        return INSTALL_PATHS['lsagent_simulate_unit']
+    return INSTALL_PATHS['systemd_service']
+
+
+def verify_service_running(unit: str = 'logstash-agent') -> bool:
     """
     Verify that the logstash-agent service is running.
 
@@ -3926,7 +3988,7 @@ def verify_service_running() -> bool:
         True if service is active, False otherwise
     """
     try:
-        result = _systemctl_cmd('is-active', 'logstash-agent')
+        result = _systemctl_cmd('is-active', unit)
         return result.returncode == 0
     except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
         return False
@@ -3970,6 +4032,8 @@ def perform_upgrade(
             )
         logger.info("✓ Agent installation verified")
 
+        upgrade_unit = _select_upgrade_agent_unit()
+
         # Step 2: Create temporary directory
         logger.info("\nStep 2: Preparing download...")
         import tempfile
@@ -3990,7 +4054,10 @@ def perform_upgrade(
 
         # Step 5: Check if service is running
         logger.info("\nStep 5: Checking service status...")
-        service_was_running = verify_service_running()
+        if upgrade_unit == 'logstash-agent':
+            service_was_running = verify_service_running()
+        else:
+            service_was_running = verify_service_running(upgrade_unit)
         if service_was_running:
             logger.info("Service is running, will be restarted")
         else:
@@ -4061,7 +4128,7 @@ def perform_upgrade(
             logger.error(f"Error code: {e.errno}")
             logger.error(f"Error message: {e.strerror}")
             # Check service status
-            service_check = _systemctl_cmd('is-active', 'logstash-agent')
+            service_check = _systemctl_cmd('is-active', upgrade_unit)
             logger.error(f"Service status: {service_check.stdout.decode().strip()}")
             # Clean up temp file if it exists
             if os.path.exists(temp_binary):
@@ -4130,15 +4197,16 @@ def perform_upgrade(
             except Exception as e:
                 logger.warning("Could not install systemctl helper: %s", e)
 
-        if not os.path.exists(INSTALL_PATHS['systemd_service']):
+        unit_file = _upgrade_unit_file(upgrade_unit)
+        if not os.path.exists(unit_file):
             logger.warning(
-                "logstash-agent systemd unit not found; skipping service restart"
+                f"{upgrade_unit} systemd unit not found; skipping service restart"
             )
         else:
             # Step 9: Restart service (always restart after upgrade)
             logger.info("\nStep 9: Restarting service with new binary...")
             try:
-                _systemctl_cmd('restart', 'logstash-agent', check=True)
+                _systemctl_cmd('restart', upgrade_unit, check=True)
                 logger.info("✓ Service restarted")
 
                 # Step 10: Verify service is running
@@ -4146,7 +4214,11 @@ def perform_upgrade(
                 import time
                 time.sleep(2)  # Give it a moment to start
 
-                if verify_service_running():
+                if upgrade_unit == 'logstash-agent':
+                    healthy = verify_service_running()
+                else:
+                    healthy = verify_service_running(upgrade_unit)
+                if healthy:
                     logger.info("✓ Service is running successfully")
                 else:
                     raise InstallError("Service failed to start with new binary")
@@ -4164,7 +4236,7 @@ def perform_upgrade(
 
                 try:
                     # Stop the failed service
-                    _systemctl_cmd('stop', 'logstash-agent')
+                    _systemctl_cmd('stop', upgrade_unit)
                     logger.info("✓ Stopped failed service")
                 except Exception as stop_error:
                     logger.warning(f"Could not stop service: {stop_error}")
@@ -4197,7 +4269,7 @@ def perform_upgrade(
                 if rollback_success:
                     try:
                         # Start with old binary
-                        _systemctl_cmd('start', 'logstash-agent', check=True)
+                        _systemctl_cmd('start', upgrade_unit, check=True)
                         logger.info("✓ Service restarted with previous version")
                         logger.info("\nRollback completed successfully")
                     except Exception as start_error:
@@ -4216,8 +4288,8 @@ def perform_upgrade(
                     logger.error(f"  1. Check if backup exists: ls -la {backup_path}")
                     logger.error(f"  2. Manually restore: sudo cp {backup_path} {INSTALL_PATHS['binary']}")
                     logger.error(f"  3. Restore permissions: sudo chmod 755 {INSTALL_PATHS['binary']}")
-                    logger.error("  4. Start service: sudo systemctl start logstash-agent")
-                    logger.error("  5. Check status: sudo systemctl status logstash-agent")
+                    logger.error(f"  4. Start service: sudo systemctl start {upgrade_unit}")
+                    logger.error(f"  5. Check status: sudo systemctl status {upgrade_unit}")
                     logger.error("="*60)
                     raise InstallError(
                         "Upgrade failed and rollback encountered errors. "
@@ -4259,10 +4331,10 @@ def perform_upgrade(
 
         if service_was_running:
             logger.info("\nService status:")
-            logger.info("  sudo systemctl status logstash-agent")
+            logger.info(f"  sudo systemctl status {upgrade_unit}")
         else:
             logger.info("\nTo start the service:")
-            logger.info("  sudo systemctl start logstash-agent")
+            logger.info(f"  sudo systemctl start {upgrade_unit}")
 
         logger.info("="*60)
 

@@ -199,7 +199,7 @@ def test_detach_upgrade_systemd_run_contract(tmp_path, monkeypatch):
     monkeypatch.setattr(installer, "host_subprocess_env", lambda: env)
     monkeypatch.setattr(time, "time", lambda: 1700000000.4)
 
-    installer.detach_upgrade("0.1.4")
+    installer.detach_upgrade("0.1.4", caller_id="guard-id")
     argv, kwargs = calls[0]
     assert argv == [
         "systemd-run",
@@ -211,6 +211,8 @@ def test_detach_upgrade_systemd_run_contract(tmp_path, monkeypatch):
         "--version",
         "0.1.4",
         "--yes",
+        "--_caller-id",
+        "guard-id",
         "--_detached",
     ]
     assert "--_self-upgrade" not in argv
@@ -227,17 +229,17 @@ def test_detach_upgrade_systemd_run_contract(tmp_path, monkeypatch):
     binary.write_bytes(b"x")
     monkeypatch.setitem(installer.INSTALL_PATHS, "binary", str(binary))
     calls.clear()
-    installer.detach_upgrade("1.2.3", replace_ctl=True, ignore_errors=False)
+    installer.detach_upgrade("1.2.3", replace_ctl=True, ignore_errors=False, caller_id="guard-id")
     argv, kwargs = calls[0]
     assert argv[4] == str(binary)
-    assert argv[-3:] == ["--yes", "--replace-ctl", "--_detached"]
+    assert argv[-5:] == ["--yes", "--replace-ctl", "--_caller-id", "guard-id", "--_detached"]
     assert "--ignore-errors" not in argv
     assert "--_self-upgrade" not in argv
     assert os.path.exists(binary)
 
     calls.clear()
-    installer.detach_upgrade("1.2.3", replace_ctl=False, ignore_errors=True)
+    installer.detach_upgrade("1.2.3", replace_ctl=False, ignore_errors=True, caller_id="guard-id")
     argv, _kwargs = calls[0]
-    assert argv[-3:] == ["--yes", "--ignore-errors", "--_detached"]
+    assert argv[-5:] == ["--yes", "--ignore-errors", "--_caller-id", "guard-id", "--_detached"]
     assert "--replace-ctl" not in argv
     assert len(calls) == 1

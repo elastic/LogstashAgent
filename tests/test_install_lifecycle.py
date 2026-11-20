@@ -4,6 +4,7 @@
 
 """Install lifecycle: enable+start agent; package logstash enable-only."""
 
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -12,11 +13,16 @@ from logstashagent import installer
 from logstashagent.installer import InstallError
 
 
+def _argv(call):
+    a = list(call.args[0])
+    return [os.path.basename(a[0]), *a[1:]]
+
+
 def test_enable_package_logstash_only_never_starts():
     with patch.object(installer.subprocess, "run") as run:
         run.return_value = MagicMock(returncode=0, stdout="", stderr="")
         installer.enable_package_logstash_only()
-    args_list = [c.args[0] for c in run.call_args_list]
+    args_list = [_argv(c) for c in run.call_args_list]
     assert any(a[:3] == ["systemctl", "enable", "logstash"] for a in args_list)
     for a in args_list:
         assert "start" not in a
@@ -27,7 +33,7 @@ def test_enable_and_start_default_agent_uses_enable_now():
     with patch.object(installer.subprocess, "run") as run:
         run.return_value = MagicMock(returncode=0, stdout="", stderr="")
         installer.enable_and_start_default_agent()
-    args_list = [c.args[0] for c in run.call_args_list]
+    args_list = [_argv(c) for c in run.call_args_list]
     assert any(
         a[:3] == ["systemctl", "enable", "--now"]
         or a == ["systemctl", "enable", "--now", "logstash-agent"]
@@ -57,7 +63,7 @@ def _systemctl_side_effect(cmd, **kwargs):
 def test_enable_simulate_services_starts_agent_not_logstash():
     with patch.object(installer.subprocess, "run", side_effect=_systemctl_side_effect) as run:
         status = installer.enable_simulate_services(3)
-    args_list = [tuple(c.args[0]) for c in run.call_args_list]
+    args_list = [tuple(_argv(c)) for c in run.call_args_list]
     # acceptance A2: install path uses canonical simulate-* names
     assert ("systemctl", "enable", "simulate-logstash@3") in args_list
     joined = [" ".join(a) for a in args_list]

@@ -3526,6 +3526,32 @@ def heal_legacy_systemd_units_on_checkin(state: Optional[dict] = None) -> bool:
     return False
 
 
+def _spawn_self_upgrade(binary_path: str, upgrade_version: str, *, mode: str, instance_id) -> bool:
+    lowered = str(mode).lower()
+    if lowered in ('managed', 'simulate') and instance_id is not None:
+        key = f'{lowered}-{instance_id}'
+    else:
+        key = 'packaged'
+    from logstashagent import installer
+    caller_id = os.urandom(8).hex()
+    logger.info(
+        f"Spawning upgrade process: sudo {binary_path} upgrade --version {upgrade_version} --yes --_self-upgrade --_caller-id {caller_id}"
+    )
+    path = Path(installer.INSTALL_PATHS['state_dir']) / f'upgrade-caller-{caller_id}.json'
+    try:
+        path.write_text(f'{{"instance_key":"{key}"}}\n', encoding='utf-8')
+    except OSError:
+        logger.error('upgrade: cannot record caller instance')
+        return False
+    subprocess.Popen(
+        ['sudo', binary_path, 'upgrade', '--version', upgrade_version, '--yes', '--_self-upgrade', '--_caller-id', caller_id],
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    return True
+
+
 def run_controller():
     """
     Main controller loop - runs indefinitely and checks in every 60 seconds
@@ -3700,7 +3726,6 @@ def run_controller():
                         try:
                             # Spawn upgrade process as separate command
                             # This will stop the service (killing us), replace binary, and restart
-                            import subprocess
                             import sys
                             
                             # Get path to the installed binary
@@ -3709,24 +3734,20 @@ def run_controller():
                                 # Fallback to current executable if not installed
                                 binary_path = sys.executable
                             
-                            logger.info(f"Spawning upgrade process: sudo {binary_path} upgrade --version {upgrade_version} --yes --_self-upgrade")
-                            
                             # Spawn upgrade subprocess with full detachment
                             # The upgrade will stop the service (killing us), replace binary, and restart
                             # Let stdout/stderr go to systemd journal for error visibility
-                            subprocess.Popen(
-                                ['sudo', binary_path, 'upgrade', '--version', upgrade_version, '--yes', '--_self-upgrade'],
-                                stdin=subprocess.DEVNULL,
-                                start_new_session=True,
-                                close_fds=True
-                            )
-                            
-                            logger.info("Upgrade process spawned")
-                            logger.info("Waiting for upgrade to stop service and replace binary...")
-                            logger.info("=" * 60)
-                            
-                            # Mark upgrade as initiated to prevent spawning another
-                            upgrade_initiated = True
+                            if _spawn_self_upgrade(
+                                binary_path,
+                                upgrade_version,
+                                mode=mode,
+                                instance_id=state.get('instance_id'),
+                            ):
+                                logger.info("Upgrade process spawned")
+                                logger.info("Waiting for upgrade to stop service and replace binary...")
+                                logger.info("=" * 60)
+                                # Mark upgrade as initiated to prevent spawning another
+                                upgrade_initiated = True
                             
                             # Continue running - upgrade will stop the service which kills us
                             # Then upgrade will restart the service with the new binary
